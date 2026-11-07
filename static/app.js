@@ -118,6 +118,38 @@ function setTool(tool) {
   savePrefs();
 }
 
+// Apple Pencil taps on buttons. iPad WebKit turns a tap into a click only when its tap gesture
+// recognises it, and it often misses short Pencil taps: tool buttons did nothing with the Pencil
+// while fingers worked. So on a pen tap (down and up on the same button, barely moving) we press
+// the button ourselves, and swallow the click WebKit may still send right after (no double press).
+{
+  let down = null;
+  let pressed = null;
+  let pressedAt = 0;
+  const buttonAt = (e) => (e.target instanceof Element ? e.target.closest('button') : null);
+  document.addEventListener('pointerdown', (e) => {
+    const b = e.pointerType === 'pen' ? buttonAt(e) : null;
+    down = b && !b.disabled ? { b, id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now() } : null;
+  }, true);
+  document.addEventListener('pointerup', (e) => {
+    const d = down;
+    down = null;
+    if (!d || e.pointerType !== 'pen' || e.pointerId !== d.id || buttonAt(e) !== d.b) return;
+    if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 12 || performance.now() - d.t > 700) return;
+    pressed = d.b;
+    pressedAt = performance.now();
+    d.b.click();
+  }, true);
+  document.addEventListener('click', (e) => {
+    if (!e.isTrusted || !pressed || performance.now() - pressedAt > 600) return;
+    if (e.target instanceof Node && pressed.contains(e.target)) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      pressed = null;
+    }
+  }, true);
+}
+
 $('#toolbar').addEventListener('click', (e) => {
   const t = e.target.closest('.tool');
   if (t) return setTool(t.dataset.tool);
