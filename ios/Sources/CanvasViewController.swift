@@ -23,7 +23,9 @@ final class CanvasViewController: UIViewController {
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
-    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
+    // Protect the bottom and sides from accidental system swipes while drawing; leave the top
+    // free so one swipe down shows the iPadOS menu bar (Canvas › Reload, Sessions, Close…).
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { [.bottom, .left, .right] }
 
     // MARK: - View
 
@@ -122,6 +124,14 @@ final class CanvasViewController: UIViewController {
               let link = LinkValidator.canvasLink(from: raw) else { return }
         connect(to: link)
     }
+
+    // MARK: - Menu commands (AppDelegate.buildMenu)
+
+    func reloadPage() { reload() }
+
+    func showServerLink() { showSetup(cancellable: savedLink != nil) }
+
+    func evaluate(_ source: String) { js(source) }
 
     func appDidEnterBackground() {
         speech.stopAll()

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -57,7 +58,14 @@ def main() -> None:
         shutil.copyfile(src, os.path.join(APP_DIR, "Canvas.ipa.tmp"))
         os.replace(os.path.join(APP_DIR, "Canvas.ipa.tmp"), os.path.join(APP_DIR, "Canvas.ipa"))
 
-    info = {"version": "1.1", "build": run["number"], "commit": run["headSha"][:7],
+    version = "1.0"
+    try:
+        with open(os.path.join(HERE, "project.yml"), "r", encoding="utf-8") as f:
+            m = re.search(r'MARKETING_VERSION:\s*"?([0-9.]+)', f.read())
+        version = m.group(1) if m else version
+    except OSError:
+        pass
+    info = {"version": version, "build": run["number"], "commit": run["headSha"][:7],
             "notes": run["displayTitle"], "built": run["createdAt"]}
     with open(os.path.join(APP_DIR, "build.json"), "w", encoding="utf-8") as f:
         json.dump(info, f, indent=1)

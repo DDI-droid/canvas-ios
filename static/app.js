@@ -1073,6 +1073,8 @@ if (native) {
   $('#menuApp').hidden = false;
   $('#btnServerLink').hidden = false;
   $('#btnServerLink').addEventListener('click', () => native.post('settings'));
+  $('#btnReload').hidden = false; // also in the app's menu bar: Canvas › Reload (⌘R)
+  $('#btnReload').addEventListener('click', () => location.reload());
   $('#voiceHint').textContent = 'Tap a voice to hear it. Every voice you download (Settings › Accessibility › Read & Speak › Voices) shows up here.';
   // Apple Pencil Pro squeeze: voice mode on / off
   window.addEventListener('canvas:pencil-squeeze', () => {
