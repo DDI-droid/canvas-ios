@@ -679,6 +679,22 @@ class Sessions:
             self.items[sid] = sess
             return sess
 
+    def archive(self, sid: str) -> bool:
+        """Remove a session from the canvas; its folder moves to data/sessions/.archive/."""
+        if sid == "main":
+            return False
+        with self.lock:
+            sess = self.items.pop(sid, None)
+        if sess is None:
+            return False
+        sess.hub.close_all()
+        if sess._talker is not None:
+            sess._talker.reset()
+        dest = os.path.join(SESSIONS_DIR, ".archive", f"{sid}-{datetime.now():%Y%m%d-%H%M%S}")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(sess.dir, dest)
+        return True
+
     def summaries(self) -> list:
         return sorted((x.summary() for x in self.all()),
                       key=lambda d: (d["id"] != "main", -(d["last_activity"] or 0)))
@@ -790,6 +806,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("POST", "/api/clientlog"): self._api_clientlog,
             ("GET", "/api/sessions"): self._api_sessions_list,
             ("POST", "/api/sessions"): self._api_sessions_create,
+            ("DELETE", "/api/sessions"): self._api_sessions_archive,
             ("GET", "/api/agent/next"): self._api_agent_next,
             ("GET", "/api/ping"): self._api_ping,
             ("POST", "/api/message"): self._api_message,
@@ -1056,6 +1073,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sess = self.sessions.create(title.strip() or sid.strip(), sid.strip())
         log(f"session {sess.id} ({sess.meta.get('title')})")
         self._send_json(200, sess.summary())
+
+    def _api_sessions_archive(self):
+        """DELETE /api/sessions?s=<id>: archive a session (not main)."""
+        if self.sid == "main" or self.session is None:
+            raise HttpError(400, "pick a session other than main")
+        self.sessions.archive(self.sid)
+        log(f"session {self.sid} archived")
+        self._send_json(200, {"ok": True, "archived": self.sid})
 
     # ---- the agent side: a Claude Code session attached to this canvas session
     def _api_agent_next(self):

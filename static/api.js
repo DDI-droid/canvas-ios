@@ -91,15 +91,25 @@ export class EventStream extends EventTarget {
     this.gen = 0;
     this.ctl = null;
     this.backoff = 1000;
-    document.addEventListener('visibilitychange', () => {
-      // iOS freezes timers/sockets in the background; restart the poll on return.
-      if (!document.hidden) this.kick();
-    });
+    this.quick = true; // next request answers at once: confirms the link fast after (re)connecting
+    // iOS suspends the page in the background (the app minimised), and its in-flight request
+    // usually dies with no error. Restart the poll on any sign that we're back...
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) this.kick(); });
+    window.addEventListener('pageshow', () => this.kick());
     window.addEventListener('online', () => this.kick());
+    window.addEventListener('focus', () => { if (this.state !== 'open') this.kick(); });
+    // ...including the one iOS can't hide: a timer that skipped ahead means we were frozen.
+    let last = Date.now();
+    setInterval(() => {
+      const now = Date.now();
+      if (now - last > 6000) this.kick();
+      last = now;
+    }, 2000);
   }
 
   connect() {
-    this._set(this.state === 'open' ? 'reconnecting' : 'connecting');
+    if (this.state !== 'open') this._set('connecting');
+    this.quick = true;
     const gen = ++this.gen;
     this._loop(gen);
   }
@@ -114,9 +124,11 @@ export class EventStream extends EventTarget {
     while (gen === this.gen) {
       const ctl = new AbortController();
       this.ctl = ctl;
-      const timer = setTimeout(() => ctl.abort(), 40000);
+      const quick = this.quick;
+      // a quick check must answer within 8 s, or the connection is dead: drop it and retry
+      const timer = setTimeout(() => ctl.abort(), quick ? 8000 : 40000);
       try {
-        const qs = `since=${this.since}&epoch=${encodeURIComponent(this.epoch)}&wait=25`;
+        const qs = `since=${this.since}&epoch=${encodeURIComponent(this.epoch)}&wait=${quick ? 0 : 25}`;
         const res = await fetch(withKey(`${this.path}?${qs}`), {
           headers: { 'X-Canvas-Key': KEY },
           cache: 'no-store',
@@ -126,6 +138,7 @@ export class EventStream extends EventTarget {
         const body = await res.json();
         if (gen !== this.gen) return;
         this.backoff = 1000;
+        this.quick = false;
         this._set('open');
         if (body.sessions) this._emit('sessions', body.sessions);
         if (body.build) this._emit('build', body.build);
@@ -145,6 +158,7 @@ export class EventStream extends EventTarget {
       } catch (err) {
         if (gen !== this.gen) return;
         this._set('reconnecting');
+        this.quick = true;
         await new Promise((r) => setTimeout(r, this.backoff * (0.85 + Math.random() * 0.3)));
         this.backoff = Math.min(this.backoff * 2, 15000);
       } finally {
