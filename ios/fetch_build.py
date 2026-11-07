@@ -30,7 +30,7 @@ def gh_exe() -> str:
 
 
 def gh(*args: str) -> str:
-    res = subprocess.run([gh_exe(), *args], cwd=CANVAS, capture_output=True, text=True)
+    res = subprocess.run([gh_exe(), *args], cwd=CANVAS, capture_output=True, text=True, encoding="utf-8")
     if res.returncode != 0:
         sys.exit(f"gh {' '.join(args)} failed:\n{res.stderr.strip()}")
     return res.stdout
