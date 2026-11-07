@@ -59,6 +59,19 @@ TOOLS = [
         },
     },
     {
+        "name": "write_on_board",
+        "description": (
+            "Write a short note on the user's board, at the top right of what they're looking at: a "
+            "formula, a key term, or up to three short lines (separate lines with \" / \"). Plain text "
+            "and symbols (x², √, ≤, ×); no LaTeX. For diagrams or marking up their work, hand_off instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "The note, at most ~200 characters."}},
+            "required": ["text"],
+        },
+    },
+    {
         "name": "dismiss",
         "description": (
             "What you heard wasn't meant for you: TV, someone else talking, background noise, your "
@@ -99,6 +112,8 @@ def _call(name: str, args: dict) -> tuple[list, bool]:
         return [{"type": "text", "text": "Handed to the main agent. Its answer will come to you as main_agent_reply."}], False
     if name == "look_at_board":
         return _look(), False
+    if name == "write_on_board":
+        return [{"type": "text", "text": "Written on the board."}], False
     if name == "dismiss":
         return [{"type": "text", "text": "Dismissed. End your turn."}], False
     return [{"type": "text", "text": f"unknown tool {name}"}], True

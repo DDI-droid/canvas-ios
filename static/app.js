@@ -917,6 +917,7 @@ async function boardForTalker() {
 const live = new Live({
   voiceSupported,
   snapshot: boardForTalker,
+  viewRect: () => board.viewRect(),
   // changes whenever the ink, the Claude drawings or the view change
   boardRev: () => {
     const last = board.strokes[board.strokes.length - 1];

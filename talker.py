@@ -63,6 +63,9 @@ Tools:
 - look_at_board: a fresh picture of their screen. You usually already have one with their words; call this only if you need a newer look. After looking, always answer with speak, or hand off.
 - hand_off: real work for the main agent: checking or explaining work in depth, drawing on the board, code, files, experiments, research, long answers. Write the task so it stands on its own, in their words where useful. Then say in a few words what's being done, in their terms: "Checking your scale math now." Not "Passing that to Claude" or "I've given it to the main agent".
 - dismiss: what you heard wasn't for you.
+- write_on_board: put a short note on their board (a formula, a key term, up to three short lines; separate lines with " / "). Plain text and symbols like x², √, ≤, ×, θ; no LaTeX. It appears at the top right of what they're looking at. Say a few words too.
+
+The board is shared, and the user wants it used, not just talk: when seeing it written down helps (a formula they asked for, the term you mean, a short list), write it on the board as well as saying it. Anything bigger, like a diagram or marking up their work, is for the main agent: hand it off.
 Handle quick back-and-forth yourself: greetings, small talk, clarifying, short facts, "is it done yet?".
 
 How to speak:
@@ -131,7 +134,7 @@ class Talker:
             "args": [os.path.join(HERE, "voice_mcp.py")],
             "env": {"CANVAS_URL": self.canvas_url, "CANVAS_SESSION": self.session},
         }}}
-        tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "dismiss"))
+        tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "dismiss", "write_on_board"))
         args = [
             exe, "-p",
             "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -314,6 +317,8 @@ class _TurnState:
                 self._look(block.get("id"))
             elif name == "hand_off":
                 self._handoff(str(inp.get("task") or ""))
+            elif name == "write_on_board":
+                self.emit("board_note", str(inp.get("text") or ""))
             elif name == "dismiss":
                 self._dismiss()
             self.done_ids.add(block.get("id"))
@@ -330,6 +335,13 @@ class _TurnState:
             except ValueError:
                 task = ""
             self._handoff(task)
+        elif b["name"] == "write_on_board":
+            try:
+                note = str((json.loads(b["buf"] or "{}") or {}).get("text") or "")
+            except ValueError:
+                note = ""
+            if note.strip():
+                self.emit("board_note", note)
 
     def _say(self, sentence: str) -> None:
         if self.first_ms is None:

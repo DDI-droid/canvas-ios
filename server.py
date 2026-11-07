@@ -147,6 +147,16 @@ then appears in the user's session switcher in the canvas, marked as connected w
    KaTeX works: `$x^2$`, `$$\int f$$`.
 4. Start `wait` again. Keep this loop going while you're attached.
 
+## Use the board, not just the chat
+
+The canvas is the user's main medium. When they write or draw something, answer there too:
+- mark it up or put your result next to their ink, at the size of their handwriting
+- draw the setup of a problem as a diagram
+- keep the chat reply short, and point to what you put on the board
+
+The voice assistant can also write short notes on the board, which appear as "Voice note" cards. Bigger
+drawings are your job.
+
 ## Replying well
 
 - The user reads on an iPad, often while drawing or talking. Make the first sentence a standalone
@@ -530,6 +540,8 @@ class VoiceState:
         self.running = ""           # turn id the talker is working on
         self.cancelled: collections.deque = collections.deque(maxlen=64)
         self.fragment_seen = False  # the talker saw words it didn't answer yet (for [continued])
+        self.view = None            # the user's view [x0, y0, x1, y1] (world), sent with each turn
+        self.notes_in_view = 0      # voice notes placed in this view (they stack)
 
     # cancelling: the user kept talking, so a turn about the first part is stale
     def cancel(self, turn: str) -> bool:
@@ -573,6 +585,29 @@ class VoiceState:
                 return "[status] main agent: idle"
             secs = int(time.time() - self.since)
             return f'[status] main agent: working on "{self.task[:240]}" ({secs} s so far)'
+
+
+def voice_note_svg(text: str) -> tuple[str, float]:
+    """A small note card (the voice's handwriting, so to speak). Returns (svg, height/width)."""
+    import html as _html
+    import textwrap as _tw
+    lines = []
+    for para in text.split(" / "):
+        lines.extend(_tw.wrap(para, 26) or [""])
+    lines = lines[:7]
+    w, pad, lh = 360, 22, 34
+    h = pad * 2 + 22 + lh * len(lines)
+    rows = "".join(
+        f'<text x="{pad + 8}" y="{pad + 22 + 26 + i * lh}" font-size="25" fill="#1d1d1f">{_html.escape(t)}</text>'
+        for i, t in enumerate(lines))
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" '
+           f'font-family="-apple-system, system-ui, sans-serif">'
+           f'<rect x="1.5" y="1.5" width="{w - 3}" height="{h - 3}" rx="16" fill="#ffffff" fill-opacity="0.95" '
+           f'stroke="#0a84ff" stroke-width="2"/>'
+           f'<rect x="1.5" y="1.5" width="8" height="{h - 3}" rx="4" fill="#0a84ff"/>'
+           f'<text x="{pad + 8}" y="{pad + 12}" font-size="15" font-weight="700" fill="#0a84ff">Voice note</text>'
+           f'{rows}</svg>')
+    return svg, h / w
 
 
 class Session:
@@ -1459,6 +1494,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not isinstance(heard, str) or not heard.strip():
                 raise HttpError(400, "text is required")
             heard = heard.strip()[:2000]
+            view = body.get("view")
+            if isinstance(view, list) and len(view) == 4 and all(isinstance(n, (int, float)) for n in view):
+                with self.voice.lock:
+                    if self.voice.view != view:
+                        self.voice.notes_in_view = 0
+                    self.voice.view = [float(n) for n in view]
             chat = self._unseen_main_message()
             if chat:
                 parts.append(f'[chat] the main agent\'s latest message: "{chat}"')
@@ -1515,6 +1556,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 push({"handoff": data})
             elif k == "dismiss":
                 push({"dismiss": True})
+            elif k == "board_note":
+                self._voice_note(data)
 
         def still_wanted() -> bool:
             if self.voice.is_cancelled(turn_id):
@@ -1562,6 +1605,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not so_far:
             raise HttpError(504, "talker did not answer")
         self._send_json(200, {"turn": turn_id, "events": so_far})
+
+    def _voice_note(self, text: str) -> None:
+        """write_on_board: a short note card from the voice, placed at the top right of the user's
+        view (notes stack downwards). Goes on the Claude layer like any drawing."""
+        text = clean_line(text or "", 240)
+        if not text:
+            return
+        with self.voice.lock:
+            v = self.voice.view or [0.0, 0.0, 1200.0, 800.0]
+            n = self.voice.notes_in_view
+            self.voice.notes_in_view += 1
+        svg, aspect = voice_note_svg(text)
+        vw, vh = v[2] - v[0], v[3] - v[1]
+        width = max(160.0, vw * 0.26)
+        height = width * aspect
+        x = v[2] - width - vw * 0.03
+        y = v[1] + vh * 0.05 + n * (height + vh * 0.02)
+        item = {"id": f"voice-note-{secrets.token_hex(3)}", "svg": svg, "x": x, "y": y, "width": width,
+                "height": None, "label": "Voice note", "ts": now_ms()}
+        st = self.store
+        with st.lock:
+            st.layer.append(item)
+            st.save_layer()
+        self.hub.broadcast("draw", item)
+        log(f"voice note [{self.session.id}] {text[:60]!r}")
 
     def _unseen_main_message(self) -> str:
         """The main agent's latest chat message, if the talker hasn't been shown it yet."""

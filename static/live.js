@@ -334,11 +334,12 @@ class Mouth extends EventTarget {
 
 // -------------------------------------------------------------------- the conversation
 export class Live extends EventTarget {
-  constructor({ voiceSupported, snapshot, boardRev, sendToMain, toast }) {
+  constructor({ voiceSupported, snapshot, boardRev, viewRect, sendToMain, toast }) {
     super();
     this.supported = !!(voiceSupported && SR);
     this.snapshot = snapshot;     // async () => JPEG data URL of the current view
     this.boardRev = boardRev || (() => ''); // changes when the ink or the view changes
+    this.viewRect = viewRect || (() => null); // [x0, y0, x1, y1] in world units: where notes go
     this.seenRev = null;          // the board as Haiku last saw it
     this.sendToMain = sendToMain; // (task, heard) => void
     this.toast = toast;
@@ -489,6 +490,7 @@ export class Live extends EventTarget {
   // Haiku sees what you see: when the board changed since its last look, the screen goes along
   // with your words (a JPEG of the current view; skipped if it isn't ready within 1.5 s).
   async askWithScreen(body) {
+    body.view = this.viewRect();
     const rev = this.boardRev();
     if (rev !== this.seenRev) {
       try {
