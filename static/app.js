@@ -1209,6 +1209,7 @@ events.addEventListener('reply', (e) => {
   if (live.on && e.detail.source !== 'talker') live.onMainReply(e.detail.text);
 });
 events.addEventListener('talk', (e) => live.onTalkEvent(e.detail));
+events.addEventListener('progress', (e) => { if (e.detail) chat.add(e.detail, { animate: true }); });
 events.addEventListener('status', (e) => chat.setStatus(e.detail || 'idle'));
 events.addEventListener('draw', (e) => {
   const item = e.detail;

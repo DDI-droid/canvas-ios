@@ -161,8 +161,12 @@ then appears in the user's session switcher in the canvas, marked as connected w
   ```
   For SVGs, set a `viewBox`, use `font-family="-apple-system, system-ui, sans-serif"`, dark text
   `#1d1d1f`, blue `#0a84ff`, red `#ff3b30`, and text at least 16 px. Don't use scripts.
-- Long job: `python canvas_agent.py status -s {SESSION} "Running the sweep…"` shows progress in
-  the canvas.
+- Show where you're going with short progress notes: about one every 2 or 3 steps, summing up
+  what you just did or found in a few plain words. No tool names, commands, file paths or
+  arguments. Notes fold into "N steps" above your reply, and they're never spoken:
+  ```bash
+  python canvas_agent.py note -s {SESSION} "Found why the loss spikes; fixing it"
+  ```
 
 ## Rules
 
@@ -639,7 +643,8 @@ class Session:
         st = self.store
         with st.lock:
             conv = st.conversation
-            last_reply = next((e.get("ts") or 0 for e in reversed(conv) if e.get("role") == "claude"), 0)
+            last_reply = next((e.get("ts") or 0 for e in reversed(conv)
+                               if e.get("role") == "claude" and e.get("kind") != "progress"), 0)
             last_activity = (conv[-1].get("ts") or 0) if conv else self.meta.get("created", 0)
             status = st.status.get("status")
         return {"id": self.id, "title": self.meta.get("title") or self.id,
@@ -811,6 +816,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("GET", "/api/ping"): self._api_ping,
             ("POST", "/api/message"): self._api_message,
             ("POST", "/api/reply"): self._api_reply,
+            ("POST", "/api/progress"): self._api_progress,
             ("POST", "/api/status"): self._api_status,
             ("POST", "/api/draw"): self._api_draw,
             ("POST", "/api/draw/clear"): self._api_draw_clear,
@@ -1351,6 +1357,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._set_status(status)
         self._send_json(200, {"id": entry["id"]})
 
+    def _api_progress(self):
+        """A one-line note of what the agent is doing now. Shown in the chat (folded into
+        "N steps" once it replies) and as the status line. Never spoken by the voice."""
+        body = self._read_json()
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise HttpError(400, "text is required")
+        text = clean_line(text, 100)  # notes are short by design (the user asked)
+        entry = {"id": "p-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2),
+                 "role": "claude", "kind": "progress", "text": text, "ts": now_ms()}
+        st = self.store
+        with st.lock:
+            st.conversation.append(entry)
+            st.save_conversation()
+        self.session.touch_agent()
+        self.hub.broadcast("progress", entry)
+        self._set_status(text[:120])
+        self._send_json(200, {"id": entry["id"]})
+
     def _api_poll(self):
         def qnum(name, default):
             try:
@@ -1543,7 +1568,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         st = self.store
         with st.lock:
             latest = next((e for e in reversed(st.conversation)
-                           if e.get("role") == "claude" and e.get("source") != "talker"), None)
+                           if e.get("role") == "claude" and e.get("source") != "talker"
+                           and e.get("kind") != "progress"), None)
         if not latest:
             return ""
         with self.voice.lock:

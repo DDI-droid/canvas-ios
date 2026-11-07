@@ -8,6 +8,7 @@ canvas link is reachable. Python 3.8+, standard library only.
   python canvas_agent.py connect "<canvas link with ?k=...>" --session NAME [--title "..."]
   python canvas_agent.py wait   -s NAME [--timeout SECONDS]   # blocks until the next message
   python canvas_agent.py say    -s NAME [--file reply.md | text ... | -] [--status S]
+  python canvas_agent.py note   -s NAME "Reading the training script"  # one step of progress
   python canvas_agent.py status -s NAME "Running the sweep..."
   python canvas_agent.py draw   -s NAME --svg fig.svg --x X --y Y [--width W] [--id ID] [--label L]
   python canvas_agent.py draw   -s NAME --list | --remove ID | --clear
@@ -211,6 +212,12 @@ def cmd_say(args) -> None:
     print(f"delivered reply {res.get('id')} ({len(text)} chars)")
 
 
+def cmd_note(args) -> None:
+    cfg = load_config()
+    call(cfg, args.session, "POST", "/api/progress", {"text": " ".join(args.text)})
+    print("noted")
+
+
 def cmd_status(args) -> None:
     cfg = load_config()
     call(cfg, args.session, "POST", "/api/status", {"status": " ".join(args.text)})
@@ -278,6 +285,10 @@ def main() -> None:
     p.add_argument("--file", "-f")
     p.add_argument("--status", help="status to show after the reply (default: idle)")
     p.set_defaults(fn=cmd_say)
+
+    p = with_session(sub.add_parser("note", help="post one short progress step to the chat"))
+    p.add_argument("text", nargs="+")
+    p.set_defaults(fn=cmd_note)
 
     p = with_session(sub.add_parser("status", help="show a progress line in the canvas"))
     p.add_argument("text", nargs="+")

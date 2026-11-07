@@ -325,6 +325,7 @@ export class ChatPanel extends EventTarget {
     this.byId.clear();
     this.byCid.clear();
     this.lastDay = '';
+    this.activity = null;
     for (const m of Array.isArray(list) ? list : []) this._append(m, false);
     for (const r of local) this._append(r.msg, false);
     this._updateEmpty();
@@ -333,6 +334,12 @@ export class ChatPanel extends EventTarget {
 
   add(msg, { animate = true } = {}) {
     if (msg.id && this.byId.has(msg.id)) return;
+    if (msg.kind === 'progress') {
+      const near = this._nearBottom();
+      this._append(msg, animate);
+      if (near) this._scrollToBottom(true);
+      return;
+    }
     if (msg.cid && this.byCid.has(msg.cid)) {
       this.update(msg.cid, { ...msg, local: false, state: 'sent' });
       return;
@@ -365,16 +372,64 @@ export class ChatPanel extends EventTarget {
     rec.el = fresh;
   }
 
-  _append(m, animate) {
-    const ts = m.ts || Date.now();
-    const day = fmtDay(ts);
-    if (day !== this.lastDay) {
-      this.lastDay = day;
-      const sep = document.createElement('div');
-      sep.className = 'day-sep';
-      sep.textContent = day;
-      this.list.appendChild(sep);
+  // Progress notes (what the agent is doing, one short line each) gather into an activity block
+  // above its next message. While it works the block is open; any real message closes it into
+  // "N steps", which expands on tap.
+  _appendProgress(m, animate) {
+    if (!this.activity) {
+      this._daySep(m.ts || Date.now());
+      const block = document.createElement('div');
+      block.className = 'activity open';
+      const head = document.createElement('button');
+      head.className = 'activity-head';
+      head.type = 'button';
+      head.addEventListener('click', () => block.classList.toggle('expanded'));
+      const steps = document.createElement('div');
+      steps.className = 'steps';
+      block.append(head, steps);
+      this.list.appendChild(block);
+      this.activity = { block, head, steps, n: 0 };
     }
+    const a = this.activity;
+    const step = document.createElement('div');
+    step.className = `step${animate ? ' enter' : ''}`;
+    const text = document.createElement('span');
+    text.className = 'step-text';
+    text.textContent = (m.text || '').trim();
+    const t = document.createElement('time');
+    t.textContent = fmtClock(m.ts || Date.now());
+    step.append(text, t);
+    a.steps.appendChild(step);
+    a.n += 1;
+    a.head.textContent = `Working · ${a.n} step${a.n === 1 ? '' : 's'}`;
+    if (m.id) this.byId.set(m.id, { msg: m, el: step });
+  }
+
+  _daySep(ts) {
+    const day = fmtDay(ts);
+    if (day === this.lastDay) return;
+    this.lastDay = day;
+    const sep = document.createElement('div');
+    sep.className = 'day-sep';
+    sep.textContent = day;
+    this.list.appendChild(sep);
+  }
+
+  _closeActivity() {
+    const a = this.activity;
+    if (!a) return;
+    a.block.classList.remove('open');
+    a.head.textContent = `${a.n} step${a.n === 1 ? '' : 's'}`;
+    this.activity = null;
+  }
+
+  _append(m, animate) {
+    if (m.kind === 'progress') {
+      this._appendProgress(m, animate);
+      return;
+    }
+    this._closeActivity();
+    this._daySep(m.ts || Date.now());
     const el = this._renderMsg(m, animate);
     this.list.appendChild(el);
     const rec = { msg: m, el };

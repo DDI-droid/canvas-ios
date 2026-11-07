@@ -1555,6 +1555,43 @@ html.is-fs #chatScroll { touch-action: none; }
 }
 [data-theme="dark"] .voice-opts button.on { background: rgba(255, 255, 255, .16); }
 .voice-empty { padding: 8px 10px; font-size: var(--t-sm); color: var(--fg-3); }
+/* progress notes: what the agent is doing, folded into "N steps" once it replies */
+.activity { margin: 2px 0 10px 38px; font-size: var(--t-sm); color: var(--fg-3); }
+.activity-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  font-size: var(--t-cap);
+  font-weight: 650;
+  letter-spacing: .02em;
+  color: var(--fg-3);
+}
+.activity-head::before { content: '▸'; font-size: 10px; transition: transform var(--d2) var(--ease); }
+.activity.expanded .activity-head::before, .activity.open .activity-head::before { transform: rotate(90deg); }
+.activity.open .activity-head::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent, #d2693f);
+  animation: activity-pulse 1.2s ease-in-out infinite;
+}
+@keyframes activity-pulse { 50% { opacity: .25; } }
+.activity .steps {
+  display: none;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+  padding-left: 10px;
+  border-left: 2px solid var(--line);
+}
+.activity.open .steps, .activity.expanded .steps { display: flex; }
+.step { display: flex; align-items: baseline; gap: 8px; line-height: 1.35; }
+.step-text { flex: 1; min-width: 0; }
+.step time { flex: none; font-size: 10px; opacity: .7; }
+.activity.open .step:last-child .step-text { color: var(--fg-2); }
+
 /* sessions: one board + chat per Claude session */
 .session-btn {
   display: inline-flex;
