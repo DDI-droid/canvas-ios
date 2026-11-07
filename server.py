@@ -696,6 +696,8 @@ class Sessions:
         self.items: dict[str, Session] = {}
         for name in sorted(os.listdir(SESSIONS_DIR)):
             if SESSION_ID_RE.match(name) and os.path.isdir(os.path.join(SESSIONS_DIR, name)):
+                if read_json_obj(os.path.join(SESSIONS_DIR, name, "meta.json")).get("archived"):
+                    continue
                 self.items[name] = Session(name, self)
         if "main" not in self.items:
             self.items["main"] = Session("main", self)
@@ -732,7 +734,15 @@ class Sessions:
             sess._talker.reset()
         dest = os.path.join(SESSIONS_DIR, ".archive", f"{sid}-{datetime.now():%Y%m%d-%H%M%S}")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.move(sess.dir, dest)
+        for _ in range(30):  # Windows: a just-killed process may hold the folder for a moment
+            try:
+                shutil.move(sess.dir, dest)
+                return True
+            except OSError:
+                time.sleep(0.1)
+        # still locked: leave the folder, but hide the session from now on
+        sess.meta["archived"] = True
+        sess.save_meta()
         return True
 
     def summaries(self) -> list:

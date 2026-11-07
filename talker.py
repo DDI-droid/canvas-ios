@@ -188,10 +188,19 @@ class Talker:
             pass
 
     def _kill(self) -> None:
+        """Stop Claude Code and everything it started (its voice-tools MCP server). On Windows,
+        killing the parent leaves the children running, holding the session folder open."""
         if self.proc is not None:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.proc.pid)],
+                               capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             try:
                 self.proc.kill()
             except OSError:
+                pass
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:
                 pass
         self.proc = None
 
