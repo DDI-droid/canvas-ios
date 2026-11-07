@@ -23,7 +23,7 @@ import argparse
 import re
 import time
 
-from _client import call, die, setup_utf8
+from _client import call, die, setup_utf8, add_session_arg, use_session
 
 
 def bbox(stroke) -> tuple[float, float, float, float]:
@@ -68,7 +68,9 @@ def main() -> None:
     ap.add_argument("--mode", choices=["inside", "center"], default="inside")
     ap.add_argument("--last", type=int, default=30)
     ap.add_argument("--dry-run", action="store_true")
+    add_session_arg(ap)
     args = ap.parse_args()
+    use_session(args)
 
     strokes = (call("GET", "/api/state") or {}).get("strokes") or []
 

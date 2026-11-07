@@ -5,7 +5,7 @@ import { ChatPanel } from './chat.js';
 import { Voice, voiceSupported } from './voice.js';
 import { Live, rankVoices } from './live.js';
 import { buildSnapshot, buildTimeline, makeThumb } from './snapshot.js';
-import { api, EventStream, KEY } from './api.js';
+import { api, EventStream, KEY, SESSION, sessionKey, switchSession } from './api.js';
 import { COLORS, inkColor } from './palette.js';
 import { hydrateIcons, icon } from './icons.js';
 import { confirmSheet, hud, lightbox, popover, toast } from './ui.js';
@@ -39,7 +39,7 @@ const chat = new ChatPanel();
 const voice = new Voice(prefs.lang);
 const events = new EventStream('/api/events');
 
-let lastSendAt = store.get('lastSendAt', 0);
+let lastSendAt = store.get(sessionKey('lastSendAt'), 0);
 let sending = false;
 const outbox = new Map();
 
@@ -155,7 +155,7 @@ $('#selection').addEventListener('click', (e) => {
 
 // ------------------------------------------------------------------ board events
 
-const saveCam = debounce(() => store.set('cam', board.cam), 400);
+const saveCam = debounce(() => store.set(sessionKey('cam'), board.cam), 400);
 board.addEventListener('tool', refreshToolbar);
 board.addEventListener('history', refreshToolbar);
 board.addEventListener('hud', (e) => hud(e.detail.text, e.detail.icon));
@@ -238,7 +238,7 @@ async function saveStrokes() {
   }
   saveInFlight = true;
   const body = JSON.stringify({ strokes: board.serialize(), client: CLIENT_ID });
-  store.set('pendingStrokes', body.length < 4.5e6 ? body : null);
+  store.set(sessionKey('pendingStrokes'), body.length < 4.5e6 ? body : null);
   try {
     await api.put('/api/strokes', body, { timeout: 45000 });
     store.remove('pendingStrokes');
@@ -427,7 +427,7 @@ async function send(opts = {}) {
     chat.setInterim('');
   }
   lastSendAt = clientTs;
-  store.set('lastSendAt', lastSendAt);
+  store.set(sessionKey('lastSendAt'), lastSendAt);
   updateInkChip();
   updateCaption();
   chat.setStatus('sending');
@@ -818,10 +818,10 @@ async function resync({ includeStrokes = false } = {}) {
   chat.setStatus(st.status || 'idle');
   if (!outbox.size) {
     lastSendAt = deriveLastSend(st.conversation);
-    store.set('lastSendAt', lastSendAt);
+    store.set(sessionKey('lastSendAt'), lastSendAt);
   }
   if (includeStrokes) {
-    const pending = store.get('pendingStrokes', null);
+    const pending = store.get(sessionKey('pendingStrokes'), null);
     let strokes = st.strokes || [];
     let restoredLocal = false;
     if (pending) {
@@ -929,6 +929,127 @@ $('#voiceOpts').addEventListener('click', (e) => {
   renderVoices();
 });
 
+// ---- sessions: one board + chat per Claude session (on this PC, another machine, or in the cloud).
+// The switcher is in the panel title. A Claude session attaches with canvas_agent.py; the
+// instructions it needs are served at /agent. Unread dots compare each session's last reply
+// with when you last saw it; the green dot means a Claude session is attached and listening.
+popover($('#sessionPop'), $('#btnSession'), { onOpen: () => renderSessions() });
+let sessionList = [];
+const seen = store.get('sessionSeen', {});
+function markSeen(id, ts) {
+  seen[id] = Math.max(seen[id] || 0, ts || Date.now());
+  store.set('sessionSeen', seen);
+}
+markSeen(SESSION, Date.now());
+const connectLink = (id) => `${location.origin}/agent?k=${encodeURIComponent(KEY)}&s=${encodeURIComponent(id)}`;
+const connectText = (id) => `Connect to my canvas as session "${id}". Follow the instructions at ${connectLink(id)}`;
+
+function updateSessionTitle() {
+  const cur = sessionList.find((x) => x.id === SESSION);
+  $('#sessionName').textContent = cur ? cur.title : SESSION;
+  $('#sessionUnread').hidden = !sessionList.some((x) => x.id !== SESSION && (x.last_reply || 0) > (seen[x.id] || 0));
+}
+
+function renderSessions() {
+  const box = $('#sessionList');
+  box.textContent = '';
+  for (const s of sessionList) {
+    const row = document.createElement('div');
+    row.className = 'session-row' + (s.id === SESSION ? ' on' : '');
+    const pick = document.createElement('button');
+    pick.className = 'session-pick';
+    pick.dataset.session = s.id;
+    const dot = document.createElement('span');
+    dot.className = 'session-agent' + (s.agent ? ' attached' : ''); // not 'live': .live styles the ink canvas
+    dot.title = s.agent ? 'A Claude session is attached' : 'No Claude session attached';
+    const title = document.createElement('span');
+    title.className = 'session-title';
+    title.textContent = s.title;
+    pick.append(dot, title);
+    if (s.id !== SESSION && (s.last_reply || 0) > (seen[s.id] || 0)) {
+      const u = document.createElement('span');
+      u.className = 'session-unread';
+      pick.append(u);
+    }
+    row.append(pick);
+    if (!s.agent) {
+      const copy = document.createElement('button');
+      copy.className = 'session-copy';
+      copy.dataset.copy = s.id;
+      copy.textContent = 'Connect';
+      row.append(copy);
+    }
+    box.append(row);
+  }
+}
+
+function onSessions(list) {
+  if (!Array.isArray(list)) return;
+  let changed = false;
+  for (const s of list) {
+    if (seen[s.id] === undefined) { seen[s.id] = s.last_reply || 0; changed = true; } // existing = read
+  }
+  if (changed) store.set('sessionSeen', seen);
+  sessionList = list;
+  updateSessionTitle();
+  if (!$('#sessionPop').hidden) renderSessions();
+}
+events.addEventListener('sessions', (e) => onSessions(e.detail));
+api.get('/api/sessions').then((r) => onSessions(r && r.sessions)).catch(() => {});
+
+async function showConnect(id, { open = false } = {}) {
+  const text = connectText(id);
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    copied = true;
+  } catch { /* clipboard not allowed here: the text is shown to copy by hand */ }
+  const help = $('#sessionHelp');
+  help.hidden = false;
+  help.textContent = '';
+  const p = document.createElement('p');
+  p.textContent = (copied ? 'Copied. ' : '') +
+    'Paste this into any Claude Code session (on this PC, another machine, or in the cloud) to attach it to this board:';
+  const cmd = document.createElement('div');
+  cmd.className = 'session-cmd';
+  cmd.textContent = text;
+  help.append(p, cmd);
+  if (open && id !== SESSION) {
+    const go = document.createElement('button');
+    go.className = 'menu-row';
+    go.textContent = 'Open this session';
+    go.addEventListener('click', () => switchSession(id));
+    help.append(go);
+  }
+}
+
+$('#sessionList').addEventListener('click', (e) => {
+  const copy = e.target.closest('[data-copy]');
+  if (copy) {
+    showConnect(copy.dataset.copy, { open: true });
+    return;
+  }
+  const pick = e.target.closest('[data-session]');
+  if (pick && pick.dataset.session !== SESSION) switchSession(pick.dataset.session);
+});
+
+$('#newSessionForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = $('#newSessionName');
+  const title = input.value.trim();
+  if (!title) return;
+  try {
+    const s = await api.post('/api/sessions', { title });
+    input.value = '';
+    sessionList = [...sessionList.filter((x) => x.id !== s.id), s];
+    markSeen(s.id, Date.now());
+    renderSessions();
+    await showConnect(s.id, { open: true });
+  } catch (err) {
+    toast(`Couldn’t create the session: ${err.message}`, { tone: 'error' });
+  }
+});
+
 // ---- inside the iPad app (canvas/ios). It injects window.__canvasNative and runs speech on
 // Apple's native engines (every installed voice, including Premium ones Safari hides).
 const native = window.__canvasNative || null;
@@ -1028,6 +1149,7 @@ events.addEventListener('message', (e) => {
 events.addEventListener('reply', (e) => {
   if (!e.detail) return;
   chat.add(e.detail, { animate: true });
+  markSeen(SESSION, e.detail.ts);
   // a main-agent reply while live: the talker says the gist out loud
   if (live.on && e.detail.source !== 'talker') live.onMainReply(e.detail.text);
 });
@@ -1072,7 +1194,7 @@ function restorePrefs() {
   $('#optLang').value = prefs.lang;
   chat.setMode(prefs.mode);
   setLayerVisible(prefs.layer !== false);
-  const cam = store.get('cam', null);
+  const cam = store.get(sessionKey('cam'), null);
   if (cam && Number.isFinite(cam.x) && Number.isFinite(cam.z)) board.setCamera(cam.x, cam.y, cam.z, { silent: true });
   $('#zoomLabel').textContent = `${Math.round(board.cam.z * 100)}%`;
 }
@@ -1091,12 +1213,16 @@ async function boot() {
     const st = await resync({ includeStrokes: true });
     if (!board.strokes.length && !(st.conversation || []).length) showHint();
   } catch (err) {
+    if (err.status === 404 && SESSION !== 'main') {
+      switchSession('main'); // that session no longer exists
+      return;
+    }
     if (err.status === 401) {
       $('#lockedMsg').textContent = 'This link’s key was rejected. Open the URL printed by server.py.';
       $('#locked').hidden = false;
     } else {
       toast('Can’t reach the Canvas server — retrying…', { tone: 'error' });
-      const pending = store.get('pendingStrokes', null);
+      const pending = store.get(sessionKey('pendingStrokes'), null);
       if (pending) {
         try { board.load(JSON.parse(pending).strokes || []); } catch { /* ignore */ }
       }

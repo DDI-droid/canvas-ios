@@ -16,15 +16,42 @@ function resolveKey() {
 
 export const KEY = resolveKey();
 
+// Which canvas session (board + chat) this page shows: ?s=, else the last one used, else main.
+// Each Claude session (local, another machine, or cloud) owns one; see /agent.
+const SESSION_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+function resolveSession() {
+  const s = (new URLSearchParams(location.search).get('s') || '').trim().toLowerCase();
+  if (SESSION_RE.test(s)) {
+    store.set('session', s);
+    return s;
+  }
+  const saved = store.get('session', 'main');
+  return SESSION_RE.test(saved) ? saved : 'main';
+}
+
+export const SESSION = resolveSession();
+
+// localStorage keys that belong to one board (camera, offline strokes, ...)
+export const sessionKey = (k) => (SESSION === 'main' ? k : `${k}:${SESSION}`);
+
+export function switchSession(id) {
+  store.set('session', id);
+  const u = new URL(location.href);
+  u.searchParams.set('s', id);
+  location.replace(u.toString());
+}
+
 export function withKey(url) {
   if (!url) return url;
-  return url + (url.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(KEY);
+  const sep = url.includes('?') ? '&' : '?';
+  const s = /[?&]s=/.test(url) ? '' : '&s=' + encodeURIComponent(SESSION);
+  return url + sep + 'k=' + encodeURIComponent(KEY) + s;
 }
 
 async function request(method, path, body, { timeout = 30000 } = {}) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeout);
-  const opts = { method, headers: { 'X-Canvas-Key': KEY }, cache: 'no-store', signal: ctl.signal };
+  const opts = { method, headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': SESSION }, cache: 'no-store', signal: ctl.signal };
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = typeof body === 'string' ? body : JSON.stringify(body);
@@ -100,6 +127,7 @@ export class EventStream extends EventTarget {
         if (gen !== this.gen) return;
         this.backoff = 1000;
         this._set('open');
+        if (body.sessions) this._emit('sessions', body.sessions);
         if (body.reset) {
           this.epoch = body.epoch;
           this.since = body.next;

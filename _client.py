@@ -1,4 +1,6 @@
-"""Shared stdlib client for the canvas helper CLIs (say.py, status.py, draw.py)."""
+"""Shared stdlib client for the local canvas helper CLIs (say.py, status.py, draw.py, ink.py).
+
+Claude sessions elsewhere (another machine, the cloud) use canvas_agent.py instead."""
 from __future__ import annotations
 
 import json
@@ -12,6 +14,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 TOKEN_FILE = os.path.join(DATA_DIR, "token.txt")
 SERVER_INFO = os.path.join(DATA_DIR, "server.json")
+# which canvas session (board + chat) to talk to: -s/--session on the CLIs, else $CANVAS_SESSION
+SESSION = os.environ.get("CANVAS_SESSION", "main")
+
+
+def add_session_arg(ap) -> None:
+    ap.add_argument("-s", "--session", help="canvas session id (default: $CANVAS_SESSION or main)")
+
+
+def use_session(args) -> None:
+    global SESSION
+    if getattr(args, "session", None):
+        SESSION = args.session.strip().lower()
 
 
 def setup_utf8() -> None:
@@ -57,7 +71,7 @@ def base_url(port: int | None = None) -> str:
 def call(method: str, path: str, payload=None, port: int | None = None, timeout: float = 30):
     url = base_url(port) + path
     data = None
-    headers = {"X-Canvas-Key": read_token(), "Accept": "application/json"}
+    headers = {"X-Canvas-Key": read_token(), "Accept": "application/json", "X-Canvas-Session": SESSION}
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json; charset=utf-8"

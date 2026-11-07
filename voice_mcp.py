@@ -21,6 +21,7 @@ import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CANVAS_URL = os.environ.get("CANVAS_URL", "http://127.0.0.1:8765").rstrip("/")
+CANVAS_SESSION = os.environ.get("CANVAS_SESSION", "main")
 
 TOOLS = [
     {
@@ -78,7 +79,8 @@ def _token() -> str:
 
 
 def _look() -> list:
-    req = urllib.request.Request(CANVAS_URL + "/api/talk/board?wait=9", headers={"X-Canvas-Key": _token()})
+    req = urllib.request.Request(CANVAS_URL + "/api/talk/board?wait=9",
+                                 headers={"X-Canvas-Key": _token(), "X-Canvas-Session": CANVAS_SESSION})
     try:
         with urllib.request.urlopen(req, timeout=12) as res:
             data = json.loads(res.read().decode("utf-8"))

@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from _client import call, die, read_file, read_stdin, setup_utf8
+from _client import call, die, read_file, read_stdin, setup_utf8, add_session_arg, use_session
 
 
 def main() -> None:
@@ -27,7 +27,9 @@ def main() -> None:
     ap.add_argument("--file", "-f", help="read markdown from this UTF-8 file")
     ap.add_argument("--status", help="status to set after the reply (default: idle)")
     ap.add_argument("--port", type=int, help="server port (default: from data/server.json or 8765)")
+    add_session_arg(ap)
     args = ap.parse_args()
+    use_session(args)
 
     if args.file:
         text = read_file(args.file)

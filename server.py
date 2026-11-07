@@ -21,6 +21,7 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import socket
 import socketserver
 import sys
@@ -47,6 +48,9 @@ STROKES_FILE = os.path.join(DATA_DIR, "strokes.json")
 LAYER_FILE = os.path.join(DATA_DIR, "claude_layer.json")
 EVENTS_LOG = os.path.join(DATA_DIR, "events.log")
 SERVER_INFO = os.path.join(DATA_DIR, "server.json")
+SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")  # one folder per canvas session (board + chat)
+SESSION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+AGENT_CLIENT = os.path.join(BASE_DIR, "canvas_agent.py")
 STATIC_ROOT = os.path.normcase(os.path.realpath(STATIC_DIR))
 
 # ---- asset versioning
@@ -101,6 +105,71 @@ CONTROL_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 
 # Explicit MIME map: on Windows `mimetypes` reads the registry, which can map .js to
 # text/plain and break ES module loading.
+# Served at /agent: how any Claude session attaches ({ORIGIN}, {KEY}, {SESSION} filled in per request).
+AGENT_DOC = r"""# Attach to the user's iPad canvas (session `{SESSION}`)
+
+The user works on an iPad canvas: an infinite board they draw on with Apple Pencil, a chat panel,
+and hands-free voice. It is served from their PC, and every Claude session gets its own canvas
+*session*, meaning its own board and chat. You are attaching as session **`{SESSION}`**. This works
+the same from a local session, a session on another machine, or a cloud session.
+
+## 1. Get the client (one file: Python 3, standard library only)
+
+```bash
+curl -fsSL "{ORIGIN}/agent/canvas_agent.py?k={KEY}" -o canvas_agent.py
+```
+
+If that fails in a cloud sandbox, the environment's network settings must allow `{ORIGIN}`.
+
+## 2. Connect (once)
+
+```bash
+python canvas_agent.py connect "{ORIGIN}/?k={KEY}" --session {SESSION} --title "<a short title for this work>"
+```
+
+This creates the session if it doesn't exist, and saves the link in `~/.canvas_agent/`. The session
+then appears in the user's session switcher in the canvas, marked as connected while you're waiting.
+
+## 3. The loop: wait, read, reply, wait again
+
+1. Run `python canvas_agent.py wait -s {SESSION}` **in the background**. In Claude Code, use
+   `run_in_background` and you'll be notified when it exits. It blocks until the user sends
+   something, then prints:
+   - the message text
+   - the path of the board snapshot (a PNG). Open it with your image or Read tool. New ink is
+     drawn at full strength, older ink faded.
+   - a timeline of what they said and drew, including the px→world mapping.
+2. Do the work.
+3. Reply. Write markdown to a file first, so the shell doesn't mangle `$math$`:
+   ```bash
+   python canvas_agent.py say -s {SESSION} --file reply.md
+   ```
+   KaTeX works: `$x^2$`, `$$\int f$$`.
+4. Start `wait` again. Keep this loop going while you're attached.
+
+## Replying well
+
+- The user reads on an iPad, often while drawing or talking. Make the first sentence a standalone
+  summary, keep it short, and end with one clear question when you need their input.
+- Messages that start with 🎙 come from the canvas's voice assistant (a fast Haiku that talks
+  with the user). It passes on spoken requests, and `(heard: "…")` shows the user's own words.
+  While voice mode is on, the gist of your reply is spoken to them.
+- Use the board. Draw an SVG in world coordinates; the timeline gives the user's current view:
+  ```bash
+  python canvas_agent.py draw -s {SESSION} --svg fig.svg --x 100 --y 200 --width 600 --id fig1 --label "what it shows"
+  python canvas_agent.py draw -s {SESSION} --list | --remove fig1 | --clear
+  ```
+  For SVGs, set a `viewBox`, use `font-family="-apple-system, system-ui, sans-serif"`, dark text
+  `#1d1d1f`, blue `#0a84ff`, red `#ff3b30`, and text at least 16 px. Don't use scripts.
+- Long job: `python canvas_agent.py status -s {SESSION} "Running the sweep…"` shows progress in
+  the canvas.
+
+## Rules
+
+- Always pass `-s {SESSION}`. Other sessions belong to other Claude sessions.
+- The link contains the user's secret key. Never commit it or share it anywhere else.
+"""
+
 MIME = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -148,9 +217,31 @@ def now_ms() -> int:
 
 
 def ensure_dirs() -> None:
-    os.makedirs(INBOX_DIR, exist_ok=True)
-    if not os.path.exists(EVENTS_LOG):
-        open(EVENTS_LOG, "ab").close()
+    """Create data/sessions/main. A single-board install (data/conversation.json, ...) moves
+    into it, so the existing board and chat become the "main" session."""
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    main_dir = os.path.join(SESSIONS_DIR, "main")
+    if not os.path.isdir(main_dir):
+        os.makedirs(main_dir)
+        for name in ("conversation.json", "strokes.json", "claude_layer.json", "events.log", "inbox"):
+            src = os.path.join(DATA_DIR, name)
+            if os.path.exists(src):
+                shutil.move(src, os.path.join(main_dir, name))
+        write_json_atomic(os.path.join(main_dir, "meta.json"), {"title": "Main", "created": now_ms()}, pretty=True)
+
+
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:32].strip("-")
+    return slug or "session"
+
+
+def read_json_obj(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def load_or_create_token() -> str:
@@ -208,21 +299,26 @@ def write_json_atomic(path: str, obj, pretty: bool = False) -> None:
 
 
 class Store:
-    def __init__(self) -> None:
+    """One session's board and chat, kept in memory and saved under its folder."""
+
+    def __init__(self, folder: str) -> None:
         self.lock = threading.RLock()
-        self.conversation = read_json_list(CONV_FILE)
-        self.strokes = read_json_list(STROKES_FILE)
-        self.layer = read_json_list(LAYER_FILE)
+        self.conv_file = os.path.join(folder, "conversation.json")
+        self.strokes_file = os.path.join(folder, "strokes.json")
+        self.layer_file = os.path.join(folder, "claude_layer.json")
+        self.conversation = read_json_list(self.conv_file)
+        self.strokes = read_json_list(self.strokes_file)
+        self.layer = read_json_list(self.layer_file)
         self.status = {"status": "idle", "ts": now_ms()}
 
     def save_conversation(self) -> None:
-        write_json_atomic(CONV_FILE, self.conversation, pretty=True)
+        write_json_atomic(self.conv_file, self.conversation, pretty=True)
 
     def save_strokes(self) -> None:
-        write_json_atomic(STROKES_FILE, self.strokes)
+        write_json_atomic(self.strokes_file, self.strokes)
 
     def save_layer(self) -> None:
-        write_json_atomic(LAYER_FILE, self.layer, pretty=True)
+        write_json_atomic(self.layer_file, self.layer, pretty=True)
 
 
 # --------------------------------------------------------------------------- SSE hub
@@ -475,7 +571,117 @@ class VoiceState:
             return f'[status] main agent: working on "{self.task[:240]}" ({secs} s so far)'
 
 
-VOICE = VoiceState()
+class Session:
+    """A canvas session: one board + chat, served to the page and to one Claude agent.
+
+    Any Claude Code session (on this PC, another machine, or in the cloud) attaches with
+    canvas_agent.py over HTTP: GET /api/agent/next long-polls for the user's next message,
+    and replies/drawings go to the normal endpoints with ?s=<id>.
+    """
+
+    def __init__(self, sid: str, registry: "Sessions") -> None:
+        self.id = sid
+        self.registry = registry
+        self.dir = os.path.join(SESSIONS_DIR, sid)
+        self.inbox = os.path.join(self.dir, "inbox")
+        self.events_log = os.path.join(self.dir, "events.log")
+        os.makedirs(self.inbox, exist_ok=True)
+        if not os.path.exists(self.events_log):
+            open(self.events_log, "ab").close()
+        self.meta_file = os.path.join(self.dir, "meta.json")
+        self.meta = read_json_obj(self.meta_file) or {"title": sid, "created": now_ms()}
+        self.store = Store(self.dir)
+        self.hub = Hub()
+        self.voice = VoiceState()
+        self.events_lock = threading.Lock()
+        self.msg_cond = threading.Condition()  # wakes agents waiting for the next message
+        self.agent_seen = 0.0                  # last time an agent polled or wrote here
+        self._talker = None
+        self._talker_lock = threading.Lock()
+
+    def save_meta(self) -> None:
+        write_json_atomic(self.meta_file, self.meta, pretty=True)
+
+    def talker(self):
+        """This session's voice talker (a Haiku process), started on first use."""
+        if talker_mod is None:
+            return None
+        with self._talker_lock:
+            if self._talker is None:
+                self._talker = talker_mod.Talker(os.path.join(self.dir, "talker"), log=log,
+                                                 canvas_url=self.registry.canvas_url, session=self.id)
+            return self._talker
+
+    def touch_agent(self) -> None:
+        self.agent_seen = time.time()
+
+    def agent_connected(self) -> bool:
+        return time.time() - self.agent_seen < 75
+
+    def user_messages(self) -> list:
+        with self.store.lock:
+            return [e for e in self.store.conversation
+                    if e.get("role") == "user" and e.get("source") not in ("chat", "voice")]
+
+    def next_message_after(self, after: str):
+        msgs = self.user_messages()
+        ids = [m.get("id") for m in msgs]
+        if after not in ids:
+            return None
+        i = ids.index(after)
+        return msgs[i + 1] if i + 1 < len(msgs) else None
+
+    def latest_message_id(self) -> str:
+        msgs = self.user_messages()
+        return msgs[-1].get("id") if msgs else ""
+
+    def summary(self) -> dict:
+        st = self.store
+        with st.lock:
+            conv = st.conversation
+            last_reply = next((e.get("ts") or 0 for e in reversed(conv) if e.get("role") == "claude"), 0)
+            last_activity = (conv[-1].get("ts") or 0) if conv else self.meta.get("created", 0)
+            status = st.status.get("status")
+        return {"id": self.id, "title": self.meta.get("title") or self.id,
+                "created": self.meta.get("created", 0), "last_reply": last_reply,
+                "last_activity": last_activity, "status": status, "agent": self.agent_connected()}
+
+
+class Sessions:
+    """All canvas sessions (folders under data/sessions/). "main" always exists."""
+
+    def __init__(self, canvas_url: str) -> None:
+        self.canvas_url = canvas_url
+        self.lock = threading.Lock()
+        self.items: dict[str, Session] = {}
+        for name in sorted(os.listdir(SESSIONS_DIR)):
+            if SESSION_ID_RE.match(name) and os.path.isdir(os.path.join(SESSIONS_DIR, name)):
+                self.items[name] = Session(name, self)
+        if "main" not in self.items:
+            self.items["main"] = Session("main", self)
+
+    def get(self, sid: str):
+        with self.lock:
+            return self.items.get(sid)
+
+    def all(self) -> list:
+        with self.lock:
+            return list(self.items.values())
+
+    def create(self, title: str, sid: str = "") -> Session:
+        sid = slugify(sid or title)
+        with self.lock:
+            if sid in self.items:
+                return self.items[sid]
+            sess = Session(sid, self)
+            sess.meta = {"title": (title or sid).strip()[:60] or sid, "created": now_ms()}
+            sess.save_meta()
+            self.items[sid] = sess
+            return sess
+
+    def summaries(self) -> list:
+        return sorted((x.summary() for x in self.all()),
+                      key=lambda d: (d["id"] != "main", -(d["last_activity"] or 0)))
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -484,9 +690,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     sys_version = ""
     timeout = 75
 
-    store: Store = None  # type: ignore[assignment]
-    hub: Hub = None  # type: ignore[assignment]
-    talker = None  # talker_mod.Talker | None
+    sessions: "Sessions" = None  # type: ignore[assignment]
+    # set per request from ?s= / X-Canvas-Session (see _dispatch)
+    session: "Session | None" = None
+    store: "Store | None" = None
+    hub: "Hub | None" = None
+    voice: "VoiceState | None" = None
     token: str = ""
     events_lock = threading.Lock()
 
@@ -521,6 +730,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not self._authorized():
                 self._unauthorized(path)
                 return
+            self._bind_session()
             self._route(self.command, path)
         except HttpError as e:
             if e.code >= 500:
@@ -546,9 +756,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if method not in ("GET", "HEAD"):
                 raise HttpError(405, "method not allowed")
             return self._serve_app(path)
+        if path in ("/agent", "/agent/", "/agent/canvas_agent.py"):
+            if method not in ("GET", "HEAD"):
+                raise HttpError(405, "method not allowed")
+            return self._serve_agent(path)
         if method not in ("GET", "HEAD"):
             raise HttpError(405, "method not allowed")
         return self._serve_static(path)
+
+    def _bind_session(self) -> None:
+        """Which canvas session this request is about: ?s=, else X-Canvas-Session, else main."""
+        sid = (self.query.get("s", [""])[0] or self.headers.get("X-Canvas-Session") or "main").strip().lower()
+        self.sid = sid
+        sess = self.sessions.get(sid) if SESSION_ID_RE.match(sid) else None
+        self.session = sess
+        self.store = sess.store if sess else None
+        self.hub = sess.hub if sess else None
+        self.voice = sess.voice if sess else None
+
+    GLOBAL_ROUTES = {"/api/ping", "/api/sessions", "/api/clientlog"}
 
     def _route_api(self, method: str, path: str):
         routes = {
@@ -562,6 +788,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("POST", "/api/talk/board"): self._api_talk_board_put,
             ("GET", "/api/talk/board"): self._api_talk_board_get,
             ("POST", "/api/clientlog"): self._api_clientlog,
+            ("GET", "/api/sessions"): self._api_sessions_list,
+            ("POST", "/api/sessions"): self._api_sessions_create,
+            ("GET", "/api/agent/next"): self._api_agent_next,
             ("GET", "/api/ping"): self._api_ping,
             ("POST", "/api/message"): self._api_message,
             ("POST", "/api/reply"): self._api_reply,
@@ -573,11 +802,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("POST", "/api/strokes"): self._api_strokes,
         }
         fn = routes.get(("GET" if method == "HEAD" else method, path))
+        if fn and self.session is None and path not in self.GLOBAL_ROUTES:
+            raise HttpError(404, f"no canvas session {self.sid!r}")
         if fn:
             return fn()
+        if self.session is None and path.startswith(("/api/inbox/", "/api/draw/")):
+            raise HttpError(404, f"no canvas session {self.sid!r}")
         m = re.match(r"^/api/inbox/([^/]+)/snapshot\.png$", path)
         if m and method in ("GET", "HEAD"):
             return self._api_snapshot(m.group(1))
+        m = re.match(r"^/api/inbox/([^/]+)/timeline\.txt$", path)
+        if m and method in ("GET", "HEAD"):
+            return self._api_timeline(m.group(1))
         m = re.match(r"^/api/draw/([^/]+)$", path)
         if m and method == "DELETE":
             return self._remove_draw(m.group(1))
@@ -806,9 +1042,101 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, source)
         raise HttpError(404, "not found")
 
+    # ---- sessions
+    def _api_sessions_list(self):
+        self._send_json(200, {"sessions": self.sessions.summaries()})
+
+    def _api_sessions_create(self):
+        """Create (or return, if the id exists) a session. Body: {title, id?}."""
+        body = self._read_json()
+        title = body.get("title") if isinstance(body.get("title"), str) else ""
+        sid = body.get("id") if isinstance(body.get("id"), str) else ""
+        if not (title.strip() or sid.strip()):
+            raise HttpError(400, "title is required")
+        sess = self.sessions.create(title.strip() or sid.strip(), sid.strip())
+        log(f"session {sess.id} ({sess.meta.get('title')})")
+        self._send_json(200, sess.summary())
+
+    # ---- the agent side: a Claude Code session attached to this canvas session
+    def _api_agent_next(self):
+        """Long-poll for the user's next message after `after` (a message id; empty = from now).
+
+        Returns {message: {...} | null, latest}. The message carries the text, the timeline
+        text and the snapshot URL (fetch it with the key). Marks the agent as connected, and
+        sets the page's status to "thinking" when it hands over a message.
+        """
+        sess = self.session
+        after = self.query.get("after", [""])[0]
+        try:
+            wait = min(max(float(self.query.get("wait", ["25"])[0]), 0.0), 25.0)
+        except ValueError:
+            wait = 25.0
+        if not after or after not in [m.get("id") for m in sess.user_messages()]:
+            after = sess.latest_message_id()
+        sess.touch_agent()
+        deadline = time.monotonic() + wait
+        msg = None
+        with sess.msg_cond:
+            while True:
+                msg = sess.next_message_after(after) if after else (sess.user_messages() or [None])[0]
+                left = deadline - time.monotonic()
+                if msg is not None or left <= 0:
+                    break
+                sess.msg_cond.wait(left)
+        sess.touch_agent()
+        if msg is None:
+            return self._send_json(200, {"message": None, "latest": after})
+        mid = msg.get("id")
+        timeline = ""
+        try:
+            with open(os.path.join(sess.inbox, mid, "timeline.txt"), "r", encoding="utf-8") as f:
+                timeline = f.read()[:20000]
+        except OSError:
+            pass
+        has_png = os.path.isfile(os.path.join(sess.inbox, mid, "snapshot.png"))
+        self._set_status("thinking")
+        self._send_json(200, {"latest": mid, "message": {
+            "id": mid, "session": sess.id, "text": msg.get("text") or "", "ts": msg.get("ts"),
+            "mode": msg.get("mode"),
+            "snapshot": f"/api/inbox/{mid}/snapshot.png?s={sess.id}" if has_png else None,
+            "timeline": timeline,
+        }})
+
+    def _api_timeline(self, mid: str):
+        if not MSG_ID_RE.match(mid):
+            raise HttpError(404, "not found")
+        p = os.path.join(self.session.inbox, mid, "timeline.txt")
+        if not os.path.isfile(p):
+            raise HttpError(404, "not found")
+        with open(p, "rb") as f:
+            body = f.read()
+        self._send(200, body, "text/plain; charset=utf-8")
+
+    def _origin(self) -> str:
+        proto = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+        return f"{proto}://{self.headers.get('Host') or f'{HOST}:{self.server.server_address[1]}'}"
+
+    def _serve_agent(self, path: str):
+        """/agent: how any Claude Code session (local, another machine, or cloud) attaches to
+        this canvas. /agent/canvas_agent.py: the client it downloads. Both need the key."""
+        if path.endswith(".py"):
+            try:
+                with open(AGENT_CLIENT, "rb") as f:
+                    body = f.read()
+            except OSError:
+                raise HttpError(404, "canvas_agent.py missing")
+            return self._send(200, body, "text/x-python; charset=utf-8")
+        origin = self._origin()
+        k = urllib.parse.quote(self.token, safe="")
+        sid = self.query.get("s", [""])[0]
+        sid = slugify(sid) if sid else "<name>"
+        doc = AGENT_DOC.replace("{ORIGIN}", origin).replace("{KEY}", k).replace("{SESSION}", sid)
+        self._send(200, doc.encode("utf-8"), "text/markdown; charset=utf-8")
+
     # ---- API: reads
     def _api_ping(self):
-        self._send_json(200, {"ok": True, "time": now_ms(), "clients": self.hub.count()})
+        clients = sum(x.hub.count() for x in self.sessions.all())
+        self._send_json(200, {"ok": True, "time": now_ms(), "clients": clients})
 
     def _api_state(self):
         st = self.store
@@ -826,7 +1154,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _api_snapshot(self, mid: str):
         if not MSG_ID_RE.match(mid):
             raise HttpError(404, "not found")
-        p = os.path.join(INBOX_DIR, mid, "snapshot.png")
+        p = os.path.join(self.session.inbox, mid, "snapshot.png")
         if not os.path.isfile(p):
             raise HttpError(404, "not found")
         with open(p, "rb") as f:
@@ -895,9 +1223,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         st = self.store
         with st.lock:
             mid = new_msg_id()
-            while os.path.exists(os.path.join(INBOX_DIR, mid)):
+            while os.path.exists(os.path.join(self.session.inbox, mid)):
                 mid = new_msg_id()
-            d = os.path.join(INBOX_DIR, mid)
+            d = os.path.join(self.session.inbox, mid)
             os.makedirs(d)
             img_path = os.path.abspath(os.path.join(d, "snapshot.png"))
             tl_path = os.path.abspath(os.path.join(d, "timeline.txt"))
@@ -937,15 +1265,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"MSG {mid} | {clean_line(text, EVENT_TEXT_MAX)} | "
                 f"img={img_path if png else 'none'} | timeline={tl_path}\n"
             )
-            with self.events_lock:
-                with open(EVENTS_LOG, "ab") as f:
+            with self.session.events_lock:
+                with open(self.session.events_log, "ab") as f:
                     f.write(line.encode("utf-8"))
                     f.flush()
                     os.fsync(f.fileno())
             status = dict(st.status)
-        log(f"message {mid} ({len(text)} chars, {len(png) if png else 0} B png, {mode})")
+        log(f"message {mid} [{self.session.id}] ({len(text)} chars, {len(png) if png else 0} B png, {mode})")
         self.hub.broadcast("message", entry)
         self.hub.broadcast("status", status)
+        with self.session.msg_cond:
+            self.session.msg_cond.notify_all()
         self._send_json(200, {"id": mid})
 
     def _api_strokes(self):
@@ -989,8 +1319,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with st.lock:
             st.conversation.append(entry)
             st.save_conversation()
-        log(f"reply {entry['id']} ({len(text)} chars)")
-        VOICE.clear()
+        log(f"reply {entry['id']} [{self.session.id}] ({len(text)} chars)")
+        self.session.touch_agent()
+        self.voice.clear()
         self.hub.broadcast("reply", entry)
         self._set_status(status)
         self._send_json(200, {"id": entry["id"]})
@@ -1008,6 +1339,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         res = self.hub.poll(since, epoch, wait)
         with self.store.lock:
             res["status"] = self.store.status
+        res["sessions"] = self.sessions.summaries()  # the page's switcher: unread + connected
         self._send_json(200, res)
 
     def _api_mirror(self):
@@ -1037,7 +1369,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         log(f"mirror {role} {entry['id']} ({len(entry['text'])} chars)")
         self.hub.broadcast("message" if role == "user" else "reply", entry)
         if role == "claude":
-            VOICE.clear()
+            self.voice.clear()
             self._set_status("idle")
         elif body.get("thinking", True):
             self._set_status("thinking")
@@ -1055,7 +1387,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         The POST answers as soon as the first event exists, with {turn, events: [...so far]},
         so the first words don't wait for a long-poll round trip. The page de-duplicates by n.
         """
-        talker = self.talker
+        talker = self.session.talker()
         if talker is None:
             raise HttpError(503, "voice talker unavailable")
         body = self._read_json()
@@ -1079,7 +1411,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             chat = self._unseen_main_message()
             if chat:
                 parts.append(f'[chat] the main agent\'s latest message: "{chat}"')
-            if body.get("continued") and VOICE.fragment_seen:
+            if body.get("continued") and self.voice.fragment_seen:
                 parts.append("[continued] the user kept talking; this is the whole thing so far")
             parts.append(f'heard: "{heard}"')
             if body.get("done"):
@@ -1095,7 +1427,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             parts.append(f"main_agent_reply:\n{text.strip()[:8000]}")
         else:
             raise HttpError(400, "unknown kind")
-        parts.append(VOICE.status_line())
+        parts.append(self.voice.status_line())
         content = "\n".join(parts)
 
         turn_id = body.get("turn") if isinstance(body.get("turn"), str) else ""
@@ -1117,19 +1449,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if k == "say":
                 push({"say": data})
             elif k == "look":
-                VOICE.look_requested()
+                self.voice.look_requested()
                 push({"look": True})
             elif k == "handoff":
-                VOICE.delegate(data)
+                self.voice.delegate(data)
                 push({"handoff": data})
             elif k == "dismiss":
                 push({"dismiss": True})
 
         def still_wanted() -> bool:
-            if VOICE.is_cancelled(turn_id):
+            if self.voice.is_cancelled(turn_id):
                 return False
-            with VOICE.lock:
-                VOICE.running = turn_id
+            with self.voice.lock:
+                self.voice.running = turn_id
             return True
 
         def work():
@@ -1140,15 +1472,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 err = str(exc)
                 log(f"talker error: {exc}")
             finally:
-                with VOICE.lock:
-                    if VOICE.running == turn_id:
-                        VOICE.running = ""
+                with self.voice.lock:
+                    if self.voice.running == turn_id:
+                        self.voice.running = ""
             if res is None:
                 push({"done": True, "error": err or "talker failed"})
                 return
             if kind == "utterance" and res["mode"] != "cancelled":
                 # it saw these words; unless it answered or dismissed them, they're still pending
-                VOICE.fragment_seen = res["mode"] in ("silent", "look")
+                self.voice.fragment_seen = res["mode"] in ("silent", "look")
             push({"done": True, **{k: v for k, v in res.items() if k != "notes"}})
             log(f"talk {turn_id} {kind} -> {res['mode']} first={res['first_ms']}ms total={res['ms']}ms")
             self._log_voice(kind, heard, res, test=not body.get("log", True))
@@ -1169,10 +1501,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            if e.get("role") == "claude" and e.get("source") != "talker"), None)
         if not latest:
             return ""
-        with VOICE.lock:
-            if VOICE.seen_reply == latest.get("id"):
+        with self.voice.lock:
+            if self.voice.seen_reply == latest.get("id"):
                 return ""
-            VOICE.seen_reply = latest.get("id") or ""
+            self.voice.seen_reply = latest.get("id") or ""
         text = re.sub(r"\s+", " ", str(latest.get("text") or "")).strip()
         return "…" + text[-700:] if len(text) > 700 else text
 
@@ -1189,7 +1521,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^data:(image/(?:png|jpeg));base64,(.+)$", body.get("image") or "", re.S)
         if not m:
             raise HttpError(400, "image must be a PNG or JPEG data URL")
-        VOICE.look_arrived(m.group(1), m.group(2))
+        self.voice.look_arrived(m.group(1), m.group(2))
         self._send_json(200, {"ok": True})
 
     def _api_talk_board_get(self):
@@ -1198,7 +1530,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             wait = min(15.0, max(0.0, float(self.query.get("wait", ["9"])[0])))
         except ValueError:
             wait = 9.0
-        img = VOICE.look_wait(wait)
+        img = self.voice.look_wait(wait)
         if not img:
             raise HttpError(504, "no board snapshot arrived")
         self._send_json(200, img)
@@ -1220,17 +1552,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         turn = body.get("turn")
         if not isinstance(turn, str) or not turn:
             raise HttpError(400, "turn is required")
-        if VOICE.cancel(turn) and self.talker is not None:
-            self.talker.interrupt()
+        if self.voice.cancel(turn) and self.session.talker() is not None:
+            self.session.talker().interrupt()
         self._send_json(200, {"ok": True})
 
     def _api_talk_reset(self):
-        if self.talker is not None:
-            self.talker.reset()
-        VOICE.clear()
+        if self.session.talker() is not None:
+            self.session.talker().reset()
+        self.voice.clear()
         self._send_json(200, {"ok": True})
 
     def _api_status(self):
+        self.session.touch_agent()
         body = self._read_json()
         status = body.get("status")
         if not isinstance(status, str) or not status.strip():
@@ -1275,7 +1608,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 st.layer.append(item)
             st.save_layer()
-        log(f"draw {item_id} at ({item['x']:.0f},{item['y']:.0f})")
+        log(f"draw {item_id} [{self.session.id}] at ({item['x']:.0f},{item['y']:.0f})")
+        self.session.touch_agent()
         self.hub.broadcast("draw", item)
         self._send_json(200, {"id": item_id})
 
@@ -1345,16 +1679,13 @@ def main(argv=None) -> int:
 
     ensure_dirs()
     token = load_or_create_token()
-    Handler.store = Store()
-    Handler.hub = Hub()
+    Handler.sessions = Sessions(canvas_url=f"http://{HOST}:{args.port}")
     Handler.token = token
-    if talker_mod is not None:
-        Handler.talker = talker_mod.Talker(os.path.join(DATA_DIR, "talker"), log=log,
-                                           canvas_url=f"http://{HOST}:{args.port}")
-
+    main_talker = Handler.sessions.get("main").talker()
+    if main_talker is not None:
         def warm_talker():  # start Haiku now so the first spoken turn doesn't pay the ~5 s cold start
             try:
-                Handler.talker.turn("[voice talker starting up; nothing has been said yet. Don't speak or use any tool.]")
+                main_talker.turn("[voice talker starting up; nothing has been said yet. Don't speak or use any tool.]")
             except Exception as exc:
                 log(f"talker warmup failed: {exc}")
         threading.Thread(target=warm_talker, daemon=True).start()
@@ -1373,14 +1704,16 @@ def main(argv=None) -> int:
     print("Canvas server running", flush=True)
     print(f"  URL:    {url}", flush=True)
     print(f"  Token:  {token}", flush=True)
-    print(f"  Events: {EVENTS_LOG}", flush=True)
+    print(f"  Sessions: {', '.join(x.id for x in Handler.sessions.all())} (data/sessions/<id>/events.log)",
+          flush=True)
     QUIET = args.quiet
     try:
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
     finally:
-        Handler.hub.close_all()
+        for sess in Handler.sessions.all():
+            sess.hub.close_all()
         httpd.server_close()
         print("Canvas server stopped", flush=True)
     return 0

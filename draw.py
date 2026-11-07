@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 
-from _client import call, die, read_file, read_stdin, setup_utf8
+from _client import call, die, read_file, read_stdin, setup_utf8, add_session_arg, use_session
 
 
 def main() -> None:
@@ -32,7 +32,9 @@ def main() -> None:
     ap.add_argument("--clear", action="store_true", help="remove all Claude-layer items")
     ap.add_argument("--list", action="store_true", help="list current Claude-layer items")
     ap.add_argument("--port", type=int, help="server port (default: from data/server.json or 8765)")
+    add_session_arg(ap)
     args = ap.parse_args()
+    use_session(args)
 
     if args.clear:
         res = call("POST", "/api/draw/clear", {}, port=args.port)

@@ -1555,6 +1555,95 @@ html.is-fs #chatScroll { touch-action: none; }
 }
 [data-theme="dark"] .voice-opts button.on { background: rgba(255, 255, 255, .16); }
 .voice-empty { padding: 8px 10px; font-size: var(--t-sm); color: var(--fg-3); }
+/* sessions: one board + chat per Claude session */
+.session-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 230px;
+  padding: 4px 8px;
+  margin-left: -4px;
+  border-radius: 10px;
+  color: var(--fg);
+}
+.session-btn:hover, .session-btn.active { background: var(--fill-2); }
+.session-btn .name { display: none; } /* the Claude mark is right there; show the session */
+.session-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+  font-size: var(--t-body);
+  font-weight: 650;
+}
+
+.session-chev { color: var(--fg-3); font-size: 11px; }
+.session-unread-dot, .session-unread {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent, #d2693f);
+}
+.session-pop { left: 40px; }
+.session-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
+.session-row { display: flex; align-items: center; gap: 6px; }
+.session-pick {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 40px;
+  padding: 0 10px;
+  border-radius: 11px;
+  font-size: var(--t-sm);
+  font-weight: 600;
+  text-align: left;
+  color: var(--fg-2);
+}
+.session-row.on .session-pick { color: var(--fg); background: var(--fill-2); }
+.session-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-agent { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--fg-3); opacity: .45; }
+.session-agent.attached { background: #34c759; opacity: 1; }
+.session-copy {
+  flex: none;
+  padding: 6px 10px;
+  border-radius: 9px;
+  font-size: var(--t-cap);
+  font-weight: 650;
+  color: var(--fg-2);
+  background: var(--fill-2);
+}
+.new-session { display: flex; gap: 6px; margin-top: var(--s3); }
+.new-session input {
+  flex: 1;
+  min-width: 0;
+  height: 40px;
+  padding: 0 12px;
+  border-radius: 11px;
+  border: 0;
+  font: inherit;
+  font-size: var(--t-sm);
+  color: var(--fg);
+  background: var(--fill-2);
+}
+.new-session .menu-row { width: auto; flex: none; }
+.session-help { margin-top: var(--s3); font-size: var(--t-cap); line-height: 1.45; color: var(--fg-2); }
+.session-help p { margin: 0 0 6px; }
+.session-cmd {
+  padding: 8px 10px;
+  border-radius: 10px;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+  color: var(--fg);
+  background: var(--fill-2);
+}
+.session-help .menu-row { margin-top: 8px; }
+
 .menu-row {
   display: flex;
   align-items: center;

@@ -16,9 +16,21 @@ There are **two ways to use it**, and both use the same page and server:
    SideStore installs it, and you re-sign it every 7 days. The server offers the build at
    `/app/Canvas.ipa` and a SideStore source at `/app/source.json`.
 
+**Several Claude sessions at once.** Each Claude Code session, whether on this PC, another machine
+or in the cloud, gets its own canvas *session*: a board, chat and voice talker of its own. Switch
+between them from the Claude panel's title. To attach a session, make a new session in that menu
+(or tap **Connect** next to an existing one) and paste the line it gives you into the Claude session:
+
+> Connect to my canvas as session "research". Follow the instructions at `https://…/agent?k=…&s=research`
+
+The instructions page serves `canvas_agent.py`, a one-file Python client. The agent connects, then
+loops: `wait` for your next message, read the board snapshot, `say` a reply, and wait again. A cloud
+session must be allowed to reach the tunnel host.
+
 Files:
 
 - `server.py` – Python stdlib HTTP server (no dependencies). Binds **127.0.0.1 only**.
+- `canvas_agent.py` – the client any Claude session uses to attach to a canvas session (served at `/agent/canvas_agent.py`).
 - `say.py`, `status.py`, `draw.py`, `ink.py` – stdlib helper CLIs Claude uses to talk back and edit the board.
 - `talker.py`, `voice_mcp.py` – the live voice "talker" (Claude Haiku via Claude Code) and its tools.
 - `static/` – the web app (vanilla ES modules, no build step; libraries vendored in `static/vendor/`).

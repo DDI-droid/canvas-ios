@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 
-from _client import call, die, setup_utf8
+from _client import call, die, setup_utf8, add_session_arg, use_session
 
 
 def main() -> None:
@@ -17,7 +17,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Set the canvas status pill")
     ap.add_argument("status", nargs="+", help="thinking | idle | any short custom text")
     ap.add_argument("--port", type=int, help="server port (default: from data/server.json or 8765)")
+    add_session_arg(ap)
     args = ap.parse_args()
+    use_session(args)
     status = " ".join(args.status).strip()
     if not status:
         die("status is empty")

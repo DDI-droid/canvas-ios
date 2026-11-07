@@ -102,10 +102,11 @@ class TalkerError(RuntimeError):
 
 
 class Talker:
-    def __init__(self, workdir: str, log=print, canvas_url: str = "http://127.0.0.1:8765"):
+    def __init__(self, workdir: str, log=print, canvas_url: str = "http://127.0.0.1:8765", session: str = "main"):
         self.workdir = workdir
         self.log = log
         self.canvas_url = canvas_url
+        self.session = session  # the canvas session (board) this talker belongs to
         self.lock = threading.Lock()  # one turn at a time
         self.wlock = threading.Lock()  # stdin writes (turns and interrupts)
         self.interrupted = False
@@ -124,7 +125,7 @@ class Talker:
         mcp = {"mcpServers": {"voice": {
             "command": sys.executable,
             "args": [os.path.join(HERE, "voice_mcp.py")],
-            "env": {"CANVAS_URL": self.canvas_url},
+            "env": {"CANVAS_URL": self.canvas_url, "CANVAS_SESSION": self.session},
         }}}
         tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "dismiss"))
         args = [
@@ -148,7 +149,7 @@ class Talker:
         )
         self.events = queue.Queue()
         threading.Thread(target=self._read, args=(self.proc, self.events), daemon=True).start()
-        self.log(f"talker: started {MODEL} with voice tools, thinking={'on' if THINKING else 'off'} (pid {self.proc.pid})")
+        self.log(f"talker [{self.session}]: started {MODEL} with voice tools, thinking={'on' if THINKING else 'off'} (pid {self.proc.pid})")
 
     @staticmethod
     def _read(proc: subprocess.Popen, out: "queue.Queue[dict | None]") -> None:
