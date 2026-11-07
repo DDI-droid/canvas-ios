@@ -51,7 +51,7 @@ export function rankVoices() {
     if (NOVELTY.test(name)) score -= 10;
     return {
       voice: v, name: v.name, score, quality,
-      label: v.name.replace(/\s*\((premium|enhanced)\)\s*/i, ' ').trim(),
+      label: v.name.replace(/\s*\((premium|enhanced)\)\s*/gi, ' ').replace(/\s+/g, ' ').trim(),
       region: REGION[v.lang.toLowerCase().replace('_', '-')] || v.lang,
     };
   }).filter((x) => x.score > -5).sort((a, b) => b.score - a.score || a.label.localeCompare(b.label));

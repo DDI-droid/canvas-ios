@@ -1340,6 +1340,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.store.lock:
             res["status"] = self.store.status
         res["sessions"] = self.sessions.summaries()  # the page's switcher: unread + connected
+        res["build"] = build_version()  # the page offers a reload when the code on the PC changed
         self._send_json(200, res)
 
     def _api_mirror(self):

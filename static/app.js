@@ -929,6 +929,21 @@ $('#voiceOpts').addEventListener('click', (e) => {
   renderVoices();
 });
 
+// ---- updates. The iPad app shows this live page, so a code change on the PC reaches it on the
+// next reload. Each poll reports the server's build; when it differs from the build this page
+// loaded (the ?v= on its own script URL), offer a one-tap reload. If the app was in the
+// background, just reload when it comes back (unless voice mode is on).
+const PAGE_BUILD = new URL(import.meta.url).searchParams.get('v');
+let updateReady = false;
+events.addEventListener('build', (e) => {
+  if (!PAGE_BUILD || !e.detail || e.detail === PAGE_BUILD || updateReady) return;
+  updateReady = true;
+  toast('Canvas was updated.', { action: 'Reload', onAction: () => location.reload(), ms: 24 * 3600 * 1000 });
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && updateReady && !live.on) location.reload();
+});
+
 // ---- sessions: one board + chat per Claude session (on this PC, another machine, or in the cloud).
 // The switcher is in the panel title. A Claude session attaches with canvas_agent.py; the
 // instructions it needs are served at /agent. Unread dots compare each session's last reply

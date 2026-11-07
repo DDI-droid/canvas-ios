@@ -29,10 +29,11 @@ final class SpeechSynth: NSObject {
         var out: [[String: Any]] = []
         for v in AVSpeechSynthesisVoice.speechVoices() {
             if v.voiceTraits.contains(.isNoveltyVoice) || v.voiceTraits.contains(.isPersonalVoice) { continue }
-            var name = v.name
+            var name = v.name // iPadOS often names them "Ava (Premium)" already
+            let lower = name.lowercased()
             switch v.quality {
-            case .premium: name += " (Premium)"
-            case .enhanced: name += " (Enhanced)"
+            case .premium where !lower.contains("premium"): name += " (Premium)"
+            case .enhanced where !lower.contains("enhanced"): name += " (Enhanced)"
             default: break
             }
             out.append(["name": name, "lang": v.language, "voiceURI": v.identifier,

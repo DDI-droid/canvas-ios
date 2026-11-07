@@ -128,6 +128,7 @@ export class EventStream extends EventTarget {
         this.backoff = 1000;
         this._set('open');
         if (body.sessions) this._emit('sessions', body.sessions);
+        if (body.build) this._emit('build', body.build);
         if (body.reset) {
           this.epoch = body.epoch;
           this.since = body.next;
