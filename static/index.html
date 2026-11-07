@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=overlays-content">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Canvas">
+<meta name="application-name" content="Canvas">
+<meta name="format-detection" content="telephone=no, email=no, address=no">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f8f6f1">
+<meta name="referrer" content="no-referrer">
+<meta name="canvas-key" content="%%K%%">
+<title>Canvas</title>
+<link rel="icon" type="image/svg+xml" href="icon.svg?k=%%K%%">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png?k=%%K%%">
+<link rel="manifest" href="manifest.webmanifest?k=%%K%%" crossorigin="use-credentials">
+<link rel="stylesheet" href="vendor/katex/katex.min.css?k=%%K%%">
+<link rel="stylesheet" href="app.css?k=%%K%%">
+<link rel="modulepreload" href="board.js">
+<link rel="modulepreload" href="chat.js">
+<script src="guard.js?k=%%K%%"></script>
+<script type="module" src="app.js?k=%%K%%"></script>
+</head>
+<body>
+<div id="app" class="booting">
+
+  <!-- board -->
+  <div id="board" class="board" aria-label="Drawing board">
+    <div id="paper" class="paper"></div>
+    <div id="claudeLayer" class="claude-layer"></div>
+    <canvas id="ink" class="ink"></canvas>
+    <canvas id="live" class="live"></canvas>
+  </div>
+  <div id="hover" class="hover-ring" aria-hidden="true"></div>
+
+  <div id="hint" class="hint gone" aria-hidden="true">
+    <span>Draw with Pencil</span><i></i><span>Tap the mic to talk</span><i></i><span>Send to share with Claude</span>
+  </div>
+
+  <!-- lasso selection -->
+  <div id="selection" class="selection" hidden>
+    <div class="sel-box"></div>
+    <div class="sel-actions glass">
+      <button class="icon-btn" data-sel="duplicate" data-icon="duplicate" aria-label="Duplicate" title="Duplicate"></button>
+      <button class="icon-btn danger" data-sel="delete" data-icon="trash" aria-label="Delete" title="Delete"></button>
+    </div>
+  </div>
+
+  <!-- top-left controls -->
+  <div class="topbar glass" id="topbar">
+    <button class="icon-btn" id="btnSettings" data-icon="sliders" aria-label="Settings" aria-haspopup="true" aria-expanded="false" title="Settings"></button>
+    <button class="zoom-btn" id="btnZoom" aria-label="Zoom — tap to reset or fit" title="Tap: 100% / fit"><span id="zoomLabel">100%</span></button>
+    <button class="icon-btn" id="btnLayer" aria-label="Toggle Claude's drawings" aria-pressed="true" title="Claude's drawings"></button>
+    <button class="icon-btn" id="btnFullscreen" data-icon="expand" aria-label="Full screen" aria-pressed="false" title="Full screen" hidden></button>
+  </div>
+
+  <div class="pop settings-pop glass" id="settingsPop" hidden role="dialog" aria-label="Settings">
+    <div class="pop-title">Canvas</div>
+    <div class="group">
+      <label class="row">
+        <span class="row-label">Draw with finger<small>Turns off once Apple Pencil is used</small></span>
+        <input type="checkbox" class="switch" id="optFinger">
+      </label>
+      <label class="row">
+        <span class="row-label">Show Claude’s drawings</span>
+        <input type="checkbox" class="switch" id="optLayer" checked>
+      </label>
+      <label class="row">
+        <span class="row-label">Speech language</span>
+        <span class="select-wrap">
+          <select id="optLang" aria-label="Speech language">
+            <option value="en-US">English (US)</option>
+            <option value="en-IN">English (India)</option>
+            <option value="en-GB">English (UK)</option>
+          </select>
+        </span>
+      </label>
+    </div>
+    <div class="group actions">
+      <button class="row-btn" id="btnFit"><span data-icon="fit"></span>Fit to content</button>
+      <button class="row-btn" id="btnClearClaude"><span data-icon="sparkleOff"></span>Clear Claude’s drawings</button>
+      <button class="row-btn danger" id="btnClearBoard"><span data-icon="trash"></span>Clear board…</button>
+    </div>
+    <div class="pop-foot"><span class="dot" id="connDot"></span><span id="connInfo">Connecting…</span></div>
+  </div>
+
+  <!-- bottom-centre tools -->
+  <nav class="toolbar glass" id="toolbar" aria-label="Drawing tools">
+    <div class="tb-group tools" role="radiogroup" aria-label="Tool">
+      <span class="tool-ind" id="toolInd" aria-hidden="true"></span>
+      <button class="tool" data-tool="pen" data-icon="pen" role="radio" aria-label="Pen (P)" title="Pen"></button>
+      <button class="tool" data-tool="hl" data-icon="highlighter" role="radio" aria-label="Highlighter (H)" title="Highlighter"></button>
+      <button class="tool" data-tool="eraser" data-icon="eraser" role="radio" aria-label="Eraser (E)" title="Eraser"></button>
+      <button class="tool" data-tool="lasso" data-icon="lasso" role="radio" aria-label="Lasso (L)" title="Lasso"></button>
+    </div>
+    <span class="tb-sep" aria-hidden="true"></span>
+    <div class="tb-group swatches" id="swatches" role="radiogroup" aria-label="Colour"></div>
+    <button class="color-btn" id="btnColor" aria-label="Colour" aria-haspopup="true" aria-expanded="false"><span class="dot"></span></button>
+    <button class="width-btn" id="btnWidth" aria-label="Stroke width" title="Stroke width"><span class="wdot"></span><span class="wdot"></span><span class="wdot"></span></button>
+    <span class="tb-sep" aria-hidden="true"></span>
+    <button class="icon-btn" id="btnUndo" data-icon="undo" aria-label="Undo" title="Undo (two-finger tap)" disabled></button>
+    <button class="icon-btn" id="btnRedo" data-icon="redo" aria-label="Redo" title="Redo (three-finger tap)" disabled></button>
+  </nav>
+  <div class="pop palette-pop glass" id="palettePop" hidden role="dialog" aria-label="Colours"><div class="palette-grid" id="paletteGrid"></div></div>
+
+  <!-- bottom-left: talk + send -->
+  <div class="talk" id="talk">
+    <div class="caption glass" id="caption" aria-live="polite"><span class="caption-text" id="captionText"></span></div>
+    <button class="mic-fab" id="btnMic" aria-label="Start listening" aria-pressed="false" title="Talk">
+      <span class="mic-glow" aria-hidden="true"></span>
+      <span class="mic-ring" aria-hidden="true"></span>
+      <span class="mic-ico" data-icon="mic"></span>
+      <span class="mic-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+    </button>
+    <button class="send-fab" id="btnSend" aria-label="Send to Claude" title="Send to Claude (⌘↩)"><span data-icon="send"></span><span class="send-spin" aria-hidden="true"></span></button>
+    <button class="live-fab" id="btnLive" data-state="off" aria-label="Live conversation with Claude" aria-pressed="false" title="Live conversation">
+      <span class="live-orb" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span class="live-text"><b id="liveState">Live</b><small id="liveSub"></small></span>
+      <span class="live-x" id="liveStop" role="button" aria-label="End live conversation" data-icon="close"></span>
+    </button>
+  </div>
+
+  <!-- chat overlay -->
+  <section class="chat glass docked" id="chat" aria-label="Conversation with Claude">
+    <header class="chat-head" id="chatHead">
+      <div class="chat-title">
+        <button class="icon-btn sm" id="btnMenu" data-icon="menu" aria-label="Menu" aria-haspopup="true" aria-expanded="false" title="Menu"></button>
+        <span class="claude-mark" data-icon="claude"></span>
+        <span class="name">Claude</span>
+        <span class="conn" id="conn" data-state="wait" role="status" aria-label="Connecting"></span>
+        <span class="conn-label" id="connLabel"></span>
+      </div>
+      <div class="chat-actions">
+        <button class="icon-btn sm" id="btnGhost" data-icon="ghost" aria-label="Pass-through: draw under the panel" aria-pressed="false" title="Pass-through"></button>
+        <button class="icon-btn sm" id="btnOpacity" data-icon="opacity" aria-label="Panel opacity" title="Opacity"></button>
+        <button class="icon-btn sm" id="btnWidthPreset" data-icon="widths" aria-label="Panel width" title="Width"></button>
+        <button class="icon-btn sm" id="btnDock" data-icon="dock" aria-label="Dock panel" title="Dock" hidden></button>
+        <button class="icon-btn sm" id="btnCollapse" data-icon="minimize" aria-label="Collapse panel" title="Collapse"></button>
+      </div>
+      <div class="pop opacity-pop glass" id="opacityPop" hidden>
+        <span data-icon="opacity"></span>
+        <input type="range" id="opacityRange" min="20" max="100" step="1" value="100" aria-label="Panel opacity">
+      </div>
+      <div class="pop menu-pop glass" id="menuPop" hidden role="dialog" aria-label="Menu">
+        <div class="menu-sec">
+          <div class="menu-label">Paper</div>
+          <div class="paper-opts" id="paperOpts" role="radiogroup" aria-label="Paper">
+            <button class="paper-opt" data-paper="dots" role="radio" aria-checked="false"><span class="pv pv-dots"></span>Dots</button>
+            <button class="paper-opt" data-paper="grid" role="radio" aria-checked="false"><span class="pv pv-grid"></span>Grid</button>
+            <button class="paper-opt" data-paper="lines" role="radio" aria-checked="false"><span class="pv pv-lines"></span>Lines</button>
+            <button class="paper-opt" data-paper="plain" role="radio" aria-checked="false"><span class="pv"></span>Plain</button>
+          </div>
+        </div>
+        <div class="menu-sec">
+          <div class="menu-label">Appearance</div>
+          <div class="theme-opts" id="themeOpts" role="radiogroup" aria-label="Appearance">
+            <button data-theme-opt="light" role="radio" aria-checked="false"><span data-icon="sun"></span>Light</button>
+            <button data-theme-opt="dark" role="radio" aria-checked="false"><span data-icon="moon"></span>Dark</button>
+            <button data-theme-opt="auto" role="radio" aria-checked="false"><span data-icon="auto"></span>Auto</button>
+          </div>
+        </div>
+        <div class="menu-sec">
+          <div class="menu-label">Voice</div>
+          <div class="voice-opts" id="voiceOpts" role="radiogroup" aria-label="Voice" data-scroll></div>
+          <p class="voice-hint" id="voiceHint">Tap a voice to hear it. Safari only offers Apple’s basic voices; the Canvas app can use the Premium ones you download.</p>
+        </div>
+        <div class="menu-sec" id="menuApp" hidden>
+          <div class="menu-label">App</div>
+          <button class="menu-row" id="btnServerLink" hidden>Server link…</button>
+          <button class="menu-row" id="btnOpenApp" hidden>Open in Canvas app</button>
+        </div>
+      </div>
+    </header>
+    <div class="chat-scroll" id="chatScroll" data-scroll>
+      <div class="chat-empty" id="chatEmpty">
+        <div class="empty-mark" data-icon="sparkle"></div>
+        <p class="empty-title">Think out loud</p>
+        <p class="empty-sub">Sketch and talk. When you send, Claude sees your board — new ink highlighted — along with what you said.</p>
+      </div>
+      <div class="messages" id="messages" aria-live="polite"></div>
+      <div class="typing" id="typing" aria-live="polite"><span class="typing-dots"><i></i><i></i><i></i></span><span class="shimmer" id="typingText">Claude is thinking</span></div>
+    </div>
+    <button class="jump-new glass" id="jumpNew" aria-label="Jump to newest"><span data-icon="arrowDown"></span>New</button>
+    <footer class="composer">
+      <div class="interim" id="interim" aria-live="polite"></div>
+      <textarea id="draft" rows="1" placeholder="Talk or type — then send to Claude" autocomplete="off" autocapitalize="sentences" spellcheck="true" aria-label="Message draft"></textarea>
+      <div class="composer-row">
+        <div class="seg" id="modeSeg" role="group" aria-label="Snapshot area">
+          <button data-mode="view" class="on" aria-pressed="true" title="Send what you see"><span data-icon="view"></span>View</button>
+          <button data-mode="board" aria-pressed="false" title="Send the whole board"><span data-icon="board"></span>Board</button>
+        </div>
+        <span class="ink-chip" id="inkChip">No new ink</span>
+        <span class="grow"></span>
+        <button class="text-btn" id="btnClearDraft" title="Clear draft">Clear</button>
+        <button class="send-mini" id="btnSendInline" data-icon="send" aria-label="Send to Claude"></button>
+      </div>
+    </footer>
+    <div class="chat-grip" id="chatGrip" aria-hidden="true"></div>
+  </section>
+
+  <button class="chat-pill glass" id="chatPill" aria-label="Open conversation">
+    <span class="claude-mark" data-icon="claude"></span>
+    <span class="pill-name">Claude</span>
+    <span class="pill-status" id="pillStatus"><i></i><i></i><i></i></span>
+    <span class="badge" id="pillBadge">0</span>
+  </button>
+
+  <!-- transient UI -->
+  <div class="hud glass" id="hud" aria-live="polite"></div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <div class="item-menu glass" id="itemMenu" hidden>
+    <span class="item-menu-label">Claude’s drawing</span>
+    <button class="row-btn danger" id="btnItemRemove"><span data-icon="trash"></span>Remove</button>
+  </div>
+  <div class="modal" id="modal" hidden>
+    <div class="sheet glass" role="alertdialog" aria-labelledby="modalTitle" aria-describedby="modalMsg">
+      <h2 id="modalTitle"></h2>
+      <p id="modalMsg"></p>
+      <div class="sheet-actions">
+        <button class="sheet-btn" id="modalCancel">Cancel</button>
+        <button class="sheet-btn primary" id="modalOk">OK</button>
+      </div>
+    </div>
+  </div>
+  <div class="lightbox" id="lightbox" hidden><img alt="Snapshot"></div>
+  <div class="locked" id="locked" hidden>
+    <div class="sheet glass"><h2>Can’t reach Canvas</h2><p id="lockedMsg">The server didn’t accept this link.</p></div>
+  </div>
+</div>
+<noscript>Canvas needs JavaScript.</noscript>
+</body>
+</html>

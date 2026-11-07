@@ -1,0 +1,10 @@
+# runtime state: the access key, chats, board, inbox, logs, app builds (never commit)
+data/
+__pycache__/
+*.pyc
+# iPad app build output
+ios/Canvas.xcodeproj/
+ios/build/
+ios/Payload/
+*.ipa
+.DS_Store

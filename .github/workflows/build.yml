@@ -1,0 +1,59 @@
+name: build-ipa
+
+# Builds the iPad app (ios/) as an unsigned IPA. SideStore signs it with the user's Apple ID
+# when it installs it. The web app (Safari) needs no build: server.py serves static/ as is.
+on:
+  push:
+    branches: [main]
+    paths: ["ios/**", ".github/workflows/build.yml"]
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    working-directory: ios
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned; SideStore signs it on install)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Canvas.xcodeproj -scheme Canvas -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            build 2>&1 | tee build.log | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/Build/Products/Release-iphoneos/Canvas.app
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/Canvas.app Payload/
+          zip -qry Canvas.ipa Payload
+          ls -la Canvas.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Canvas-ipa
+          path: ios/Canvas.ipa
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: ios/build.log
