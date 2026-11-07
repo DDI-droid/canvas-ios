@@ -22,7 +22,8 @@ const PAUSE_AFTER_PUNCT_MS = 500; // ...shorter when the recogniser closed the s
 const HOLD_MS = 12000;            // an unanswered draft is kept this long in case you go on
 const KEEP_WARM_MS = 240000;      // ping Haiku after 4 idle minutes so its prompt cache stays warm
 const ECHO_GRACE_MS = 1200;       // just after the voice stops, words it said are still echo
-const BARGE_IN_WORDS = 3;         // words it didn't say that count as talking over it
+const BARGE_IN_WORDS = 3;
+const STOP_WORDS = new Set(['no', 'nope', 'stop', 'wait', 'hold', 'hang', 'actually', 'hey', 'pause']);         // words it didn't say that count as talking over it
 const SPEECH_RATE = 1.0;          // Apple's natural voices sound best at their own pace
 const FILLER = /^(?:u+m+|u+h+|h+m+|m+h*m*|a+h+|e+r+|o+h+)[.!?,]*$/i;
 const PREFERRED_VOICES = ['ava', 'zoe', 'evan', 'nathan', 'samantha', 'allison', 'susan', 'tom', 'daniel', 'karen'];
@@ -31,6 +32,35 @@ const NOVELTY = /(novelty|bells|bubbles|whisper|zarvox|trinoids|organ|bahh|boing
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 
 const words = (s) => (s || '').toLowerCase().replace(/[^a-z0-9' ]+/g, ' ').split(/\s+/).filter(Boolean);
+
+function editDistance(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const up = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = up;
+    }
+  }
+  return prev[b.length];
+}
+
+// Is a heard word (probably) one the voice itself just said? The recogniser often mishears the
+// voice's echo ("sinensis" -> "science is"), so close spellings and shared stems count too.
+function echoMatcher(spoken) {
+  const list = words(spoken);
+  const set = new Set(list);
+  const long = list.filter((w) => w.length >= 4);
+  return (w) => {
+    if (set.has(w)) return true;
+    if (w.length < 4) return false;
+    const tol = w.length >= 7 ? 2 : 1;
+    return long.some((m) => m.slice(0, 4) === w.slice(0, 4)
+      || (Math.abs(m.length - w.length) <= tol && editDistance(m, w) <= tol));
+  };
+}
 const now = () => performance.now();
 const newTurnId = () => 't-' + Math.random().toString(36).slice(2, 12);
 
@@ -387,7 +417,7 @@ export class Live extends EventTarget {
   onWords(text) {
     if (!this.active) return;
     if (this.mouth.speaking) {
-      if (this.newWords(text) < BARGE_IN_WORDS) return; // its own voice
+      if (this.newWords(text) < this.bargeWords()) return; // its own voice
       this.bargeIn();
     } else if (text && this.isEcho(text)) {
       return; // the tail of its voice, just after it stopped
@@ -546,6 +576,7 @@ export class Live extends EventTarget {
     this.heldAt = 0;
     this.heardWords = 0;
     this.echoInDraft = false;
+    this.userFrom = 0;
     if (resetEars) {
       this.cleanAt = 0;
       this.ears.reset();
@@ -578,7 +609,25 @@ export class Live extends EventTarget {
     if (cut) this.cutoff = cut;
     this.cancelTurn(); // stop it generating more
     this.echoInDraft = true;
+    this.userFrom = this.findUserStart(this.ears.text);
     this.set('hearing');
+  }
+
+  // Where your words begin in a transcript that starts with the voice's (possibly misheard)
+  // echo: scan back from the end until two echo words in a row.
+  findUserStart(text) {
+    const parts = (text || '').split(' ');
+    const mine = echoMatcher(this.mouth.recent);
+    let i = parts.length;
+    let echoRun = 0;
+    while (i > 0) {
+      const w = words(parts[i - 1])[0] || '';
+      const echo = w.length > 2 && mine(w) && !STOP_WORDS.has(w);
+      echoRun = echo ? echoRun + 1 : 0;
+      if (echoRun === 2) return i + 1;
+      i--;
+    }
+    return 0;
   }
 
   // The voice finished on its own. Whatever the mic heard meanwhile is its own echo, unless
@@ -587,34 +636,50 @@ export class Live extends EventTarget {
   afterSpeech() {
     if (!this.active) return;
     const text = this.ears.text;
-    if (text && this.newWords(text) >= BARGE_IN_WORDS) return;
+    if (text && this.newWords(text) >= this.bargeWords()) return;
     this.ears.mark();
     this.clearDraft(false);
     this.cleanAt = now() + 1500;
     this.set(this.busy() ? 'thinking' : 'listening');
   }
 
+  // The user asked that the voice never stop for its own echo, so the bar stays at 3 even in the
+  // app (where the echo canceller already keeps most of its voice out of the mic).
+  bargeWords() {
+    return BARGE_IN_WORDS;
+  }
+
+  // How strongly the words heard while the voice talks look like you, not its echo: words it
+  // didn't say count 1 (tiny ones like "a", "to" don't count), and a stop word it didn't say
+  // ("no", "wait", "stop", "hold on", "actually") counts 2.
   newWords(text) {
-    const mine = new Set(words(this.mouth.recent));
-    return words(text).filter((w) => !mine.has(w)).length;
+    const mine = echoMatcher(this.mouth.recent);
+    let n = 0;
+    for (const w of words(text)) {
+      if (mine(w)) continue;
+      if (STOP_WORDS.has(w)) n += 2;
+      else if (w.length > 2) n += 1;
+    }
+    return n;
   }
 
   isEcho(text) {
     if (now() - this.mouth.endedAt > ECHO_GRACE_MS) return false;
     const w = words(text);
     if (!w.length) return false;
-    const mine = new Set(words(this.mouth.recent));
-    return w.filter((x) => mine.has(x)).length / w.length >= 0.6;
+    const mine = echoMatcher(this.mouth.recent);
+    return w.filter((x) => mine(x)).length / w.length >= 0.6;
   }
 
-  // A draft that began while the voice talked starts with its echo: drop those words.
+  // A draft that began while the voice talked starts with its echo: drop those words. After a
+  // barge-in we know where your words began (userFrom); then drop any echo words left in front.
   stripEcho(text) {
     const t = (text || '').replace(/\s+/g, ' ').trim();
     if (!t || !this.echoInDraft) return t;
-    const mine = new Set(words(this.mouth.recent));
-    const parts = t.split(' ');
+    const mine = echoMatcher(this.mouth.recent);
+    const parts = t.split(' ').slice(this.userFrom || 0);
     let i = 0;
-    while (i < parts.length && mine.has(words(parts[i])[0] || '')) i++;
+    while (i < parts.length && mine(words(parts[i])[0] || '')) i++;
     return parts.slice(i).join(' ');
   }
 

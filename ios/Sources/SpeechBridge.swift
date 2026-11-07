@@ -12,33 +12,30 @@ import WebKit
 /// `text` is the cumulative transcript of the session; the shim splits it into results at
 /// each "pause" (no new words for ~1.1 s).
 ///
-/// The microphone engine keeps running between sessions (the page's live mode restarts its
-/// session after every answer): a new session just swaps in a fresh recognition request, so
-/// no words are lost to a restart. The engine stops after 30 s without a session, or when the
-/// app goes to the background.
+/// Audio comes from VoiceEngine, which keeps running between sessions (the page's live mode
+/// restarts its session after every answer): a new session just swaps in a fresh recognition
+/// request, so no words are lost to a restart. With voice processing on, the app's own voice
+/// is cancelled out of the mic before it gets here.
 @MainActor
 final class SpeechBridge: NSObject {
     weak var webView: WKWebView?
 
-    private let engine = AVAudioEngine()
-    private let target = TapTarget()
-    private var tapInstalled = false
+    private let voice = VoiceEngine.shared
     private var recognizers: [String: SFSpeechRecognizer] = [:]
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
-    private var activeId = 0      // session currently recognising (0 = none)
-    private var pendingId = 0     // session waiting on permission prompts
+    private(set) var activeId = 0  // session currently recognising (0 = none)
+    private var pendingId = 0      // session waiting on permission prompts
     private var lastText = ""
     private var pauseTask: Task<Void, Never>?
     private var endTask: Task<Void, Never>?
-    private var idleTask: Task<Void, Never>?
 
     override init() {
         super.init()
         NotificationCenter.default.addObserver(self, selector: #selector(audioInterrupted(_:)),
                                                name: AVAudioSession.interruptionNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(engineChanged(_:)),
-                                               name: .AVAudioEngineConfigurationChange, object: engine)
+                                               name: .AVAudioEngineConfigurationChange, object: voice.engine)
     }
 
     // MARK: page messages
@@ -60,23 +57,21 @@ final class SpeechBridge: NSObject {
         }
     }
 
-    /// App went to the background, or the page died: end everything and free the mic.
+    /// App went to the background, or the page died: end the session.
     func stopAll() {
         pendingId = 0
         if activeId != 0 { finish(graceful: false) }
-        stopEngine()
     }
 
     @objc nonisolated private func audioInterrupted(_ note: Notification) {
         Task { @MainActor [weak self] in self?.stopAll() }
     }
 
-    // A route change (AirPods in or out) reconfigures the engine and stops it.
+    // A route change (AirPods in or out) stops the engine: end the session, the page starts a new one.
     @objc nonisolated private func engineChanged(_ note: Notification) {
         Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.tearDownTap()
-            if self.activeId != 0 { self.finish(graceful: false) } // the page starts a new session
+            guard let self, self.activeId != 0 else { return }
+            self.finish(graceful: false)
         }
     }
 
@@ -127,18 +122,20 @@ final class SpeechBridge: NSObject {
     private func begin(id: Int, lang: String) {
         guard let rec = recognizer(for: lang) else { return fail(id, "language-not-supported") }
         guard rec.isAvailable else { return fail(id, "network") }
-        guard startEngine() else { return fail(id, "audio-capture") }
+        guard voice.start() else { return fail(id, "audio-capture") }
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
         req.taskHint = .dictation
         req.addsPunctuation = true
 
-        idleTask?.cancel()
         request = req
         activeId = id
         lastText = ""
-        target.set(req)
+        voice.tapTarget.set(req)
+        // tell the page whether the app's own voice is cancelled out of the mic (live.js
+        // then lets the user cut in with fewer words)
+        webView?.evaluateJavaScript("window.__canvasEchoCancel=\(voice.echoCancelling)", completionHandler: nil)
         emit(id, ["type": "start"])
         task = rec.recognitionTask(with: req, resultHandler: Self.resultHandler(bridge: self, id: id))
     }
@@ -203,7 +200,7 @@ final class SpeechBridge: NSObject {
         guard id != 0 else { return }
         if graceful {
             // stop feeding audio, let the recogniser deliver its final result, then end
-            target.set(nil)
+            voice.tapTarget.set(nil)
             request?.endAudio()
             task?.finish()
             endTask?.cancel()
@@ -223,66 +220,21 @@ final class SpeechBridge: NSObject {
     private func fail(_ id: Int, _ error: String) {
         emit(id, ["type": "error", "error": error])
         emit(id, ["type": "end"])
-        scheduleIdleStop()
+        voice.scheduleIdleStop()
     }
 
-    /// Ends the recognition session; the microphone keeps running for the next one.
+    /// Ends the recognition session; the engine keeps running for the next one (or the voice).
     private func endSession() {
         pauseTask?.cancel()
         endTask?.cancel()
-        target.set(nil)
+        voice.tapTarget.set(nil)
         request?.endAudio()
         task?.cancel()
         task = nil
         request = nil
         activeId = 0
         lastText = ""
-        scheduleIdleStop()
-    }
-
-    // MARK: microphone engine
-
-    private func startEngine() -> Bool {
-        if engine.isRunning && tapInstalled { return true }
-        guard AudioSession.shared.activate() else { return false }
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else { return false }
-        if !tapInstalled {
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 1024, format: format, block: target.block)
-            tapInstalled = true
-        }
-        engine.prepare()
-        do {
-            try engine.start()
-            return true
-        } catch {
-            tearDownTap()
-            return false
-        }
-    }
-
-    private func scheduleIdleStop() {
-        idleTask?.cancel()
-        idleTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
-            guard !Task.isCancelled, let self, self.activeId == 0, self.pendingId == 0 else { return }
-            self.stopEngine()
-        }
-    }
-
-    private func stopEngine() {
-        idleTask?.cancel()
-        tearDownTap()
-    }
-
-    private func tearDownTap() {
-        if engine.isRunning { engine.stop() }
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
+        voice.scheduleIdleStop()
     }
 
     // MARK: native → page
@@ -293,28 +245,5 @@ final class SpeechBridge: NSObject {
               let json = String(data: data, encoding: .utf8) else { return }
         webView.evaluateJavaScript("window.__canvasSpeech&&window.__canvasSpeech.emit(\(id),\(json))",
                                    completionHandler: nil)
-    }
-}
-
-/// Where the microphone tap sends audio: the current recognition request, if any. The tap
-/// runs on the audio thread, so the request is swapped under a lock.
-final class TapTarget: @unchecked Sendable {
-    private let lock = NSLock()
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-
-    func set(_ req: SFSpeechAudioBufferRecognitionRequest?) {
-        lock.lock()
-        request = req
-        lock.unlock()
-    }
-
-    var block: AVAudioNodeTapBlock {
-        return { [weak self] buffer, _ in
-            guard let self else { return }
-            self.lock.lock()
-            let req = self.request
-            self.lock.unlock()
-            req?.append(buffer)
-        }
     }
 }

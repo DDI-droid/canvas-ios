@@ -1454,6 +1454,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             raise HttpError(400, "unknown kind")
         parts.append(self.voice.status_line())
+        parts.append("(Answer only by calling speak; text you write is never heard. Or wait, or dismiss.)")
         content = "\n".join(parts)
         image = body.get("image") if kind == "utterance" else None
         m = re.match(r"^data:(image/(?:png|jpeg));base64,(.+)$", image or "", re.S)
@@ -1501,6 +1502,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             res, err = None, None
             try:
                 res = talker.turn(content, on_event, still_wanted=still_wanted)
+                # Safety net: Haiku sometimes writes its answer as plain text, which is private and
+                # never spoken. If a turn ends with no tool call but a real answer in text, ask it
+                # once to say that with speak (same turn id, so the page just hears it).
+                notes = (res.get("notes") or "").strip()
+                if res["mode"] == "silent" and len(notes) > 40 and not self.voice.is_cancelled(turn_id):
+                    log(f"talk {turn_id}: answer written as text, asking Haiku to speak it")
+                    again = talker.turn("[You wrote that answer as text, which the user can't hear. If it was "
+                                        "meant for them, say it now with speak, shortened for speech. If you are "
+                                        "waiting for them to finish, do nothing.]", on_event)
+                    again["ms"] = res["ms"] + again["ms"]
+                    res = again
             except Exception as exc:
                 err = str(exc)
                 log(f"talker error: {exc}")

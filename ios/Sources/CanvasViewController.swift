@@ -70,6 +70,11 @@ final class CanvasViewController: UIViewController {
         speech.webView = web
         synth.webView = web
         webView = web
+        // the shared audio engine may idle-stop only when neither the mic nor the voice is in use
+        VoiceEngine.shared.isBusy = { [weak self] in
+            guard let self else { return false }
+            return self.speech.activeId != 0 || self.synth.playing > 0
+        }
 
         let root = UIView()
         root.backgroundColor = paper
@@ -136,6 +141,7 @@ final class CanvasViewController: UIViewController {
     func appDidEnterBackground() {
         speech.stopAll()
         synth.stopAll()
+        VoiceEngine.shared.stop()
         AudioSession.shared.deactivate()
     }
 
