@@ -171,9 +171,9 @@ drawings are your job.
   ```
   For SVGs, set a `viewBox`, use `font-family="-apple-system, system-ui, sans-serif"`, dark text
   `#1d1d1f`, blue `#0a84ff`, red `#ff3b30`, and text at least 16 px. Don't use scripts.
-- Show where you're going with short progress notes: about one every 2 or 3 steps, summing up
-  what you just did or found in a few plain words. No tool names, commands, file paths or
-  arguments. Notes fold into "N steps" above your reply, and they're never spoken:
+- Show where you're going with short progress notes: one for each meaningful step (something
+  you found, changed or tested), usually 4 to 8 for a piece of work, each a few plain words. No
+  tool names, commands, file paths or arguments. Notes fold into "N steps" above your reply, and they're never spoken:
   ```bash
   python canvas_agent.py note -s {SESSION} "Found why the loss spikes; fixing it"
   ```

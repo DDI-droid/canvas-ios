@@ -44,9 +44,10 @@ scripts.
 
 ## Progress and replies
 
-- **Progress notes:** about one every 2–3 steps, in a few plain words, with no tool names or file
-  paths: `canvas_agent.py note -s <session> "Found the cause; fixing it"`. They fold into "N steps"
-  above your reply.
+- **Progress notes:** one for each meaningful step (a finding, a change, a test result), usually
+  4–8 for a piece of work, each a few plain words with no tool names or file paths:
+  `canvas_agent.py note -s <session> "Found the cause; fixing it"`. They fold into "N steps" above
+  your reply.
 - **Replies:** write markdown to a file first, then send it with `canvas_agent.py say -s <session>
   --file reply.md`. KaTeX math works: `$x^2$`.
 - **Keep listening:** run `canvas_agent.py wait -s <session>` in the background again after every
