@@ -885,6 +885,12 @@ async function boardForTalker() {
 const live = new Live({
   voiceSupported,
   snapshot: boardForTalker,
+  // changes whenever the ink, the Claude drawings or the view change
+  boardRev: () => {
+    const last = board.strokes[board.strokes.length - 1];
+    const c = board.cam;
+    return `${board.strokes.length}:${last ? last.id : ''}:${Math.round(c.x)}:${Math.round(c.y)}:${c.z.toFixed(3)}:${layer.records ? layer.records.size : ''}`;
+  },
   sendToMain: (task, heard) => send({ text: `🎙 ${task}${heard ? `\n\n(heard: “${heard}”)` : ''}` }),
   toast,
 });

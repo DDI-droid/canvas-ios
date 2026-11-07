@@ -304,10 +304,12 @@ class Mouth extends EventTarget {
 
 // -------------------------------------------------------------------- the conversation
 export class Live extends EventTarget {
-  constructor({ voiceSupported, snapshot, sendToMain, toast }) {
+  constructor({ voiceSupported, snapshot, boardRev, sendToMain, toast }) {
     super();
     this.supported = !!(voiceSupported && SR);
     this.snapshot = snapshot;     // async () => JPEG data URL of the current view
+    this.boardRev = boardRev || (() => ''); // changes when the ink or the view changes
+    this.seenRev = null;          // the board as Haiku last saw it
     this.sendToMain = sendToMain; // (task, heard) => void
     this.toast = toast;
     this.ears = new Ears();
@@ -347,6 +349,7 @@ export class Live extends EventTarget {
     }
     this.mouth.unlock();
     this.active = true;
+    this.seenRev = null; // a new conversation: show Haiku the board with the first words
     this.clearDraft(false);
     this.ears.start(lang);
     api.post('/api/talk', { kind: 'warmup' }, { timeout: 15000 }).catch(() => {});
@@ -450,7 +453,23 @@ export class Live extends EventTarget {
     this.sent = { text, words: n };
     this.heldAt = 0;
     this.lastHeard = text;
-    this.ask({ kind: 'utterance', text, continued, done, interrupted: this.cutoff });
+    this.askWithScreen({ kind: 'utterance', text, continued, done, interrupted: this.cutoff });
+  }
+
+  // Haiku sees what you see: when the board changed since its last look, the screen goes along
+  // with your words (a JPEG of the current view; skipped if it isn't ready within 1.5 s).
+  async askWithScreen(body) {
+    const rev = this.boardRev();
+    if (rev !== this.seenRev) {
+      try {
+        const image = await Promise.race([this.snapshot(), new Promise((r) => setTimeout(() => r(null), 1500))]);
+        if (image) {
+          body.image = image;
+          this.seenRev = rev;
+        }
+      } catch { /* words only */ }
+    }
+    if (this.sent && this.sent.text === body.text) this.ask(body); // still the current draft
   }
 
   async ask(body) {

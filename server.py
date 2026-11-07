@@ -1455,6 +1455,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HttpError(400, "unknown kind")
         parts.append(self.voice.status_line())
         content = "\n".join(parts)
+        image = body.get("image") if kind == "utterance" else None
+        m = re.match(r"^data:(image/(?:png|jpeg));base64,(.+)$", image or "", re.S)
+        if m:  # the screen as they see it, sent whenever the board changed since Haiku's last look
+            content = [
+                {"type": "image", "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)}},
+                {"type": "text", "text": "[the picture is the user's screen right now]\n" + content},
+            ]
 
         turn_id = body.get("turn") if isinstance(body.get("turn"), str) else ""
         if not re.match(r"^t-[A-Za-z0-9]{4,24}$", turn_id):
