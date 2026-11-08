@@ -38,7 +38,10 @@ python canvas_agent.py chart  -s <session> --data d.json        # {type, title, 
 python canvas_agent.py update -s <session> --id <card> --data more.json --append   # live points
 python canvas_agent.py page   -s <session> --file demo.html     # a live, interactive page (sandboxed)
 python canvas_agent.py browse -s <session> --url example.com    # a real Chrome tab, streamed live
+python canvas_agent.py signin --url accounts.google.com         # sign the browser cards in, on the PC
 ```
+
+New tabs and popups from a browser card open as a new card beside it.
 
 ## The voice assistant (Haiku) and you
 

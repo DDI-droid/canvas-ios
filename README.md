@@ -228,6 +228,7 @@ All JSON bodies are UTF-8; all routes need the token.
 | `POST /api/page` | `{html}` or `{template: chart\|model, data}`, `title?` → `{page, src}`; served keyless at `/live/<token>/` (sandboxed, with `live-bridge.js`). |
 | `POST /api/card/data` | `{id\|page, data, mode: replace\|append}` → live data into the card's page (`canvas:data` event). |
 | `POST /api/browser` | `{url, label?}` → a browser card (headless Chrome on this PC, `browser.py`); `GET /api/browser/<tab>/frame?after=N` (JPEG long-poll), `POST /api/browser/<tab>/input`. |
+| `POST /api/browser/signin` | `{url?}` → opens a normal Chrome window on the PC with the browser cards' profile (sites that won't sign in a hidden browser); cards pause until it's closed. |
 | `POST /api/draw/remove` | `{id}` → `{ok}` (404 if unknown); also `DELETE /api/draw/<id>`. Pushes `draw_remove`. |
 | `POST /api/draw/clear` | `{}` → `{ok, removed}`; pushes `draw_clear`. |
 | `PUT /api/strokes` | page → server (debounced): `{strokes: [...], client}`; persists `strokes.json`, pushes `strokes`. |

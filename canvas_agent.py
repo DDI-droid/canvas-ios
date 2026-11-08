@@ -18,6 +18,7 @@ canvas link is reachable. Python 3.8+, standard library only.
   python canvas_agent.py model  -s NAME --file part.glb|.gltf|.obj|.stl  # a 3D model you can turn
   python canvas_agent.py update -s NAME --id CARD --data d.json [--append]  # live data for a card
   python canvas_agent.py browse -s NAME --url example.com [--label L]   # a live browser card
+  python canvas_agent.py signin [--url accounts.google.com]             # sign the browser cards in, on the PC
   python canvas_agent.py sessions
 
 The link (with its secret key) is saved in ~/.canvas_agent/config.json by `connect`, or taken
@@ -503,6 +504,16 @@ def cmd_update(args) -> None:
     print("updated")
 
 
+def cmd_signin(args) -> None:
+    """Sites like Google won't sign in a hidden browser: open a normal Chrome window on the PC
+    with the browser cards' profile. Sign in there and close the window; the cards come back
+    signed in."""
+    cfg = load_config()
+    call(cfg, args.session, "POST", "/api/browser/signin", {"url": args.url} if args.url else {}, timeout=60)
+    print("A Chrome window is open on the PC that runs the canvas. Sign in there, then close the "
+          "window: the browser cards come back signed in. (They pause until it's closed.)")
+
+
 def cmd_browse(args) -> None:
     """A live browser card: a real Chrome tab on the canvas's PC, streamed into the card."""
     cfg = load_config()
@@ -730,6 +741,11 @@ def main() -> None:
     p = placing(with_session(sub.add_parser("browse", help="a live browser card (a real Chrome tab on the PC)")))
     p.add_argument("--url", required=True)
     p.set_defaults(fn=cmd_browse)
+
+    p = sub.add_parser("signin", help="sign the browser cards in to a site (opens Chrome on the PC)")
+    p.add_argument("--url", help="where to sign in (default accounts.google.com)")
+    p.add_argument("-s", "--session", default=None)
+    p.set_defaults(fn=cmd_signin)
 
     p = sub.add_parser("sessions", help="list the canvas sessions")
     p.set_defaults(fn=cmd_sessions)

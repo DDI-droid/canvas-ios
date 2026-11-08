@@ -285,6 +285,7 @@ board.addEventListener('fingerdraw', () => {
 // ---- media cards: a finger double-tap opens one full screen (the Pencil keeps drawing over them)
 const viewer = new Viewer($('#stage'));
 let stagePage = null; // the live page open full screen: {page, src, link}
+let stageId = null;   // the card open full screen
 
 function openMedia(id) {
   const rec = layer.records.get(id);
@@ -295,6 +296,7 @@ function openMedia(id) {
     from: () => rec.host.getBoundingClientRect(),
     onHide: (hidden) => {
       rec.host.style.visibility = hidden ? 'hidden' : '';
+      stageId = hidden ? id : null;
       if (!rec.live) return;
       // full screen runs its own copy: the card rests meanwhile (no double rendering or fetching)
       layer.focused = hidden ? id : null;
@@ -1546,8 +1548,15 @@ events.addEventListener('draw', (e) => {
     return;
   }
   const r = layer.rectOf(rec);
+  if (item.opener && stageId === item.opener && viewer.isOpen) {
+    // a new tab from the page you're looking at full screen: go to it, like a browser would
+    viewer.close();
+    setTimeout(() => openMedia(item.id), 480);
+    return;
+  }
   if (!rectsIntersect(r, board.viewRect())) {
-    toast(item.label ? `Claude drew “${item.label}”.` : 'Claude drew something.', {
+    const what = item.opener ? 'Opened in a new card.' : item.label ? `Claude drew “${item.label}”.` : 'Claude drew something.';
+    toast(what, {
       action: 'Show',
       onAction: () => {
         board.animateTo(board.cameraForRect(r, 120, board.cam.z));

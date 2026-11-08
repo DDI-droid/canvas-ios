@@ -28,7 +28,7 @@ The board is the user's main medium. When they draw or write, answer there too:
   - An image, a video or a 3D model: `canvas_agent.py embed -s <board> --file plot.png|clip.mp4|part.glb --label "what it shows"`.
   - A chart that grows live: `canvas_agent.py chart -s <board> --data d.json`, with `{type: line|bar|scatter|area, title, x: [...], series: [{name, y: [...]}]}`. Add points with `canvas_agent.py update -s <board> --id CARD --data more.json --append`.
   - A live, interactive page (a demo, a simulation, a small tool): `canvas_agent.py page -s <board> --file demo.html --label "..."`. It runs sandboxed. It can load `/vendor/three/...` and `/vendor/chartjs/...` from the canvas, and it gets live data from `update` with `window.addEventListener('canvas:data', e => e.detail.data)`.
-  - A live website: `canvas_agent.py browse -s <board> --url example.com`. It's a real Chrome tab on the PC, streamed into the card; the user taps and scrolls it.
+  - A live website: `canvas_agent.py browse -s <board> --url example.com`. It's a real Chrome tab on the PC, streamed into the card; the user taps and scrolls it. Links that open a new tab, and popups, become a new card beside it. If a site won't sign in there (Google), run `canvas_agent.py signin --url accounts.google.com`: a normal Chrome window opens on the PC; the user signs in and closes it, and the cards come back signed in.
 - Keep the chat reply short and point to what you put on the board. The first sentence should stand on its own; end with one clear question when you need their input.
 
 ## Show progress while you work
