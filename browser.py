@@ -350,9 +350,43 @@ class BrowserManager:
             return "browser cards need Google Chrome or Chromium on the PC"
         return None
 
+    def _port_file(self) -> str:
+        """Where the hidden Chrome's DevTools port is noted, next to its profile."""
+        return os.path.join(self.data_dir, self.profile_name + ".chrome.json")
+
+    def _close_leftover(self) -> None:
+        """A canvas server that was stopped (a restart kills it) leaves its hidden Chrome running,
+        and that Chrome keeps the profile, so a new one can't start and browser cards hang. Close
+        it through the DevTools port this profile's Chrome last ran on."""
+        try:
+            with open(self._port_file(), encoding="utf-8") as f:
+                port = int(json.load(f)["port"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        version = f"http://127.0.0.1:{port}/json/version"
+        try:
+            info = json.loads(urllib.request.urlopen(version, timeout=1).read())
+        except Exception:
+            return  # gone already
+        try:
+            with ws_connect(info["webSocketDebuggerUrl"], max_size=4 * 1024 * 1024, open_timeout=3) as ws:
+                ws.send(json.dumps({"id": 1, "method": "Browser.close"}))
+                ws.recv(timeout=3)
+        except Exception:
+            pass
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(version, timeout=0.5)
+                time.sleep(0.1)
+            except Exception:
+                break
+        time.sleep(0.5)  # it lets go of the profile as it exits
+        self.log(f"browser: closed a hidden Chrome left from an earlier run (port {port})")
+
     def _chrome(self) -> None:
         if self.proc and self.proc.poll() is None:
             return
+        self._close_leftover()
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
@@ -374,6 +408,11 @@ class BrowserManager:
                 info = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/version", timeout=1).read())
                 self.identity = normal_identity(info)
                 self.browser_ws = info.get("webSocketDebuggerUrl")
+                try:  # so the next server can close this Chrome if this one is killed
+                    with open(self._port_file(), "w", encoding="utf-8") as f:
+                        json.dump({"port": self.port, "pid": self.proc.pid}, f)
+                except OSError:
+                    pass
                 self.log(f"browser: Chrome up (pid {self.proc.pid})")
                 threading.Thread(target=self._watch, args=(info.get("webSocketDebuggerUrl"), self.proc),
                                  daemon=True, name="browser-targets").start()
@@ -497,6 +536,7 @@ class BrowserManager:
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
             self.proc = None
+            self._close_leftover()
             profile = os.path.join(self.data_dir, self.profile_name)
             os.makedirs(profile, exist_ok=True)
             self.signing = subprocess.Popen(

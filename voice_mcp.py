@@ -49,8 +49,10 @@ TOOLS = [
         "name": "hand_off",
         "description": (
             "Give a task to the main agent: a slower, fully capable Claude Code session on the "
-            "user's PC that sees the whole board, draws on it, runs code, edits files and does "
-            "research. Its answer comes back to you later as main_agent_reply."
+            "user's PC that sees the whole board, draws on it, opens websites and charts on it, runs "
+            "code, edits files and does research. Every request to do something goes here, even when "
+            "the user doesn't mention the main agent. Its answer comes back to you later as "
+            "main_agent_reply."
         ),
         "inputSchema": {
             "type": "object",
@@ -69,19 +71,6 @@ TOOLS = [
             "type": "object",
             "properties": {"text": {"type": "string", "description": "The note, at most ~200 characters."}},
             "required": ["text"],
-        },
-    },
-    {
-        "name": "open_website",
-        "description": (
-            "Open a website on the user's board as a live browser card (a real browser on their PC, "
-            "streamed into a card they can tap and scroll). Use when they ask to open, show or look up "
-            "a site. A bare name or a few words become a search."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"url": {"type": "string", "description": "An address (example.com) or what to search for."}},
-            "required": ["url"],
         },
     },
     {

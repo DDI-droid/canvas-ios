@@ -46,8 +46,9 @@ python canvas_agent.py signin --url accounts.google.com         # sign the brows
 - **What it does:** it talks with the user hands-free and sees their screen. It can write **short
   notes** on the board (a formula, a key term), which appear as "Voice note" cards at the top right
   of their view.
-- **What it hands to you:** real work (checking work in depth, diagrams, marking up, code,
-  experiments) comes to you as a **🎙 message**, with the user's words in `(heard: "…")`.
+- **What it hands to you:** every request to do something (opening a site or chart, anything on
+  the board, checking work, code, research) comes to you as a **🎙 message**, with the user's words
+  in `(heard: "…")`. It routes on its own; the user doesn't have to say "ask the main agent".
 - **What happens to your replies:** while voice mode is on, Haiku **speaks the gist** of each one.
   Make the first sentence a standalone summary, and end with one clear question.
 - **Don't fight over the board:** leave its Voice note cards alone unless the user asks, and keep
