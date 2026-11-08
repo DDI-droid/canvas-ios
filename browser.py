@@ -11,8 +11,8 @@ treat it like any browser. Sites that still refuse a hidden browser's sign-in (G
 pauses it and opens a normal Chrome window on this PC with the same profile; sign in there, close
 the window, and the cards come back signed in.
 
-New tabs and popups (target=_blank links, window.open) become new browser cards beside the card
-that opened them; a popup that closes itself (a sign-in window) takes its card away.
+Links that would open a new tab (target=_blank, window.open) open in the same card, like a phone
+browser: one card, one tab, no extra tiles.
 
 Talks to Chrome over the DevTools protocol with the `websockets` package (pip install websockets).
 Without it the rest of the canvas works and browser cards say so.
@@ -51,6 +51,25 @@ KEYS = {  # key name -> (code, windows virtual key code)
 }
 
 
+# In every page of a card: links and window.open stay in this tab (a card is one tab)
+SAME_TAB_JS = r"""(() => {
+  const same = (e) => {
+    const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+    if (!a) return;
+    const t = (a.getAttribute('target') || (document.querySelector('base[target]') || {}).target || '').toLowerCase();
+    if (t && t !== '_self' && t !== '_top' && t !== '_parent') a.target = '_self';
+  };
+  addEventListener('click', same, true);
+  addEventListener('auxclick', same, true);
+  const open = window.open;
+  window.open = function (u) {
+    if (!u || u === 'about:blank') return open.apply(this, arguments);
+    location.href = new URL(u, location.href).href;
+    return window;
+  };
+})();"""
+
+
 def find_chrome() -> str | None:
     for p in CHROME_PATHS:
         if os.path.isfile(p):
@@ -83,13 +102,18 @@ class Tab:
         self.title_asks = set()  # ids of our own document.title requests
         threading.Thread(target=self._read, daemon=True, name=f"tab-{bid}").start()
         self.call("Page.enable")
+        self.call("Page.addScriptToEvaluateOnNewDocument", source=SAME_TAB_JS)
         if identity:  # normal Chrome, before the first page loads
             self.call("Emulation.setUserAgentOverride", **identity)
         self.call("Emulation.setDeviceMetricsOverride", width=VIEW_W, height=VIEW_H, deviceScaleFactor=1, mobile=False)
         self.call("Emulation.setTouchEmulationEnabled", enabled=True, maxTouchPoints=1)
         self.call("Page.startScreencast", format="jpeg", quality=62, maxWidth=VIEW_W, maxHeight=VIEW_H, everyNthFrame=1)
         if url:
+            self.want = url
             self.call("Page.navigate", url=url)
+            # a fresh tab's own blank page can swallow the first navigation: check, and go again
+            for delay in (4.0, 10.0, 20.0):
+                threading.Timer(delay, self._ensure_loaded).start()
         else:
             self._ask_title()  # it may have loaded before we connected (no load event left to see)
             threading.Timer(1.5, self._ask_title).start()  # (or be just about to)
@@ -102,6 +126,13 @@ class Tab:
             except Exception:
                 self.alive = False
             return self.msg_id
+
+    want = None  # the address it was opened at, until it's really there
+
+    def _ensure_loaded(self) -> None:
+        if self.alive and self.want and (not self.url or self.url == "about:blank"):
+            self.log(f"browser: {self.id} still blank; loading {self.want} again")
+            self.call("Page.navigate", url=self.want)
 
     def _ask_title(self) -> None:
         self.title_asks.add(self.call("Runtime.evaluate", expression="[document.title, location.href]", returnByValue=True))
@@ -130,6 +161,8 @@ class Tab:
                     fr = msg["params"].get("frame") or {}
                     if not fr.get("parentId") and fr.get("url") and fr["url"] != self.url:
                         self.url = fr["url"]
+                        if self.url != "about:blank":
+                            self.want = None
                         self._changed()
                 elif method == "Page.navigatedWithinDocument":
                     url = msg["params"].get("url")
@@ -273,8 +306,6 @@ class BrowserManager:
         self.identity: dict | None = None
         self.signing: subprocess.Popen | None = None  # the visible sign-in window, while it's open
         self.browser_ws: str | None = None
-        self.on_popup = None  # (opener card's tab id, new Tab) -> None: put the new tab on the board
-        self.on_gone = None   # (tab id) -> None: a popup closed itself; take its card away
 
     @property
     def available(self) -> str | None:
@@ -371,54 +402,42 @@ class BrowserManager:
                     info = msg["params"]["targetInfo"]
                     if info.get("type") == "page":
                         threading.Thread(target=self._new_target, args=(info, proc), daemon=True).start()
-                elif method == "Target.targetDestroyed":
-                    self._target_gone(msg["params"]["targetId"])
         except Exception:
             pass  # Chrome stopped; the next one gets its own watcher
 
     def _new_target(self, info: dict, proc) -> None:
+        """A page opened a tab anyway (a popup the in-page script didn't catch): load it in the
+        card that opened it instead, and close the extra tab."""
         time.sleep(1.0)  # our own new tabs register within this
         tid = info["targetId"]
         with self.lock:
             if self.proc is not proc or any(t.target == tid for t in self.tabs.values()):
                 return
             opener = next((t for t in self.tabs.values() if info.get("openerId") and t.target == info["openerId"]), None)
-            if opener is None:  # rel=noopener links don't say who opened them: the card just tapped did
+            if opener is None:  # rel=noopener tabs don't say who opened them: the card just tapped did
                 now = time.monotonic()
                 recent = [t for t in self.tabs.values() if now - t.last_input < 5]
                 opener = max(recent, key=lambda t: t.last_input) if recent else None
-            if opener is None:
-                return  # Chrome's own start page, not a card's
-            bid = "br-" + secrets.token_hex(4)
+            port = self.port
+        if opener is None:
+            return  # Chrome's own start page, not a card's
+        url = ""
+        for _ in range(20):  # its address, once it has one
             try:
-                tab = Tab(bid, {"id": tid, "url": info.get("url"), "title": info.get("title"),
-                                "webSocketDebuggerUrl": f"ws://127.0.0.1:{self.port}/devtools/page/{tid}"},
-                          self.log, self.identity)
-            except Exception as e:
-                self.log(f"browser: couldn't take the new tab ({e})")
-                return
-            tab.popup = True
-            self.tabs[bid] = tab
-        self.log(f"browser: {opener.id} opened a new tab {bid} ({info.get('url') or 'loading'})")
-        if self.on_popup:
-            try:
-                self.on_popup(opener.id, tab)
-            except Exception as e:
-                self.log(f"browser: new tab card failed: {e}")
-
-    def _target_gone(self, tid: str) -> None:
-        with self.lock:
-            bid = next((b for b, t in self.tabs.items() if t.target == tid and t.popup), None)
-            tab = self.tabs.pop(bid, None) if bid else None
-        if not tab:
-            return  # closed by us (its card was removed), or not a popup
-        tab.close()
-        self.log(f"browser: popup {bid} closed itself")
-        if self.on_gone:
-            try:
-                self.on_gone(bid)
+                listing = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3).read())
+                url = next((t.get("url") or "" for t in listing if t.get("id") == tid), "")
             except Exception:
-                pass
+                url = ""
+            if url and url != "about:blank":
+                break
+            time.sleep(0.25)
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/json/close/{tid}", timeout=5).read()
+        except Exception:
+            pass
+        if url and url != "about:blank":
+            self.log(f"browser: {opener.id} opened {url} in the same card")
+            opener.call("Page.navigate", url=url)
 
     def get(self, bid: str) -> Tab | None:
         tab = self.tabs.get(bid)

@@ -136,7 +136,8 @@ export class Cards {
     const rec = id && this.layer.records.get(id);
     if (!rec || !rec.live || id === this.id) return null;
     const r = this.layer.rectOf(rec);
-    if (wy - r[1] < BAR) return { id, part: 'bar' };
+    // the title strip arranges; zoomed far out it stays at least a finger tall (28 px)
+    if (wy - r[1] < Math.max(BAR, 28 / z)) return { id, part: 'bar' };
     return { id, rec, part: 'content' };
   }
 

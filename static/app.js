@@ -1548,14 +1548,8 @@ events.addEventListener('draw', (e) => {
     return;
   }
   const r = layer.rectOf(rec);
-  if (item.opener && stageId === item.opener && viewer.isOpen) {
-    // a new tab from the page you're looking at full screen: go to it, like a browser would
-    viewer.close();
-    setTimeout(() => openMedia(item.id), 480);
-    return;
-  }
   if (!rectsIntersect(r, board.viewRect())) {
-    const what = item.opener ? 'Opened in a new card.' : item.label ? `Claude drew “${item.label}”.` : 'Claude drew something.';
+    const what = item.label ? `Claude drew “${item.label}”.` : 'Claude drew something.';
     toast(what, {
       action: 'Show',
       onAction: () => {

@@ -227,7 +227,6 @@ drawings are your job.
   python canvas_agent.py browse -s {SESSION} --url example.com                      # a real browser tab, live
   python canvas_agent.py signin --url accounts.google.com   # a site won't sign in a browser card: sign in on the PC
   ```
-  Links that open a new tab (and popups) open as a new browser card beside the one tapped.
   A page runs sandboxed. It can load `/vendor/three/...` and `/vendor/chartjs/...` from the
   canvas, and it gets live data from `update` with
   `window.addEventListener('canvas:data', e => e.detail.data)`.
@@ -382,53 +381,7 @@ def browser_manager():
     if _browsers is None:
         import browser
         _browsers = browser.BrowserManager(DATA_DIR, log)
-        _browsers.on_popup = _browser_popup_card
-        _browsers.on_gone = _browser_card_gone
     return _browsers
-
-
-def _browser_card_home(bid: str):
-    """(session, item) of the card showing browser tab `bid`, or (None, None)."""
-    for sess in Handler.sessions.all():
-        with sess.store.lock:
-            for it in sess.store.layer:
-                if isinstance(it, dict) and it.get("browser") == bid:
-                    return sess, dict(it)
-    return None, None
-
-
-def _browser_popup_card(opener_bid: str, tab) -> None:
-    """A page in a browser card opened a new tab: it becomes a new card beside that one."""
-    sess, op = _browser_card_home(opener_bid)
-    if sess is None:
-        _browsers.close(tab.id)
-        return
-    w = num(op.get("width")) or 600.0
-    h = num(op.get("height")) or w * 0.625 + LIVE_BAR
-    ox, oy = num(op.get("x")) or 0.0, num(op.get("y")) or 0.0
-    gap = 40.0
-    item = {"id": "b-" + secrets.token_hex(4), "type": "browser", "browser": tab.id,
-            "url": tab.url if tab.url and tab.url != "about:blank" else None,
-            "width": w, "height": h, "aspect": op.get("aspect") or 800 / 1280, "label": None,
-            "opener": op.get("id"), "ts": now_ms()}
-    st = sess.store
-    with st.lock:  # to its right, or the nearest free spot to that
-        item["x"], item["y"] = free_spot(st.layer, [ox + w + gap, oy, ox + 2 * w + gap, oy + h], w, h)
-        st.layer.append(item)
-        st.save_layer()
-    log(f"browser {item['id']} [{sess.id}]: a new tab from {op.get('id')}")
-    sess.hub.broadcast("draw", item)
-
-
-def _browser_card_gone(bid: str) -> None:
-    """A popup closed itself (a sign-in window, say): its card goes too."""
-    sess, item = _browser_card_home(bid)
-    if sess is None:
-        return
-    with sess.store.lock:
-        sess.store.layer = [it for it in sess.store.layer if not (isinstance(it, dict) and it.get("id") == item["id"])]
-        sess.store.save_layer()
-    sess.hub.broadcast("draw_remove", {"id": item["id"]})
 
 
 def registry_url():
@@ -1326,10 +1279,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/api/inbox/([^/]+)/timeline\.txt$", path)
         if m and method in ("GET", "HEAD"):
             return self._api_timeline(m.group(1))
-        m = re.match(r"^/api/browser/([A-Za-z0-9_.:-]{1,64})/(frame|input)$", path)
+        m = re.match(r"^/api/browser/([A-Za-z0-9_.:-]{1,64})/(frame|input|stream)$", path)
         if m:
             if self.session is None:
                 raise HttpError(404, f"no canvas session {self.sid!r}")
+            if m.group(2) == "stream" and method == "GET":
+                return self._api_browser_stream(m.group(1))
             if m.group(2) == "frame" and method in ("GET", "HEAD"):
                 return self._api_browser_frame(m.group(1))
             if m.group(2) == "input" and method == "POST":
@@ -2223,9 +2178,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HttpError(503, str(e))
         self._send_json(200, {"ok": True, "url": url})
 
-    def _api_browser_frame(self, bid: str):
-        """The tab's newest frame (JPEG) once it's newer than ?after=N; waits up to 20 s."""
+    def _api_browser_stream(self, bid: str):
+        """The tab's pictures as one pushed stream (multipart JPEG, shown by a plain <img>): each new
+        picture goes out as Chrome paints it, at most ~20 a second, with no request per picture."""
         tab = self._browser_tab(bid)
+        boundary = "canvasframe"
+        self.send_response(200)
+        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self._security_headers()
+        self.end_headers()
+        self.close_connection = True
+        seq = 0
+        try:
+            while tab.alive:
+                t0 = time.monotonic()
+                s, jpeg = tab.next_frame(seq, wait=15.0)  # nothing new for 15 s: resend (keeps it open)
+                if not jpeg:
+                    continue
+                seq = s
+                self.wfile.write(f"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpeg)}\r\n\r\n".encode()
+                                 + jpeg + b"\r\n")
+                self.wfile.flush()
+                left = 0.05 - (time.monotonic() - t0)
+                if left > 0:
+                    time.sleep(left)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass  # the card went off screen or closed
+
+    def _api_browser_frame(self, bid: str):
+        """The tab's newest frame (JPEG) once it's newer than ?after=N; waits up to 20 s.
+        ?meta=1: just {url, title}, at once."""
+        tab = self._browser_tab(bid)
+        if self.query.get("meta"):
+            return self._send_json(200, {"url": tab.url or "", "title": tab.title or ""})
         try:
             after = int(self.query.get("after", ["0"])[0])
         except ValueError:

@@ -253,12 +253,50 @@ export class BrowserStream {
   start() {
     if (this.on) return;
     this.on = true;
-    this._loop(++this.gen);
+    const gen = ++this.gen;
+    if (this.pushed === false) return this._loop(gen); // the stream didn't work here: one at a time
+    // one pushed stream (a plain <img> shows multipart JPEG): no request per picture
+    let got = false;
+    this.img.onload = () => {
+      if (!got && gen === this.gen) { got = true; this._metaLoop(gen); }
+    };
+    this.img.onerror = () => {
+      if (gen !== this.gen || !this.on) return;
+      this.img.onload = this.img.onerror = null;
+      this.pushed = false;
+      this._loop(gen);
+    };
+    this.img.src = withKey(`/api/browser/${encodeURIComponent(this.bid)}/stream?t=${Date.now()}`);
+    // restart it now and then (a proxy may end long responses; the picture stays meanwhile)
+    this.renew = setTimeout(() => { if (gen === this.gen && this.on) { this.on = false; this.start(); } }, 4 * 60000);
   }
 
   stop() {
     this.on = false;
     this.gen++;
+    clearTimeout(this.renew);
+    if (this.pushed !== false && this.img.src.includes('/stream')) {
+      this.img.onload = this.img.onerror = null;
+      this.img.removeAttribute('src'); // closes the stream (it's off screen)
+    }
+  }
+
+  // the page's address and title, beside the stream
+  async _metaLoop(gen) {
+    while (this.on && gen === this.gen) {
+      try {
+        const res = await fetch(withKey(`/api/browser/${encodeURIComponent(this.bid)}/frame?meta=1`), {
+          headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': SESSION }, cache: 'no-store' });
+        if (gen !== this.gen) return;
+        const m = await res.json();
+        if (this.onMeta && (m.url !== this.lastUrl || m.title !== this.lastTitle)) {
+          this.lastUrl = m.url;
+          this.lastTitle = m.title;
+          this.onMeta(m.url || '', m.title || '');
+        }
+      } catch { /* the PC is restarting */ }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
   }
 
   async _loop(gen) {
@@ -282,7 +320,7 @@ export class BrowserStream {
       } catch {
         await new Promise((r) => setTimeout(r, 1500)); // the PC or its Chrome is restarting
       }
-      const wait = 200 - (performance.now() - t0); // at most ~5 pictures a second
+      const wait = 66 - (performance.now() - t0); // at most ~15 pictures a second
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
   }

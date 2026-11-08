@@ -41,8 +41,6 @@ python canvas_agent.py browse -s <session> --url example.com    # a real Chrome 
 python canvas_agent.py signin --url accounts.google.com         # sign the browser cards in, on the PC
 ```
 
-New tabs and popups from a browser card open as a new card beside it.
-
 ## The voice assistant (Haiku) and you
 
 - **What it does:** it talks with the user hands-free and sees their screen. It can write **short
