@@ -49,12 +49,23 @@
     </div>
   </div>
 
+  <!-- card selection: tap a card to arrange it (drag to move, a corner to resize) -->
+  <div id="cardSel" class="card-sel" hidden>
+    <div class="card-box"><i data-h="nw"></i><i data-h="ne"></i><i data-h="sw"></i><i data-h="se"></i></div>
+    <div class="card-actions glass">
+      <button class="icon-btn" data-card="open" data-icon="expand" aria-label="Open full screen" title="Open"></button>
+      <button class="icon-btn danger" data-card="remove" data-icon="trash" aria-label="Remove" title="Remove"></button>
+    </div>
+  </div>
+
   <!-- top-left controls -->
   <div class="topbar glass" id="topbar">
     <button class="icon-btn" id="btnSettings" data-icon="sliders" aria-label="Settings" aria-haspopup="true" aria-expanded="false" title="Settings"></button>
     <button class="zoom-btn" id="btnZoom" aria-label="Zoom — tap to reset or fit" title="Tap: 100% / fit"><span id="zoomLabel">100%</span></button>
     <button class="icon-btn" id="btnLayer" aria-label="Toggle Claude's drawings" aria-pressed="true" title="Claude's drawings"></button>
+    <button class="icon-btn" id="btnAdd" data-icon="plus" aria-label="Add an image" title="Add an image"></button>
     <button class="icon-btn" id="btnFullscreen" data-icon="expand" aria-label="Full screen" aria-pressed="false" title="Full screen" hidden></button>
+    <input type="file" id="fileInput" accept="image/*" multiple hidden>
   </div>
 
   <div class="pop settings-pop glass" id="settingsPop" hidden role="dialog" aria-label="Settings">
@@ -223,9 +234,13 @@
   <!-- transient UI -->
   <div class="hud glass" id="hud" aria-live="polite"></div>
   <div class="toasts" id="toasts" aria-live="polite"></div>
-  <div class="item-menu glass" id="itemMenu" hidden>
-    <span class="item-menu-label">Claude’s drawing</span>
-    <button class="row-btn danger" id="btnItemRemove"><span data-icon="trash"></span>Remove</button>
+  <div class="stage" id="stage" hidden>
+    <div class="stage-bg"></div>
+    <div class="stage-frame"></div>
+    <div class="stage-bar">
+      <span class="stage-title"></span>
+      <button class="stage-close" data-icon="close" aria-label="Close" title="Close"></button>
+    </div>
   </div>
   <div class="modal" id="modal" hidden>
     <div class="sheet glass" role="alertdialog" aria-labelledby="modalTitle" aria-describedby="modalMsg">

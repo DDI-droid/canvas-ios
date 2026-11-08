@@ -1,5 +1,6 @@
 // Auth token handling, JSON API calls and the Server-Sent Events connection.
 import { store } from './util.js';
+import { followIfMoved, rememberRegistry } from './relink.js';
 
 function resolveKey() {
   const params = new URLSearchParams(location.search);
@@ -107,6 +108,14 @@ export class EventStream extends EventTarget {
     }, 2000);
   }
 
+  // Start from the cursor that came with a state snapshot (GET /api/state), so nothing that
+  // happens between loading the page and the first poll is missed.
+  resume(cursor) {
+    if (!cursor || this.epoch || typeof cursor.epoch !== 'string' || !Number.isFinite(cursor.seq)) return;
+    this.epoch = cursor.epoch;
+    this.since = cursor.seq;
+  }
+
   connect() {
     if (this.state !== 'open') this._set('connecting');
     this.quick = true;
@@ -139,7 +148,9 @@ export class EventStream extends EventTarget {
         if (gen !== this.gen) return;
         this.backoff = 1000;
         this.quick = false;
+        this.failingSince = 0;
         this._set('open');
+        if (body.registry) rememberRegistry(body.registry);
         if (body.sessions) this._emit('sessions', body.sessions);
         if (body.build) this._emit('build', body.build);
         if (body.reset) {
@@ -159,6 +170,9 @@ export class EventStream extends EventTarget {
         if (gen !== this.gen) return;
         this._set('reconnecting');
         this.quick = true;
+        // still failing after a few seconds: maybe the canvas moved to a new address
+        this.failingSince = this.failingSince || Date.now();
+        if (Date.now() - this.failingSince > 6000) followIfMoved().catch(() => {});
         await new Promise((r) => setTimeout(r, this.backoff * (0.85 + Math.random() * 0.3)));
         this.backoff = Math.min(this.backoff * 2, 15000);
       } finally {

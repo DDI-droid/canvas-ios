@@ -2,6 +2,18 @@
 // Each item renders inside its own shadow root so <style> rules and ids stay scoped.
 import DOMPurify from './vendor/dompurify/purify.es.mjs';
 import { rectsIntersect, unionRect } from './util.js';
+import { withKey } from './api.js';
+
+const CARD_STYLE =
+  ':host{all:initial;display:block;position:absolute;contain:layout style}' +
+  '.card{position:absolute;inset:0;border-radius:14px;overflow:hidden;background:#fff;' +
+  'box-shadow:0 0 0 .5px rgba(0,0,0,.08),0 2px 6px rgba(0,0,0,.06),0 12px 32px rgba(0,0,0,.10);' +
+  'transition:box-shadow 220ms cubic-bezier(.2,.85,.25,1)}' +
+  // lifted while you move or resize it
+  ':host(.lifted) .card{box-shadow:0 0 0 .5px rgba(0,0,0,.08),0 10px 24px rgba(0,0,0,.12),0 28px 64px rgba(0,0,0,.18)}' +
+  'img{display:block;width:100%;height:100%;object-fit:cover;-webkit-user-drag:none;user-select:none}' +
+  '.cap{position:absolute;left:0;top:100%;margin-top:8px;font:500 12px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;' +
+  'letter-spacing:-.005em;color:#8a6a5c;white-space:nowrap}';
 
 const purifier = DOMPurify(window);
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -93,6 +105,41 @@ export class ClaudeLayer extends EventTarget {
   setVisible(on) {
     this.visible = !!on;
     this.el.classList.toggle('hidden', !this.visible);
+    this._changed();
+  }
+
+  _changed() {
+    this.dispatchEvent(new Event('change'));
+  }
+
+  // same picture, maybe somewhere else: only the geometry needs updating
+  static sameContent(a, b) {
+    return (a.type || '') === (b.type || '') && a.svg === b.svg && a.src === b.src && (a.label || null) === (b.label || null);
+  }
+
+  // Move / resize an item in place (no re-render, so no flicker and no entrance animation).
+  // g: {x, y, width?, height?, ts?} in world units.
+  place(id, g) {
+    const rec = this.records.get(id);
+    if (!rec || !g) return null;
+    const it = rec.item;
+    if (Number.isFinite(g.x)) it.x = g.x;
+    if (Number.isFinite(g.y)) it.y = g.y;
+    if (g.width > 0) {
+      const ratio = rec.h / rec.w;
+      rec.w = g.width;
+      rec.h = g.height > 0 ? g.height : g.width * ratio;
+      it.width = rec.w;
+      it.height = rec.h;
+    }
+    if (g.ts) it.ts = g.ts;
+    const s = rec.host.style;
+    s.left = `${it.x || 0}px`;
+    s.top = `${it.y || 0}px`;
+    s.width = `${rec.w}px`;
+    s.height = `${rec.h}px`;
+    this._changed();
+    return rec;
   }
 
   sync(cam) {
@@ -105,13 +152,19 @@ export class ClaudeLayer extends EventTarget {
       if (!it || typeof it.id !== 'string') continue;
       keep.add(it.id);
       const cur = this.records.get(it.id);
-      if (!cur || cur.item.ts !== it.ts || cur.item.svg !== it.svg) this.upsert(it, { animate: false });
+      if (!cur) this.upsert(it, { animate: false });
+      else if (cur.item.ts !== it.ts) {
+        if (ClaudeLayer.sameContent(cur.item, it)) this.place(it.id, it);
+        else this.upsert(it, { animate: false });
+      }
     }
     for (const id of [...this.records.keys()]) if (!keep.has(id)) this.remove(id, { animate: false });
+    this._changed();
   }
 
   upsert(item, { animate = true } = {}) {
     if (!item || typeof item.id !== 'string') return null;
+    if (item.type === 'image') return this._upsertImage(item, animate);
     const svg = sanitizeSvg(item.svg);
     if (!svg) {
       this.remove(item.id, { animate: false });
@@ -158,6 +211,68 @@ export class ClaudeLayer extends EventTarget {
     }
     rec = { item, host, svg, w, h };
     this.records.set(item.id, rec);
+    this._changed();
+    return rec;
+  }
+
+  // An image card: a calm rounded card at its world size. The image is served by the canvas
+  // server (/api/media/…, with the key), so it's same-origin: snapshots can include it.
+  _upsertImage(item, animate) {
+    let rec = this.records.get(item.id);
+    let host;
+    if (rec) {
+      host = rec.host;
+    } else {
+      host = document.createElement('div');
+      host.className = 'claude-item media-item';
+      host.attachShadow({ mode: 'open' });
+      this.el.appendChild(host);
+    }
+    const root = host.shadowRoot;
+    root.replaceChildren();
+    const style = document.createElement('style');
+    style.textContent = CARD_STYLE;
+    const card = document.createElement('div');
+    card.className = 'card';
+    const img = document.createElement('img');
+    img.alt = item.label || 'Image';
+    img.decoding = 'async';
+    img.draggable = false;
+    img.src = withKey(item.src);
+    card.append(img);
+    root.append(style, card);
+    if (item.label) {
+      const cap = document.createElement('div');
+      cap.className = 'cap';
+      cap.textContent = item.label;
+      root.append(cap);
+    }
+    const w = item.width > 0 ? item.width : 420;
+    const aspect = item.height > 0 ? item.height / w : item.aspect > 0 ? item.aspect : 0.66;
+    const h = w * aspect;
+    host.style.left = `${item.x || 0}px`;
+    host.style.top = `${item.y || 0}px`;
+    host.style.width = `${w}px`;
+    host.style.height = `${h}px`;
+    host.dataset.id = item.id;
+    host.dataset.kind = 'image';
+    if (animate) {
+      host.classList.remove('enter');
+      void host.offsetWidth;
+      host.classList.add('enter');
+    }
+    rec = { item, host, img, kind: 'image', w, h };
+    this.records.set(item.id, rec);
+    // no known size yet: take the image's own shape once it loads
+    if (!(item.height > 0) && !(item.aspect > 0)) {
+      img.addEventListener('load', () => {
+        if (!img.naturalWidth || this.records.get(item.id) !== rec) return;
+        rec.h = rec.w * (img.naturalHeight / img.naturalWidth);
+        host.style.height = `${rec.h}px`;
+        this._changed();
+      }, { once: true });
+    }
+    this._changed();
     return rec;
   }
 
@@ -169,6 +284,7 @@ export class ClaudeLayer extends EventTarget {
       rec.host.classList.add('leave');
       setTimeout(() => rec.host.remove(), 220);
     } else rec.host.remove();
+    this._changed();
   }
 
   clear({ animate = true } = {}) {
@@ -191,14 +307,19 @@ export class ClaudeLayer extends EventTarget {
     return r;
   }
 
+  // The item under a world point. The smallest wins, so a card sitting on a big diagram is
+  // still easy to pick; among equal sizes, the top-most.
   hitTest(wx, wy, pad = 0) {
     if (!this.visible) return null;
-    const recs = [...this.records.values()].reverse();
-    for (const rec of recs) {
+    let best = null, bestArea = Infinity;
+    for (const rec of this.records.values()) {
       const [x0, y0, x1, y1] = this.rectOf(rec);
-      if (wx >= x0 - pad && wx <= x1 + pad && wy >= y0 - pad && wy <= y1 + pad) return rec.item.id;
+      if (wx >= x0 - pad && wx <= x1 + pad && wy >= y0 - pad && wy <= y1 + pad) {
+        const area = (x1 - x0) * (y1 - y0);
+        if (area <= bestArea) { best = rec.item.id; bestArea = area; }
+      }
     }
-    return null;
+    return best;
   }
 
   flash(id) {
@@ -216,6 +337,16 @@ export class ClaudeLayer extends EventTarget {
     for (const rec of this.records.values()) {
       const r = this.rectOf(rec);
       if (!rectsIntersect(r, rect)) continue;
+      if (rec.kind === 'image') {
+        try {
+          if (!rec.img.complete) await rec.img.decode();
+          ctx.globalAlpha = alpha;
+          ctx.drawImage(rec.img, r[0], r[1], rec.w, rec.h);
+          ctx.globalAlpha = 1;
+          n++;
+        } catch { /* not loaded: skip */ }
+        continue;
+      }
       const pw = Math.max(1, Math.round(rec.w * scale));
       const ph = Math.max(1, Math.round(rec.h * scale));
       if (pw * ph > 16e6) continue;

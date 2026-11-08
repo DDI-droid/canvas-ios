@@ -11,11 +11,28 @@ export function uid(prefix = '') {
   return prefix + Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Settings and offline data (localStorage, under "canvas.").
+//
+// The browser keeps localStorage per address, and the canvas's address can change (relink.js).
+// So inside the iPad app every value is also kept by the app: it hands each page load a copy
+// (window.__canvasNativeStore), and a key missing here is read from that copy. In Safari, the
+// page carries its values to the new address itself (#carry=, below).
 const NS = 'canvas.';
+const LAZY = /^pendingStrokes/; // big and short-lived: given to the app only when it matters
+const toApp = (key, raw) => {
+  try { window.__canvasNative && window.__canvasNative.post('store', { key, value: raw }); } catch { /* ignore */ }
+};
 export const store = {
   get(key, fallback) {
     try {
-      const v = localStorage.getItem(NS + key);
+      let v = localStorage.getItem(NS + key);
+      if (v == null) {
+        const copy = window.__canvasNativeStore;
+        if (copy && typeof copy[key] === 'string') {
+          v = copy[key];
+          try { localStorage.setItem(NS + key, v); } catch { /* full: still use it */ }
+        }
+      }
       return v == null ? fallback : JSON.parse(v);
     } catch {
       return fallback;
@@ -23,7 +40,9 @@ export const store = {
   },
   set(key, value) {
     try {
-      localStorage.setItem(NS + key, JSON.stringify(value));
+      const raw = JSON.stringify(value);
+      localStorage.setItem(NS + key, raw);
+      if (!LAZY.test(key)) toApp(key, raw);
       return true;
     } catch {
       return false;
@@ -31,8 +50,45 @@ export const store = {
   },
   remove(key) {
     try { localStorage.removeItem(NS + key); } catch { /* ignore */ }
+    toApp(key, null);
+  },
+  // give a big value (unsent ink) to the app too: a save failed, or we're about to move
+  keep(key) {
+    try {
+      const raw = localStorage.getItem(NS + key);
+      if (raw != null) toApp(key, raw);
+    } catch { /* ignore */ }
+  },
+  keepAll() {
+    for (const k of Object.keys(snapshotStore())) if (LAZY.test(k)) this.keep(k);
   },
 };
+
+// Every canvas value on this page, raw (Safari carries these to the new address).
+export function snapshotStore() {
+  const out = {};
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(NS)) out[k.slice(NS.length)] = localStorage.getItem(k);
+    }
+  } catch { /* storage unavailable */ }
+  return out;
+}
+
+// Arriving from the canvas's old address (relink.js, Safari): take its values over, keeping any
+// this address already has, then drop the fragment from the address bar.
+(function importCarried() {
+  try {
+    const m = /#carry=([A-Za-z0-9+/=]+)/.exec(location.hash);
+    if (!m) return;
+    const data = JSON.parse(decodeURIComponent(escape(atob(m[1]))));
+    for (const [k, v] of Object.entries(data)) {
+      if (typeof v === 'string' && localStorage.getItem(NS + k) == null) localStorage.setItem(NS + k, v);
+    }
+    history.replaceState(null, '', location.pathname + location.search);
+  } catch { /* ignore */ }
+})();
 
 export function debounce(fn, ms) {
   let t = 0;

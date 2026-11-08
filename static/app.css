@@ -149,13 +149,18 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 }
 .paper {
   position: absolute;
-  inset: 0;
+  inset: -96px; /* PAPER_OVERSCAN in board.js: slides by < one dot step, never shows an edge */
+  will-change: transform;
   background-color: var(--paper);
   background-image: radial-gradient(circle at center, var(--dot) 0, var(--dot) 1px, transparent 1.45px);
   background-size: 24px 24px;
   transition: background-color var(--d3) var(--ease);
 }
 .ink, .live { position: absolute; left: 0; top: 0; pointer-events: none; }
+.ink { transform-origin: 0 0; }
+/* while the camera moves, the GPU moves Claude's layer as one picture; at rest it's dropped
+   again so drawings and text are re-drawn sharp at the new zoom (Safari would keep them blurry) */
+.board.moving .claude-layer { will-change: transform; }
 .claude-layer {
   position: absolute;
   left: 0;
@@ -167,18 +172,20 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   transition: opacity var(--d2) var(--ease);
 }
 .claude-layer.hidden { opacity: 0; }
-[data-theme="dark"] .claude-layer { filter: invert(1) hue-rotate(180deg) brightness(1.04); }
-.claude-item { position: absolute; transform-origin: 50% 50%; }
+/* --tone: how Claude's drawings are tinted for the theme. Dark mode inverts drawings only;
+   photos and other media keep their real colours. (No filter on the layer itself: a filter
+   there would re-render everything on every frame of a pan or zoom.) */
+.claude-item { position: absolute; transform-origin: 50% 50%; --tone: brightness(1); }
+[data-theme="dark"] .claude-item:not(.media-item) { --tone: invert(1) hue-rotate(180deg) brightness(1.04); filter: var(--tone); }
 .claude-item.enter { animation: claude-in 620ms var(--soft-spring) both; }
 .claude-item.leave { opacity: 0; transform: scale(.97); transition: opacity 200ms var(--ease), transform 200ms var(--ease); }
 .claude-item.pulse { animation: claude-pulse 900ms var(--ease); }
 @keyframes claude-in {
-  from { opacity: 0; transform: scale(.94) translateY(6px); filter: blur(3px); }
-  to { opacity: 1; transform: none; filter: none; }
+  from { opacity: 0; transform: scale(.94) translateY(6px); filter: var(--tone) blur(3px); }
+  to { opacity: 1; transform: none; }
 }
 @keyframes claude-pulse {
-  0%, 100% { filter: none; }
-  40% { filter: drop-shadow(0 0 10px rgba(210, 105, 63, .55)); }
+  40% { filter: var(--tone) drop-shadow(0 0 10px rgba(210, 105, 63, .55)); }
 }
 
 .hover-ring {
@@ -1244,6 +1251,47 @@ textarea:focus { background: rgb(var(--glass-rgb) / .9); box-shadow: inset 0 0 0
   transition: opacity var(--d2) var(--ease);
 }
 .sel-actions.moving { opacity: 0; pointer-events: none; }
+
+/* card selection: an outline that hugs the card, a handle on each corner, Open · Remove */
+.card-sel { position: fixed; inset: 0; z-index: 12; pointer-events: none; }
+.card-box {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border: 1.5px solid var(--accent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 13%, transparent);
+  animation: fade-in var(--d2) var(--ease);
+}
+.card-box i {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1.5px solid var(--accent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .2);
+  transition: opacity var(--d2) var(--ease), transform var(--d2) var(--spring);
+}
+.card-box i[data-h="nw"] { left: -8px; top: -8px; }
+.card-box i[data-h="ne"] { right: -8px; top: -8px; }
+.card-box i[data-h="sw"] { left: -8px; bottom: -8px; }
+.card-box i[data-h="se"] { right: -8px; bottom: -8px; }
+.card-sel.moving .card-box i { opacity: 0; transform: scale(.5); }
+.card-sel.resizing .card-box i { transform: scale(1.15); }
+.card-actions {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: var(--r-full);
+  pointer-events: auto;
+  animation: pop-in var(--d3) var(--spring);
+  transition: opacity var(--d2) var(--ease);
+}
+.card-sel.moving .card-actions, .card-sel.resizing .card-actions { opacity: 0; pointer-events: none; }
+.claude-item.lifted { z-index: 2; }
 @keyframes fade-in { from { opacity: 0; } }
 
 /* ------------------------------------------------------------------ transient */
@@ -1555,6 +1603,67 @@ html.is-fs #chatScroll { touch-action: none; }
 }
 [data-theme="dark"] .voice-opts button.on { background: rgba(255, 255, 255, .16); }
 .voice-empty { padding: 8px 10px; font-size: var(--t-sm); color: var(--fg-3); }
+/* full-screen media viewer: the card grows into the middle; the canvas dims and blurs */
+.stage { position: fixed; inset: 0; z-index: 80; }
+.stage[hidden] { display: none; }
+.stage-bg {
+  position: absolute;
+  inset: 0;
+  background: rgba(14, 14, 16, .74);
+  -webkit-backdrop-filter: blur(22px) saturate(1.15);
+  backdrop-filter: blur(22px) saturate(1.15);
+  opacity: 0;
+  transition: opacity 420ms cubic-bezier(.2, .85, .25, 1);
+}
+.stage.open .stage-bg { opacity: 1; }
+.stage-frame {
+  position: absolute;
+  overflow: hidden;
+  transform-origin: 0 0;
+  border-radius: 14px;
+  box-shadow: 0 30px 90px rgba(0, 0, 0, .38);
+  touch-action: none;
+  will-change: transform;
+}
+.stage-frame img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform-origin: 0 0;
+  will-change: transform;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+}
+.stage-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px 0 22px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 260ms ease 120ms;
+}
+.stage.open .stage-bar { opacity: 1; pointer-events: auto; }
+.stage-title { color: rgba(255, 255, 255, .88); font: 600 15px/1.2 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; letter-spacing: -.01em; }
+.stage-close {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  color: #fff;
+  background: rgba(255, 255, 255, .16);
+  display: grid;
+  place-items: center;
+}
+.stage-close .ico { width: 18px; height: 18px; }
+
 /* progress notes: what the agent is doing, folded into "N steps" once it replies */
 .activity { margin: 2px 0 10px 38px; font-size: var(--t-sm); color: var(--fg-3); }
 .activity-head {

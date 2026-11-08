@@ -1,8 +1,15 @@
 // Infinite ink board: camera, input (Pencil / touch / mouse), tools, history, rendering.
 //
 // Rendering: committed strokes are cached as world-space Path2D objects and painted onto the
-// `ink` canvas only when the camera or the stroke list changes; the stroke in progress (plus
-// lasso / eraser / move previews) is painted each animation frame on the `live` canvas.
+// `ink` canvas; the stroke in progress (plus lasso / eraser / move previews) is painted each
+// animation frame on the `live` canvas.
+//
+// Smooth pans and pinches, however much is on the board: the ink canvas reaches past the
+// screen by a margin, and while the camera moves only its CSS transform changes (the GPU slides
+// and scales the drawn bitmap; nothing is redrawn). It's redrawn when the screen would leave
+// the drawn area, when the zoom drifts too far for the bitmap to stay sharp, and once when the
+// camera settles. The paper slides the same way, and the board gets a `moving` class so the
+// Claude layer is composited (moved by the GPU) only while it moves and is crisp at rest.
 import { getStroke } from './vendor/perfect-freehand/perfect-freehand.mjs';
 import { HL_ALPHA, inkColor } from './palette.js';
 import { clamp, easeInOutCubic, rectsIntersect, uid, unionRect } from './util.js';
@@ -18,6 +25,9 @@ const TAP_MAX_MS = 380;
 const LONG_PRESS_MS = 560;
 const FINGER_STROKE_GRACE_MS = 260;
 const HISTORY_LIMIT = 300;
+const SETTLE_MS = 140;          // no camera change for this long = the board is at rest
+const INK_MAX_PIXELS = 15e6;    // iPad Safari refuses canvases over 16.7 MP
+const PAPER_OVERSCAN = 96;      // px the paper reaches past the screen (> the largest dot step)
 
 const round2 = (v) => Math.round(v * 100) / 100;
 const round3 = (v) => Math.round(v * 1000) / 1000;
@@ -179,13 +189,25 @@ export class Board extends EventTarget {
     this.fingerDraw = false;
     this.penSeen = false;
     this.onLongPress = null; // (info) => boolean (handled)
+    this.onDoubleTap = null; // (info) => boolean (handled): a finger double-tap (opens media cards)
+    this._lastTap = null;
+    // Cards (cards.js): { hit(sx, sy) -> part|null, begin(part, sx, sy) -> bool, move(sx, sy),
+    // end(cancelled) -> moved, tap(info) -> bool, pen() }. A finger on the selected card moves or
+    // resizes it; a tap selects; the Pencil lets go.
+    this.cardHooks = null;
 
     this.touches = new Map();
     this.gesture = null;
     this.action = null;
     this.selection = null;
     this.spaceDown = false;
-    this.dirty = { view: true, ink: true, live: true };
+    this.dirty = { view: true, ink: true, live: true, cam: false };
+    this.inkCam = null;   // the camera the ink bitmap was drawn with
+    this.inkM = 0;        // px the ink canvas reaches past each screen edge
+    this.moving = false;  // the camera is moving (pan, pinch, animation)
+    this._settleTimer = 0;
+    this._paperStep = 0;
+    this._selBarSize = null;
     this.raf = 0;
     this.anim = null;
     this._lastLive = false;
@@ -306,12 +328,34 @@ export class Board extends EventTarget {
   setCamera(x, y, z, { silent = false } = {}) {
     z = clamp(z, MIN_ZOOM, MAX_ZOOM);
     if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
+    if (x === this.cam.x && y === this.cam.y && z === this.cam.z) return;
     this.cam.x = x;
     this.cam.y = y;
     this.cam.z = z;
-    this._invalidate('view', 'ink');
+    this._invalidate('view', 'cam');
+    this._markMoving();
     if (this.action) this._invalidate('live');
     if (!silent) this._emit('camera', { ...this.cam });
+  }
+
+  _markMoving() {
+    if (!this.moving) {
+      this.moving = true;
+      this.root.classList.add('moving');
+    }
+    clearTimeout(this._settleTimer);
+    this._settleTimer = setTimeout(() => this._settle(), SETTLE_MS);
+  }
+
+  // The camera came to rest: drop the GPU hints and redraw the ink sharp if the bitmap was
+  // scaled (or is running out of margin for the next pan).
+  _settle() {
+    this._settleTimer = 0;
+    this.moving = false;
+    this.root.classList.remove('moving');
+    const t = this._inkOffset();
+    if (!t || Math.abs(t.k - 1) > 1e-6 || t.slack < this.inkM * 0.4) this._invalidate('ink');
+    this._emit('settle', { ...this.cam });
   }
 
   zoomAt(sx, sy, z) {
@@ -498,6 +542,7 @@ export class Board extends EventTarget {
   clearSelection() {
     if (!this.selection) return;
     this.selection = null;
+    this._selBarSize = null;
     this._updateSelectionEl();
     this._emit('selection', { count: 0 });
   }
@@ -569,8 +614,10 @@ export class Board extends EventTarget {
     this.selBox.style.transform = `translate(${left}px, ${top}px)`;
     this.selBox.style.width = `${w}px`;
     this.selBox.style.height = `${h}px`;
-    const barW = this.selBar.offsetWidth || 110;
-    const barH = this.selBar.offsetHeight || 48;
+    // measured once per selection: reading layout every frame of a pan would stall it
+    if (!this._selBarSize) this._selBarSize = { w: this.selBar.offsetWidth || 110, h: this.selBar.offsetHeight || 48 };
+    const barW = this._selBarSize.w;
+    const barH = this._selBarSize.h;
     let bx = clamp(left + w / 2 - barW / 2, 8, this.W - barW - 8);
     let by = top - barH - 10;
     if (by < 60) by = Math.min(top + h + 10, this.H - barH - 100);
@@ -593,12 +640,27 @@ export class Board extends EventTarget {
     this.W = w;
     this.H = h;
     this.dpr = dpr;
-    for (const c of [this.inkCanvas, this.liveCanvas]) {
-      c.width = Math.round(w * dpr);
-      c.height = Math.round(h * dpr);
-      c.style.width = `${w}px`;
-      c.style.height = `${h}px`;
-    }
+    // ink: the screen plus a margin M on every side (a quarter screen), kept under the pixel
+    // limit: (w + 2M)(h + 2M)·dpr² <= INK_MAX_PIXELS
+    const A = INK_MAX_PIXELS / (dpr * dpr);
+    const disc = (w + h) * (w + h) - 4 * (w * h - A);
+    const mFit = disc > 0 ? (-(w + h) + Math.sqrt(disc)) / 4 : 0;
+    const M = Math.max(0, Math.floor(Math.min(0.25 * Math.max(w, h), mFit)));
+    this.inkM = M;
+    const ink = this.inkCanvas;
+    ink.width = Math.round((w + 2 * M) * dpr);
+    ink.height = Math.round((h + 2 * M) * dpr);
+    ink.style.width = `${w + 2 * M}px`;
+    ink.style.height = `${h + 2 * M}px`;
+    ink.style.left = `${-M}px`;
+    ink.style.top = `${-M}px`;
+    ink.style.transform = '';
+    this.inkCam = null;
+    const live = this.liveCanvas;
+    live.width = Math.round(w * dpr);
+    live.height = Math.round(h * dpr);
+    live.style.width = `${w}px`;
+    live.style.height = `${h}px`;
     this._invalidate('view', 'ink', 'live');
   }
 
@@ -615,7 +677,11 @@ export class Board extends EventTarget {
     }
     if (this.dirty.ink) {
       this.dirty.ink = false;
+      this.dirty.cam = false;
       this._renderInk();
+    } else if (this.dirty.cam) {
+      this.dirty.cam = false;
+      this._placeInk();
     }
     if (this.dirty.live) {
       this.dirty.live = false;
@@ -629,10 +695,17 @@ export class Board extends EventTarget {
     while (step < 15) step *= 2;
     while (step > 44) step /= 2;
     if (this.paper.dataset.paper === 'lines') step *= 2; // ruled paper: roomier rows
-    const ox = ((x % step) + step) % step;
-    const oy = ((y % step) + step) % step;
-    this.paper.style.backgroundSize = `${step}px ${step}px`;
-    this.paper.style.backgroundPosition = `${ox - step / 2}px ${oy - step / 2}px`;
+    // the paper reaches PAPER_OVERSCAN px past the screen; sliding it by less than one dot step
+    // (a GPU transform) looks exactly like an endless pattern, with no repaint per frame
+    if (step !== this._paperStep) {
+      this._paperStep = step;
+      this.paper.style.backgroundSize = `${step}px ${step}px`;
+    }
+    const d = this.dpr || 1;
+    const P = PAPER_OVERSCAN;
+    const tx = Math.round(((((x - step / 2 + P) % step) + step) % step) * d) / d;
+    const ty = Math.round(((((y - step / 2 + P) % step) + step) % step) * d) / d;
+    this.paper.style.transform = `translate3d(${tx}px, ${ty}px, 0)`;
     this._updateSelectionEl();
     this._emit('view', { ...this.cam });
   }
@@ -643,18 +716,59 @@ export class Board extends EventTarget {
     ctx.setTransform(d * z, 0, 0, d * z, d * (x + dx * z), d * (y + dy * z));
   }
 
+  // world -> ink-bitmap pixels, for the camera the bitmap was drawn with
+  _inkTransform(ctx) {
+    const { x, y, z } = this.inkCam || this.cam;
+    const d = this.dpr, M = this.inkM;
+    ctx.setTransform(d * z, 0, 0, d * z, d * (x + M), d * (y + M));
+  }
+
   _renderInk() {
     const ctx = this.inkCtx;
+    const M = this.inkM;
+    const { x, y, z } = this.cam;
+    this.inkCam = { x, y, z };
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, this.inkCanvas.width, this.inkCanvas.height);
-    this._worldTransform(ctx);
-    const v = this.viewRect();
-    const m = 4 / this.cam.z;
-    const vis = [v[0] - m, v[1] - m, v[2] + m, v[3] + m];
+    this._inkTransform(ctx);
+    const m = 4 / z;
+    const vis = [(-M - x) / z - m, (-M - y) / z - m, (this.W + M - x) / z + m, (this.H + M - y) / z + m];
     for (const s of this.strokes) {
       if (s._hidden || !rectsIntersect(s._bbox, vis)) continue;
       paintStroke(ctx, s, this.theme);
     }
+    this.inkCanvas.style.transform = '';
+  }
+
+  // Where the drawn ink bitmap sits for the current camera: a scale k and offset (tx, ty) for
+  // the canvas, and `slack`, how many px of drawn ink reach past the nearest screen edge.
+  _inkOffset() {
+    const r = this.inkCam;
+    if (!r) return null;
+    const c = this.cam, M = this.inkM, k = c.z / r.z;
+    let tx = M - k * (M + r.x) + c.x;
+    let ty = M - k * (M + r.y) + c.y;
+    if (Math.abs(k - 1) < 1e-6) {
+      // a pure pan: whole device pixels keep the bitmap exactly as sharp as a redraw
+      const d = this.dpr;
+      tx = Math.round(tx * d) / d;
+      ty = Math.round(ty * d) / d;
+    }
+    const left = -M + tx, top = -M + ty;
+    const right = left + k * (this.W + 2 * M), bottom = top + k * (this.H + 2 * M);
+    const slack = Math.min(-left, -top, right - this.W, bottom - this.H);
+    return { k, tx, ty, slack };
+  }
+
+  // The camera moved but the ink didn't: slide / scale the bitmap instead of redrawing it.
+  _placeInk() {
+    const t = this._inkOffset();
+    if (!t || t.slack < -0.5 || t.k > 2 || t.k < 0.5) {
+      this._renderInk();
+      return;
+    }
+    const still = Math.abs(t.k - 1) < 1e-6 && t.tx === 0 && t.ty === 0;
+    this.inkCanvas.style.transform = still ? '' : `translate(${t.tx}px, ${t.ty}px) scale(${t.k})`;
   }
 
   _renderLive() {
@@ -776,7 +890,15 @@ export class Board extends EventTarget {
         return;
       }
       if (e.button !== 0) return;
+      // the mouse can move / resize a selected card too (handy on the PC)
+      const part = this.cardHooks && !this.action ? this.cardHooks.hit(e.clientX, e.clientY) : null;
+      if (part && this.cardHooks.begin(part, e.clientX, e.clientY)) {
+        this._capture(e);
+        this.action = { kind: 'card', id: e.pointerId, type: 'mouse' };
+        return;
+      }
     }
+    if (e.pointerType === 'pen' && this.cardHooks) this.cardHooks.pen();
     if (this.action) {
       // a pen always wins over a finger action
       if (e.pointerType === 'pen' && this.action.type === 'touch') this._endAction(null, this.action.kind === 'stroke');
@@ -837,6 +959,10 @@ export class Board extends EventTarget {
       this.setCamera(a.cam0.x + e.clientX - a.sx, a.cam0.y + e.clientY - a.sy, this.cam.z);
       return;
     }
+    if (a.kind === 'card') {
+      this.cardHooks.move(e.clientX, e.clientY);
+      return;
+    }
     const events = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
     const list = events && events.length ? events : [e];
     if (a.kind === 'stroke') {
@@ -891,6 +1017,8 @@ export class Board extends EventTarget {
       }
     } else if (a.kind === 'lasso') {
       if (!discard) this._finishLasso(a);
+    } else if (a.kind === 'card') {
+      this.cardHooks.end(!!discard);
     } else if (a.kind === 'move') {
       const ids = this.selection ? this.selection.ids : new Set();
       for (const s of this.strokes) s._hidden = false;
@@ -955,9 +1083,9 @@ export class Board extends EventTarget {
     prepareStroke(s);
     this.strokes.push(s);
     this._pushHistory({ type: 'add', items: [{ s, index: this.strokes.length - 1 }] });
-    if (!this.dirty.ink) {
-      // incremental paint on top of the cached layer
-      this._worldTransform(this.inkCtx);
+    if (!this.dirty.ink && this.inkCam) {
+      // incremental paint on top of the cached bitmap (in the bitmap's own camera)
+      this._inkTransform(this.inkCtx);
       paintStroke(this.inkCtx, s, this.theme);
     }
     this._changed();
@@ -1045,18 +1173,28 @@ export class Board extends EventTarget {
     if (n === 1) {
       this.gesture = { t0: performance.now(), max: 1, moved: false, owner: null, suspended: false, camStart: { ...this.cam } };
       const p = this._pt(e);
-      if (this.fingerDraw && !this.action) {
+      // a finger on the selected card (or one of its corners) arranges it
+      const part = this.cardHooks && !this.action ? this.cardHooks.hit(e.clientX, e.clientY) : null;
+      if (part && this.cardHooks.begin(part, e.clientX, e.clientY)) {
+        this.gesture.owner = 'card';
+        this.gesture.cardPointer = e.pointerId;
+      } else if (this.fingerDraw && !this.action) {
         this._startAction(e, 'touch');
         this.gesture.owner = 'action';
       } else if (this.selection && this._inSelection(p) && !this.action) {
         this._beginMove(e, p, 'touch');
         this.gesture.owner = 'action';
       }
-      if (!(e.width > 60 || e.height > 60)) this._startLongPress(e); // large contact = palm
+      if (this.gesture.owner !== 'card' && !(e.width > 60 || e.height > 60)) this._startLongPress(e); // large contact = palm
     } else {
       const g = this.gesture;
       if (!g) return;
       this._cancelLongPress();
+      if (g.owner === 'card') {
+        // a second finger: keep the card where it is now and let two fingers move the board
+        this.cardHooks.end(false);
+        g.owner = null;
+      }
       if (this.action && this.action.type === 'touch') {
         const a = this.action;
         const young = performance.now() - (a.t || 0) < FINGER_STROKE_GRACE_MS;
@@ -1090,6 +1228,13 @@ export class Board extends EventTarget {
       return;
     }
     const g = this.gesture;
+    if (g && g.owner === 'card') {
+      if (e.pointerId === g.cardPointer) {
+        this.cardHooks.move(e.clientX, e.clientY);
+        if (!g.moved && Math.hypot(t.x - t.sx, t.y - t.sy) > PAN_SLOP) g.moved = true;
+      }
+      return;
+    }
     if (!g || g.suspended || (g.owner && this.touches.size < 2)) return;
     const pts = [...this.touches.values()];
     if (!g.moved) {
@@ -1117,13 +1262,29 @@ export class Board extends EventTarget {
     if (this.action && this.action.id === e.pointerId) this._endAction(e, false);
     this._cancelLongPress();
     const g = this.gesture;
+    if (g && g.owner === 'card' && e.pointerId === g.cardPointer) {
+      // a press on the selected card that never moved is still a tap (a double-tap opens it)
+      if (!this.cardHooks.end(!!cancelled)) g.owner = null;
+    }
     if (this.touches.size === 0) {
       if (g && !cancelled && !g.moved && !g.suspended && !g.owner) {
         const dt = performance.now() - g.t0;
         if (dt < TAP_MAX_MS) {
           if (g.max === 2) this.undo(true);
           else if (g.max === 3) this.redo(true);
-          else if (g.max === 1 && this.selection) this.clearSelection();
+          else if (g.max === 1) {
+            if (this.selection) this.clearSelection();
+            const now = performance.now(), x = e.clientX, y = e.clientY;
+            const info = { x, y, wx: (x - this.cam.x) / this.cam.z, wy: (y - this.cam.y) / this.cam.z };
+            if (this.cardHooks) this.cardHooks.tap(info); // select the card under the tap, or let go
+            const prev = this._lastTap;
+            if (prev && now - prev.t < 340 && Math.hypot(x - prev.x, y - prev.y) < 40 && this.onDoubleTap) {
+              this._lastTap = null;
+              this.onDoubleTap(info);
+            } else {
+              this._lastTap = { t: now, x, y };
+            }
+          }
         }
       }
       this.gesture = null;
@@ -1139,6 +1300,11 @@ export class Board extends EventTarget {
     if (!g) return;
     g.suspended = true;
     this._cancelLongPress();
+    if (g.owner === 'card') {
+      // most likely a palm on a selected card as the Pencil lands: put the card back
+      this.cardHooks.end(true);
+      g.owner = null;
+    }
     if (g.moved && performance.now() - g.t0 < 450) {
       this.setCamera(g.camStart.x, g.camStart.y, g.camStart.z);
     }
@@ -1155,6 +1321,14 @@ export class Board extends EventTarget {
       if (handled) {
         if (this.action && this.action.type === 'touch') this._endAction(null, true);
         g.owner = 'longpress';
+        // a long-press on a card selects it and picks it up: keep moving to drag it
+        if (handled === 'card' && this.cardHooks && this.touches.size === 1) {
+          const [pid, t] = [...this.touches.entries()][0];
+          if (this.cardHooks.begin('body', t.x, t.y)) {
+            g.owner = 'card';
+            g.cardPointer = pid;
+          }
+        }
       }
     }, LONG_PRESS_MS);
   }

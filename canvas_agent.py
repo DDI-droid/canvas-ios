@@ -12,6 +12,7 @@ canvas link is reachable. Python 3.8+, standard library only.
   python canvas_agent.py status -s NAME "Running the sweep..."
   python canvas_agent.py draw   -s NAME --svg fig.svg --x X --y Y [--width W] [--id ID] [--label L]
   python canvas_agent.py draw   -s NAME --list | --remove ID | --clear
+  python canvas_agent.py embed  -s NAME --file chart.png [--x X --y Y --width W] [--label L] [--id ID]
   python canvas_agent.py sessions
 
 The link (with its secret key) is saved in ~/.canvas_agent/config.json by `connect`, or taken
@@ -20,7 +21,9 @@ from $CANVAS_LINK. Get the full instructions from <canvas origin>/agent?k=<key>&
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import struct
 import os
 import sys
 import time
@@ -79,6 +82,35 @@ def load_state(sid: str) -> dict:
             return json.load(f)
     except (OSError, ValueError):
         return {}
+
+
+def remember_attachment(sid: str) -> None:
+    """Record which canvas session this Claude Code session works in. The chat-mirror hooks
+    (canvas/hooks/) use it to copy prompts typed in Claude Code, and the answers to them, into
+    that session's canvas chat, so the canvas reads like the whole conversation. Only `wait`
+    and `connect` call this: they're what "attached" means (one-off commands like `embed` from
+    a test script must not steal the mirror)."""
+    cid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not cid or not sid:
+        return
+    path = os.path.join(HOME, "attached.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    now = int(time.time())
+    cur = data.get(cid)
+    if isinstance(cur, dict) and cur.get("session") == sid and now - int(cur.get("ts", 0)) < 600:
+        return
+    data[cid] = {"session": sid, "ts": now}
+    data = {k: v for k, v in data.items() if isinstance(v, dict) and now - int(v.get("ts", 0)) < 30 * 86400}
+    try:
+        save_json(path, data)
+    except OSError:
+        pass
 
 
 def opener_for(origin: str):
@@ -142,6 +174,7 @@ def cmd_connect(args) -> None:
     # start from "now": earlier messages in this session are history, not work
     res = call(cfg, sid, "GET", "/api/agent/next?wait=0", timeout=15)
     save_json(state_path(sid), {"after": res.get("latest") or ""})
+    remember_attachment(sid)
     print(f"connected to canvas session '{sid}' ({sess.get('title')}) at {cfg['origin']}")
     print(f"next: run `python {os.path.basename(sys.argv[0])} wait -s {sid}` in the background, and")
     print(f"      reply with `python {os.path.basename(sys.argv[0])} say -s {sid} --file reply.md`")
@@ -150,6 +183,7 @@ def cmd_connect(args) -> None:
 def cmd_wait(args) -> None:
     cfg = load_config()
     sid = args.session
+    remember_attachment(sid)
     after = load_state(sid).get("after", "")
     deadline = time.time() + args.timeout if args.timeout else None
     failures = 0
@@ -250,6 +284,54 @@ def cmd_draw(args) -> None:
     print(f"drew {res.get('id')} at ({args.x}, {args.y})")
 
 
+IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+              ".webp": "image/webp", ".avif": "image/avif", ".heic": "image/heic"}
+
+
+def image_size(raw: bytes):
+    """(width, height) from a PNG, GIF or JPEG header, or None."""
+    try:
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            return struct.unpack(">II", raw[16:24])
+        if raw[:6] in (b"GIF87a", b"GIF89a"):
+            return struct.unpack("<HH", raw[6:10])
+        if raw[:2] == b"\xff\xd8":
+            i = 2
+            while i + 9 < len(raw):
+                if raw[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = raw[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h, w = struct.unpack(">HH", raw[i + 5:i + 9])
+                    return w, h
+                seg = struct.unpack(">H", raw[i + 2:i + 4])[0]
+                i += 2 + seg
+    except struct.error:
+        pass
+    return None
+
+
+def cmd_embed(args) -> None:
+    cfg = load_config()
+    ext = os.path.splitext(args.file)[1].lower()
+    mime = IMAGE_MIME.get(ext)
+    if not mime:
+        die("only images for now: png, jpg, gif, webp, avif, heic")
+    with open(args.file, "rb") as f:
+        raw = f.read()
+    up = call(cfg, args.session, "POST", "/api/media",
+              {"data": base64.b64encode(raw).decode("ascii"), "mime": mime}, timeout=180)
+    payload = {"type": "image", "src": up["src"], "x": args.x, "y": args.y, "width": args.width,
+               "id": args.id, "label": args.label}
+    size = image_size(raw)
+    if size and size[0]:
+        payload["aspect"] = size[1] / size[0]
+    res = call(cfg, args.session, "POST", "/api/draw", {k: v for k, v in payload.items() if v is not None})
+    print(f"embedded {res.get('id')} at ({res.get('x', 0):.0f}, {res.get('y', 0):.0f}), "
+          f"width {res.get('width', 0):.0f} (double-tap it on the iPad to open full screen)")
+
+
 def cmd_sessions(args) -> None:
     cfg = load_config()
     for s in (call(cfg, None, "GET", "/api/sessions") or {}).get("sessions") or []:
@@ -306,6 +388,15 @@ def main() -> None:
     p.add_argument("--remove")
     p.add_argument("--clear", action="store_true")
     p.set_defaults(fn=cmd_draw)
+
+    p = with_session(sub.add_parser("embed", help="put an image on the board as a card"))
+    p.add_argument("--file", required=True, help="png, jpg, gif, webp, avif or heic")
+    p.add_argument("--x", type=float, help="world x (default: centred in the user's view)")
+    p.add_argument("--y", type=float)
+    p.add_argument("--width", type=float, help="world width (default: ~40%% of the view)")
+    p.add_argument("--label")
+    p.add_argument("--id")
+    p.set_defaults(fn=cmd_embed)
 
     p = sub.add_parser("sessions", help="list the canvas sessions")
     p.set_defaults(fn=cmd_sessions)

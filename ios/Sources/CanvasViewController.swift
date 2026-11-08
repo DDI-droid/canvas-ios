@@ -14,6 +14,9 @@ final class CanvasViewController: UIViewController {
     private let setupView = SetupView()
     private let errorView = ErrorView()
     private var loadedURL: URL?
+    private var contentController: WKUserContentController!
+    private var bootstrap = ""
+    private var lastRelinkLookup = Date.distantPast
 
     private static let linkKey = "canvas.link"
     private var savedLink: URL? {
@@ -37,10 +40,9 @@ final class CanvasViewController: UIViewController {
         contentController.add(proxy, name: "canvasNative")
         contentController.add(proxy, name: "canvasSpeech")
         contentController.add(proxy, name: "canvasSynth")
-        let bootstrap = NativeScripts.bootstrap(voicesJSON: SpeechSynth.voiceListJSON())
-        contentController.addUserScript(WKUserScript(source: bootstrap,
-                                                     injectionTime: .atDocumentStart,
-                                                     forMainFrameOnly: true))
+        self.contentController = contentController
+        bootstrap = NativeScripts.bootstrap(voicesJSON: SpeechSynth.voiceListJSON())
+        installScripts()
         let config = WKWebViewConfiguration()
         config.userContentController = contentController
         config.allowsInlineMediaPlayback = true
@@ -112,7 +114,42 @@ final class CanvasViewController: UIViewController {
         guard let link = savedLink else { return showSetup(cancellable: false) }
         errorView.isHidden = true
         loadedURL = link
+        installScripts() // a fresh copy of the page's stored settings for this load
         webView.load(URLRequest(url: link, cachePolicy: .reloadRevalidatingCacheData, timeoutInterval: 30))
+    }
+
+    /// The speech/voice shims, then the page's settings as the app keeps them (NativeStore).
+    private func installScripts() {
+        contentController.removeAllUserScripts()
+        contentController.addUserScript(WKUserScript(source: bootstrap, injectionTime: .atDocumentStart,
+                                                     forMainFrameOnly: true))
+        contentController.addUserScript(WKUserScript(source: NativeStore.script(), injectionTime: .atDocumentStart,
+                                                     forMainFrameOnly: true))
+    }
+
+    // MARK: - Following the canvas to a new address (Relink)
+
+    /// Load the canvas at `origin`, keeping the saved link's key and session.
+    private func relink(to origin: URL) {
+        guard let link = savedLink, let moved = Relink.moved(link, to: origin),
+              moved.host != link.host else { return }
+        savedLink = moved
+        reload()
+    }
+
+    /// The saved address isn't answering: ask the gist where the canvas is now. If it moved,
+    /// go there; otherwise (the PC is off, or no internet) show the error with Retry.
+    private func relinkOrShow(_ error: Error) {
+        guard Date().timeIntervalSince(lastRelinkLookup) > 10 else { return showError(error) }
+        lastRelinkLookup = Date()
+        Relink.lookup { [weak self] origin in
+            guard let self else { return }
+            if let origin, let link = self.savedLink, origin.host != link.host {
+                self.relink(to: origin)
+            } else {
+                self.showError(error)
+            }
+        }
     }
 
     private func connect(to url: URL) {
@@ -181,6 +218,12 @@ final class CanvasViewController: UIViewController {
             case "settings": showSetup(cancellable: true)
             case "reload": reload()
             case "haptic": UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            case "registry": // where the gist is that says where the canvas lives
+                if let s = body["url"] as? String, Relink.isRegistry(s) { Relink.registry = URL(string: s) }
+            case "relink": // the page found the canvas at a new address
+                if let s = body["origin"] as? String, let u = URL(string: s), u.scheme == "https" { relink(to: u) }
+            case "store": // the page's settings, kept here too (they survive a change of address)
+                if let key = body["key"] as? String { NativeStore.set(key, body["value"] as? String) }
             default: break
             }
         default:
@@ -210,12 +253,34 @@ extension CanvasViewController: WKNavigationDelegate, WKUIDelegate {
         decisionHandler(.cancel)
     }
 
+    /// A dead quick tunnel answers with a Cloudflare error page (530 / 502…) rather than failing:
+    /// don't show that page; look for the canvas's new address instead.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if navigationResponse.isForMainFrame,
+           let http = navigationResponse.response as? HTTPURLResponse,
+           [502, 503, 504, 521, 522, 523, 530].contains(http.statusCode) {
+            decisionHandler(.cancel)
+            let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotConnectToHost, userInfo: [
+                NSLocalizedDescriptionKey: "The canvas server isn't answering (HTTP \(http.statusCode)). Is the PC on?"])
+            relinkOrShow(error)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         errorView.isHidden = true
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        showError(error)
+        let ns = error as NSError
+        if ns.domain == "WebKitErrorDomain" && ns.code == 102 { return } // we cancelled it (error page above)
+        if Relink.isDeadAddress(error) {
+            relinkOrShow(error)
+        } else {
+            showError(error)
+        }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

@@ -496,6 +496,13 @@ export class ChatPanel extends EventTarget {
         tag.textContent = 'whole board';
         meta.appendChild(tag);
       }
+      if (m.role !== 'claude' && m.source === 'chat') {
+        // typed in Claude Code (terminal, VS Code, the Claude app), mirrored here
+        const tag = document.createElement('span');
+        tag.className = 'tag';
+        tag.textContent = 'in Claude Code';
+        meta.appendChild(tag);
+      }
     }
     return meta;
   }

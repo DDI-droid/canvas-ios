@@ -20,7 +20,7 @@ enum NativeScripts {
 
   window.__canvasNative = {
     platform: 'ios',
-    version: '1.1',
+    version: '1.4',
     post: function (cmd, extra) {
       var msg = { cmd: cmd };
       if (extra) for (var k in extra) msg[k] = extra[k];

@@ -4,12 +4,14 @@ import { ClaudeLayer } from './claude-layer.js';
 import { ChatPanel } from './chat.js';
 import { Voice, voiceSupported } from './voice.js';
 import { Live, rankVoices } from './live.js';
+import { Viewer } from './viewer.js';
+import { Cards } from './cards.js';
 import { buildSnapshot, buildTimeline, makeThumb } from './snapshot.js';
-import { api, EventStream, KEY, SESSION, sessionKey, switchSession } from './api.js';
+import { api, EventStream, KEY, SESSION, sessionKey, switchSession, withKey } from './api.js';
 import { COLORS, inkColor } from './palette.js';
 import { hydrateIcons, icon } from './icons.js';
 import { confirmSheet, hud, lightbox, popover, toast } from './ui.js';
-import { $, $$, clamp, debounce, rectsIntersect, store, uid } from './util.js';
+import { $, $$, debounce, rectsIntersect, store, uid } from './util.js';
 
 const CLIENT_ID = uid('c');
 const THEME_COLOR = { light: '#f8f6f1', dark: '#1a1a1c' };
@@ -35,6 +37,31 @@ const board = new Board({
   hover: $('#hover'),
 });
 const layer = new ClaudeLayer($('#claudeLayer'));
+// cards: tap to select, drag to move, corners to resize (same for every kind of card)
+const cards = new Cards({
+  board,
+  layer,
+  el: $('#cardSel'),
+  onCommit: (id, g) => {
+    api.post('/api/draw/move', { id, ...g }).catch((err) => {
+      if (err.status !== 404) toast('Couldn’t save the new place. It may jump back after a reload.', { tone: 'error' });
+    });
+  },
+  onOpen: (id) => openMedia(id),
+  onRemove: async (id) => {
+    layer.remove(id);
+    try {
+      await api.post('/api/draw/remove', { id });
+    } catch (err) {
+      if (err.status !== 404) toast('Couldn’t remove it on the server.', { tone: 'error' });
+    }
+  },
+});
+board.cardHooks = cards;
+// automated tests only (?debug in the URL): reach the board from the outside
+if (new URLSearchParams(location.search).has('debug')) window.__canvas = { board, layer, cards };
+// the "Draw with Pencil · …" hint is for an empty board only
+layer.addEventListener('change', () => { if (layer.count) hideHint(); });
 const chat = new ChatPanel();
 const voice = new Voice(prefs.lang);
 const events = new EventStream('/api/events');
@@ -193,10 +220,15 @@ board.addEventListener('history', refreshToolbar);
 board.addEventListener('hud', (e) => hud(e.detail.text, e.detail.icon));
 board.addEventListener('view', (e) => {
   layer.sync(e.detail);
-  hideItemMenu();
+  cards.sync();
 });
+let zoomPct = 100;
 board.addEventListener('camera', (e) => {
-  $('#zoomLabel').textContent = `${Math.round(e.detail.z * 100)}%`;
+  const pct = Math.round(e.detail.z * 100);
+  if (pct !== zoomPct) { // only touch the toolbar when the number changes (not on every pan frame)
+    zoomPct = pct;
+    $('#zoomLabel').textContent = `${pct}%`;
+  }
   saveCam();
 });
 board.addEventListener('change', (e) => {
@@ -213,48 +245,83 @@ board.addEventListener('fingerdraw', () => {
   $('#optFinger').checked = false;
   toast('Apple Pencil detected — finger drawing is off. Fingers now pan and zoom.');
 });
-board.onLongPress = ({ x, y, wx, wy }) => {
+// ---- media cards: a finger double-tap opens one full screen (the Pencil keeps drawing over them)
+const viewer = new Viewer($('#stage'));
+function openMedia(id) {
+  const rec = layer.records.get(id);
+  if (!rec || rec.kind !== 'image') return false;
+  cards.clear();
+  viewer.show({
+    src: withKey(rec.item.src),
+    title: rec.item.label || '',
+    aspect: rec.h / rec.w,
+    from: () => rec.host.getBoundingClientRect(),
+    onHide: (hidden) => { rec.host.style.visibility = hidden ? 'hidden' : ''; },
+  });
+  return true;
+}
+board.onDoubleTap = ({ wx, wy }) => {
+  const id = layer.hitTest(wx, wy, 6 / board.cam.z);
+  return id ? openMedia(id) : false;
+};
+
+// + : add images from Photos / Files. Each is uploaded to the canvas server and placed in view.
+$('#btnAdd').addEventListener('click', () => $('#fileInput').click());
+$('#fileInput').addEventListener('change', async (e) => {
+  const files = [...(e.target.files || [])];
+  e.target.value = '';
+  let i = 0;
+  for (const file of files) {
+    if (!file.type.startsWith('image/')) { toast('Only images for now.', { tone: 'error' }); continue; }
+    if (file.size > 18 * 1024 * 1024) { toast(`${file.name} is too big (max 18 MB).`, { tone: 'error' }); continue; }
+    try {
+      const data = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(r.result);
+        r.onerror = () => rej(r.error);
+        r.readAsDataURL(file);
+      });
+      const probe = new Image();
+      probe.src = data;
+      await probe.decode().catch(() => {});
+      const aspect = probe.naturalWidth ? probe.naturalHeight / probe.naturalWidth : 0.66;
+      const up = await api.post('/api/media', { data }, { timeout: 120000 });
+      const v = board.viewRect();
+      const vw = v[2] - v[0], vh = v[3] - v[1];
+      let width = vw * 0.42;
+      if (width * aspect > vh * 0.7) width = (vh * 0.7) / aspect;
+      const off = i * Math.min(vw, vh) * 0.04;
+      await api.post('/api/draw', {
+        type: 'image', src: up.src, aspect, width,
+        x: v[0] + (vw - width) / 2 + off, y: v[1] + (vh - width * aspect) / 2 + off,
+        label: file.name && !/^image\.(jpe?g|png|heic)$/i.test(file.name) ? file.name.replace(/\.[^.]+$/, '') : '',
+      });
+      i++;
+    } catch (err) {
+      toast(`Couldn’t add ${file.name || 'the image'}: ${err.message}`, { tone: 'error' });
+    }
+  }
+  if (i) toast(i === 1 ? 'Image added. Double-tap it to open.' : `${i} images added.`);
+});
+
+// tell the server where you're looking, so agents and the voice place things in view
+const reportView = debounce(() => {
+  api.post('/api/view', { view: board.viewRect() }).catch(() => {});
+}, 800);
+board.addEventListener('camera', reportView);
+setTimeout(reportView, 1500);
+
+// a long-press on a card selects it and picks it up (keep moving to drag it)
+board.onLongPress = ({ wx, wy }) => {
   const id = layer.hitTest(wx, wy, 8 / board.cam.z);
   if (!id) return false;
-  showItemMenu(id, x, y);
-  return true;
+  cards.select(id);
+  return 'card';
 };
 
 function updateInkChip() {
   chat.setNewInk(board.strokesSince(lastSendAt).length);
 }
-
-// ------------------------------------------------------------------ Claude-layer item menu
-
-let menuItem = null;
-function showItemMenu(id, x, y) {
-  const m = $('#itemMenu');
-  menuItem = id;
-  layer.flash(id);
-  m.hidden = false;
-  const w = m.offsetWidth || 200, h = m.offsetHeight || 90;
-  m.style.left = `${clamp(x - w / 2, 10, window.innerWidth - w - 10)}px`;
-  m.style.top = `${clamp(y - h - 18, 10, window.innerHeight - h - 10)}px`;
-}
-function hideItemMenu() {
-  if (!menuItem) return;
-  menuItem = null;
-  $('#itemMenu').hidden = true;
-}
-$('#btnItemRemove').addEventListener('click', async () => {
-  const id = menuItem;
-  hideItemMenu();
-  if (!id) return;
-  layer.remove(id);
-  try {
-    await api.post('/api/draw/remove', { id });
-  } catch (err) {
-    if (err.status !== 404) toast('Couldn’t remove the drawing on the server.', { tone: 'error' });
-  }
-});
-document.addEventListener('pointerdown', (e) => {
-  if (menuItem && !(e.target instanceof Element && e.target.closest('#itemMenu'))) hideItemMenu();
-}, true);
 
 // ------------------------------------------------------------------ persistence of ink
 
@@ -278,6 +345,7 @@ async function saveStrokes() {
     saveFailures = 0;
   } catch {
     saveFailures++;
+    store.keep(sessionKey('pendingStrokes')); // in the app, unsent ink survives a change of address
     if (saveFailures === 2) toast('Can’t reach the server — your ink is kept on this device and will sync.', { tone: 'error' });
     setTimeout(() => scheduleSave(), Math.min(30000, 1500 * 2 ** saveFailures));
   } finally {
@@ -1188,11 +1256,9 @@ liveBtn.addEventListener('click', (e) => {
   }
 });
 
-let helloCount = 0;
-events.addEventListener('hello', () => {
-  helloCount++;
-  if (helloCount > 1) resync().catch(() => {});
-});
+// 'hello' = the server couldn't replay what we missed (it restarted, or we slept through more
+// than it keeps): reload the conversation and the layer from its state.
+events.addEventListener('hello', () => { resync().catch(() => {}); });
 events.addEventListener('message', (e) => {
   const m = e.detail;
   if (!m) return;
@@ -1232,6 +1298,12 @@ events.addEventListener('draw', (e) => {
   }
 });
 events.addEventListener('draw_remove', (e) => e.detail && layer.remove(e.detail.id));
+// a card was moved or resized (here or on another device): just reposition it
+events.addEventListener('draw_move', (e) => {
+  const g = e.detail;
+  if (!g || (cards.drag && cards.drag.id === g.id)) return; // you're holding it right now
+  layer.place(g.id, g);
+});
 events.addEventListener('draw_clear', () => layer.clear());
 events.addEventListener('strokes', (e) => {
   if (!e.detail || e.detail.client === CLIENT_ID) return;
@@ -1253,7 +1325,8 @@ function restorePrefs() {
   setLayerVisible(prefs.layer !== false);
   const cam = store.get(sessionKey('cam'), null);
   if (cam && Number.isFinite(cam.x) && Number.isFinite(cam.z)) board.setCamera(cam.x, cam.y, cam.z, { silent: true });
-  $('#zoomLabel').textContent = `${Math.round(board.cam.z * 100)}%`;
+  zoomPct = Math.round(board.cam.z * 100);
+  $('#zoomLabel').textContent = `${zoomPct}%`;
 }
 
 async function boot() {
@@ -1268,7 +1341,8 @@ async function boot() {
   }
   try {
     const st = await resync({ includeStrokes: true });
-    if (!board.strokes.length && !(st.conversation || []).length) showHint();
+    events.resume(st.events); // live updates pick up exactly where this snapshot ends
+    if (!board.strokes.length && !layer.count && !(st.conversation || []).length) showHint();
   } catch (err) {
     if (err.status === 404 && SESSION !== 'main') {
       switchSession('main'); // that session no longer exists

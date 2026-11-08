@@ -50,6 +50,12 @@ EVENTS_LOG = os.path.join(DATA_DIR, "events.log")
 SERVER_INFO = os.path.join(DATA_DIR, "server.json")
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")  # one folder per canvas session (board + chat)
 SESSION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+# media files are content-addressed: <sha256 prefix>.<ext>
+MEDIA_FILE_RE = re.compile(r"^[a-f0-9]{16,64}\.(png|jpe?g|gif|webp|avif|heic|mp4|m4v|mov|webm)$")
+MEDIA_SRC_RE = re.compile(r"^/api/media/([a-f0-9]{16,64}\.(?:png|jpe?g|gif|webp|avif|heic|mp4|m4v|mov|webm))$")
+IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
+             "image/avif": "avif", "image/heic": "heic"}
+MAX_MEDIA = 60 * 1024 * 1024
 AGENT_CLIENT = os.path.join(BASE_DIR, "canvas_agent.py")
 STATIC_ROOT = os.path.normcase(os.path.realpath(STATIC_DIR))
 
@@ -171,6 +177,12 @@ drawings are your job.
   ```
   For SVGs, set a `viewBox`, use `font-family="-apple-system, system-ui, sans-serif"`, dark text
   `#1d1d1f`, blue `#0a84ff`, red `#ff3b30`, and text at least 16 px. Don't use scripts.
+- Put an image (a plot, a screenshot, a photo) on the board as a card. Without --x/--y it goes
+  in the middle of the user's view. The user can tap it to move or resize it, and double-tap it
+  to open it full screen:
+  ```bash
+  python canvas_agent.py embed -s {SESSION} --file plot.png --label "what it shows"
+  ```
 - Show where you're going with short progress notes: one for each meaningful step (something
   you found, changed or tested), usually 4 to 8 for a piece of work, each a few plain words. No
   tool names, commands, file paths or arguments. Notes fold into "N steps" above your reply, and they're never spoken:
@@ -196,6 +208,14 @@ MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".ico": "image/x-icon",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".heic": "image/heic",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
     ".woff2": "font/woff2",
     ".woff": "font/woff",
     ".ttf": "font/ttf",
@@ -204,13 +224,32 @@ MIME = {
 
 CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
+    # api.github.com: the page reads the gist that says where the server moved (supervisor.py)
+    "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://api.github.com; "
     "media-src 'self' blob:; manifest-src 'self'; worker-src 'none'; object-src 'none'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 )
 
 QUIET = False
 _print_lock = threading.Lock()
+
+# Where the server can be found when its address changes: supervisor.py publishes each new
+# tunnel address to a secret gist and records the gist in data/link.json. Pages and the iPad
+# app get the gist's API URL with every poll and read it when the old address stops answering.
+_registry_cache = {"mtime": None, "url": None}
+
+
+def registry_url():
+    path = os.path.join(DATA_DIR, "link.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if mtime != _registry_cache["mtime"]:
+        gid = read_json_obj(path).get("gist")
+        ok = isinstance(gid, str) and re.fullmatch(r"[0-9a-f]{8,64}", gid)
+        _registry_cache.update(mtime=mtime, url=f"https://api.github.com/gists/{gid}" if ok else None)
+    return _registry_cache["url"]
 
 
 def log(msg: str) -> None:
@@ -623,8 +662,11 @@ class Session:
         self.registry = registry
         self.dir = os.path.join(SESSIONS_DIR, sid)
         self.inbox = os.path.join(self.dir, "inbox")
+        self.media = os.path.join(self.dir, "media")
         self.events_log = os.path.join(self.dir, "events.log")
         os.makedirs(self.inbox, exist_ok=True)
+        os.makedirs(self.media, exist_ok=True)
+        self.view = None  # the page's current view [x0, y0, x1, y1] (world), reported by the page
         if not os.path.exists(self.events_log):
             open(self.events_log, "ab").close()
         self.meta_file = os.path.join(self.dir, "meta.json")
@@ -862,10 +904,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("POST", "/api/message"): self._api_message,
             ("POST", "/api/reply"): self._api_reply,
             ("POST", "/api/progress"): self._api_progress,
+            ("POST", "/api/media"): self._api_media_upload,
+            ("POST", "/api/view"): self._api_view,
             ("POST", "/api/status"): self._api_status,
             ("POST", "/api/draw"): self._api_draw,
             ("POST", "/api/draw/clear"): self._api_draw_clear,
             ("POST", "/api/draw/remove"): self._api_draw_remove,
+            ("POST", "/api/draw/move"): self._api_draw_move,
             ("PUT", "/api/strokes"): self._api_strokes,
             ("POST", "/api/strokes"): self._api_strokes,
         }
@@ -882,6 +927,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/api/inbox/([^/]+)/timeline\.txt$", path)
         if m and method in ("GET", "HEAD"):
             return self._api_timeline(m.group(1))
+        m = re.match(r"^/api/media/([^/]+)$", path)
+        if m and method in ("GET", "HEAD"):
+            if self.session is None:
+                raise HttpError(404, f"no canvas session {self.sid!r}")
+            return self._api_media_get(m.group(1))
         m = re.match(r"^/api/draw/([^/]+)$", path)
         if m and method == "DELETE":
             return self._remove_draw(m.group(1))
@@ -1215,6 +1265,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "time": now_ms(), "clients": clients})
 
     def _api_state(self):
+        # the event cursor is read *before* the snapshot, so the page's event stream resumes from
+        # here with no gap (an event already in the snapshot may arrive again; pages dedupe by id)
+        with self.hub.cond:
+            cursor = {"epoch": self.hub.epoch, "seq": self.hub.seq}
         st = self.store
         with st.lock:
             payload = {
@@ -1223,6 +1277,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "claude_layer": st.layer,
                 "status": st.status,
                 "server_time": now_ms(),
+                "events": cursor,
             }
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send(200, body, MIME[".json"])
@@ -1402,6 +1457,137 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._set_status(status)
         self._send_json(200, {"id": entry["id"]})
 
+    # ---- media: images now; video and live pages later (served with Range for iOS video)
+    def _api_media_upload(self):
+        """Store a file for this session. Body: {data: base64 or data URL, mime?}.
+        Returns {src: "/api/media/<hash>.<ext>", bytes, mime}. Content-addressed, so re-uploads are free."""
+        body = self._read_json()
+        data = body.get("data")
+        mime = body.get("mime") if isinstance(body.get("mime"), str) else ""
+        if not isinstance(data, str) or not data:
+            raise HttpError(400, "data (base64 or data URL) is required")
+        m = re.match(r"^data:([\w/+.-]+);base64,(.*)$", data, re.S)
+        if m:
+            mime, data = m.group(1), m.group(2)
+        ext = IMAGE_EXT.get(mime.lower())
+        if not ext:
+            raise HttpError(415, "only images for now (png, jpeg, gif, webp, avif, heic)")
+        try:
+            raw = base64.b64decode(data, validate=False)
+        except (binascii.Error, ValueError):
+            raise HttpError(400, "data is not valid base64")
+        if not raw or len(raw) > MAX_MEDIA:
+            raise HttpError(413, "file is empty or too large")
+        name = hashlib.sha256(raw).hexdigest()[:24] + "." + ext
+        path = os.path.join(self.session.media, name)
+        if not os.path.exists(path):
+            write_bytes_atomic(path, raw)
+        log(f"media {name} [{self.session.id}] ({len(raw) / 1e6:.1f} MB)")
+        self._send_json(200, {"src": f"/api/media/{name}", "bytes": len(raw), "mime": mime})
+
+    def _api_media_get(self, name: str):
+        """Serve a media file, with HTTP Range (iPad video playback and seeking need it)."""
+        if not MEDIA_FILE_RE.match(name):
+            raise HttpError(404, "not found")
+        path = os.path.join(self.session.media, name)
+        if not os.path.isfile(path):
+            raise HttpError(404, "not found")
+        size = os.path.getsize(path)
+        ctype = MIME.get(os.path.splitext(name)[1].lower(), "application/octet-stream")
+        rng = self.headers.get("Range") or ""
+        m = re.match(r"^bytes=(\d*)-(\d*)$", rng.strip())
+        start, end = 0, size - 1
+        partial = False
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                end = int(m.group(2)) if m.group(2) else size - 1
+            else:  # suffix range: the last N bytes
+                start = max(0, size - int(m.group(2)))
+            end = min(end, size - 1)
+            if start > end or start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            partial = True
+        length = end - start + 1
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+        self._security_headers()
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(path, "rb") as f:
+            f.seek(start)
+            left = length
+            while left > 0:
+                chunk = f.read(min(left, 1 << 20))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
+
+    def _api_view(self):
+        """The page reports its view [x0, y0, x1, y1] (world units) when the camera settles."""
+        body = self._read_json()
+        v = body.get("view")
+        if isinstance(v, list) and len(v) == 4 and all(isinstance(n, (int, float)) for n in v):
+            self.session.view = [float(n) for n in v]
+            with self.voice.lock:
+                if self.voice.view != self.session.view:
+                    self.voice.notes_in_view = 0
+                self.voice.view = self.session.view
+        self._send_json(200, {"ok": True})
+
+    def _draw_image(self, body: dict):
+        """An image card on the board: {type: "image", src: "/api/media/…", x?, y?, width?, height?,
+        aspect?, id?, label?}. Without x/y it goes in the middle of the user's current view."""
+        src = body.get("src")
+        if not isinstance(src, str) or not MEDIA_SRC_RE.match(src):
+            raise HttpError(400, "src must be a /api/media/... path from POST /api/media")
+        if not os.path.isfile(os.path.join(self.session.media, src.rsplit("/", 1)[1])):
+            raise HttpError(404, "that media file isn't in this session")
+        item_id = body.get("id")
+        if item_id is not None and (not isinstance(item_id, str) or not DRAW_ID_RE.match(item_id)):
+            raise HttpError(400, "id must match [A-Za-z0-9_.:-]{1,64}")
+        item_id = item_id or "m-" + secrets.token_hex(4)
+        aspect = num(body.get("aspect"))  # height / width of the image, if known
+        v = self.session.view or [0.0, 0.0, 1200.0, 800.0]
+        vw, vh = v[2] - v[0], v[3] - v[1]
+        width = num(body.get("width"))
+        width = width if width and width > 0 else vw * 0.42
+        height = num(body.get("height"))
+        height = height if height and height > 0 else (width * aspect if aspect and aspect > 0 else None)
+        x, y = num(body.get("x")), num(body.get("y"))
+        if x is None or y is None:
+            x = v[0] + (vw - width) / 2
+            y = v[1] + (vh - (height or width * 0.66)) / 2
+        label = body.get("label")
+        item = {"id": item_id, "type": "image", "src": src, "x": x, "y": y, "width": width,
+                "height": height, "aspect": aspect if aspect and aspect > 0 else None,
+                "label": clean_line(label, 200) if isinstance(label, str) and label.strip() else None,
+                "ts": now_ms()}
+        st = self.store
+        with st.lock:
+            for i, old in enumerate(st.layer):
+                if isinstance(old, dict) and old.get("id") == item_id:
+                    st.layer[i] = item
+                    break
+            else:
+                st.layer.append(item)
+            st.save_layer()
+        log(f"image {item_id} [{self.session.id}] at ({x:.0f},{y:.0f}) w={width:.0f}")
+        self.session.touch_agent()
+        self.hub.broadcast("draw", item)
+        self._send_json(200, {"id": item_id, "x": x, "y": y, "width": width, "height": height})
+
     def _api_progress(self):
         """A one-line note of what the agent is doing now. Shown in the chat (folded into
         "N steps" once it replies) and as the status line. Never spoken by the voice."""
@@ -1436,6 +1622,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             res["status"] = self.store.status
         res["sessions"] = self.sessions.summaries()  # the page's switcher: unread + connected
         res["build"] = build_version()  # the page offers a reload when the code on the PC changed
+        reg = registry_url()
+        if reg:
+            res["registry"] = reg  # where to look if this address stops answering
         self._send_json(200, res)
 
     def _api_mirror(self):
@@ -1724,6 +1913,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _api_draw(self):
         body = self._read_json()
+        if body.get("type") == "image":
+            return self._draw_image(body)
         svg = body.get("svg")
         if not isinstance(svg, str) or "<svg" not in svg.lower():
             raise HttpError(400, "svg (string containing an <svg> element) is required")
@@ -1778,6 +1969,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not isinstance(item_id, str) or not item_id:
             raise HttpError(400, "id is required")
         self._remove_draw(item_id)
+
+    def _api_draw_move(self):
+        """Move and/or resize a Claude-layer item (a card or a drawing): {id, x, y, width?, height?}.
+        Geometry only, so every page just repositions it (no re-render, no "Claude drew" toast)."""
+        body = self._read_json()
+        item_id = body.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            raise HttpError(400, "id is required")
+        x, y = num(body.get("x")), num(body.get("y"))
+        if x is None or y is None:
+            raise HttpError(400, "x and y are required")
+        width, height = num(body.get("width")), num(body.get("height"))
+        st = self.store
+        with st.lock:
+            item = next((it for it in st.layer if isinstance(it, dict) and it.get("id") == item_id), None)
+            if item is None:
+                raise HttpError(404, f"no Claude-layer item with id {item_id!r}")
+            item["x"], item["y"] = x, y
+            if width and width > 0:
+                item["width"] = width
+            if height and height > 0:
+                item["height"] = height
+            item["ts"] = now_ms()
+            st.save_layer()
+            geom = {k: item.get(k) for k in ("id", "x", "y", "width", "height", "ts")}
+        self.hub.broadcast("draw_move", geom)
+        self._send_json(200, {"ok": True, **geom})
 
     def _remove_draw(self, item_id: str):
         st = self.store

@@ -257,6 +257,17 @@ DOMPurify 3.4.17 (Apache-2.0 / MPL-2.0, used under Apache-2.0), KaTeX 0.19.1 (MI
 
 - **Long-polling:** `GET /api/poll?since=<seq>&epoch=<id>&wait=25` returns `{epoch, next, reset, events:[{seq, event, data}], status}`. The page uses this instead of SSE because Cloudflare quick tunnels buffer SSE. `/api/events` still works on localhost.
 - **Chat mirror:** `POST /api/mirror {role: "user"|"claude", text}` adds a main-chat turn to the canvas conversation without touching `events.log`. It is used by `hooks/mirror_prompt.py` (UserPromptSubmit) and `hooks/mirror_reply.py` (Stop).
+  - They mirror only for a Claude Code session attached to a canvas session (`canvas_agent.py wait`/`connect` records it in `~/.canvas_agent/attached.json`), only into that session, and only turns that began with a typed prompt.
+  - To install them, add this to `training/.claude/settings.local.json` (or use `/hooks`):
+    ```json
+    "hooks": {
+      "UserPromptSubmit": [{ "hooks": [{ "type": "command", "timeout": 10,
+        "command": "python \"C:/Users/AnshulThakur/Documents/training/canvas/hooks/mirror_prompt.py\"" }] }],
+      "Stop": [{ "hooks": [{ "type": "command", "timeout": 15,
+        "command": "python \"C:/Users/AnshulThakur/Documents/training/canvas/hooks/mirror_reply.py\"" }] }]
+    }
+    ```
+- **Cards:** `POST /api/draw/move {id, x, y, width?, height?}` moves or resizes a Claude-layer item and broadcasts `draw_move` (pages reposition it without re-rendering). `GET /api/state` also returns `events: {epoch, seq}`, the cursor the page resumes its event stream from.
 - **Erasing the user's ink:** `python canvas/ink.py --list | --erase-ids ID… | --erase-box X0 Y0 X1 Y1 | --erase-px X0 Y0 X1 Y1 --timeline <timeline.txt>`, with `[--mode inside|center] [--dry-run]`. It saves the filtered stroke list with `PUT /api/strokes` (client `"claude"`), and the page reloads it.
 - **Full screen:** the top-bar button uses the Fullscreen API on iPadOS Safari.
   - Safari adds its own one-finger swipe-down gesture that exits full screen, and pages can't block it.
