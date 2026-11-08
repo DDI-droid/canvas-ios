@@ -40,6 +40,7 @@ def gh(*args: str) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--run", type=int, help="run number (default: latest successful)")
+    ap.add_argument("--no-publish", action="store_true", help="don't publish to the SideStore source gist")
     args = ap.parse_args()
 
     runs = json.loads(gh("run", "list", "--workflow", WORKFLOW, "--limit", "30",
@@ -71,6 +72,11 @@ def main() -> None:
         json.dump(info, f, indent=1)
     size = os.path.getsize(os.path.join(APP_DIR, "Canvas.ipa"))
     print(f"build {run['number']} ({info['commit']}): {size / 1e6:.1f} MB -> data/app/Canvas.ipa")
+    if not args.no_publish:
+        # the SideStore source whose address never changes (publish_app.py)
+        sys.path.insert(0, HERE)
+        import publish_app
+        publish_app.publish()
 
 
 if __name__ == "__main__":
