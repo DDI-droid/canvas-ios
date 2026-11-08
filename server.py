@@ -52,6 +52,37 @@ SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")  # one folder per canvas sessi
 SESSION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 # media files are content-addressed: <sha256 prefix>.<ext>
 MEDIA_FILE_RE = re.compile(r"^[a-f0-9]{16,64}\.(png|jpe?g|gif|webp|avif|heic|mp4|m4v|mov|webm)$")
+# a light copy of an image for board cards, made on first request (<hash>.preview.jpg)
+PREVIEW_RE = re.compile(r"^([a-f0-9]{16,64})\.preview\.jpg$")
+PREVIEW_SIDE = 1280
+_preview_lock = threading.Lock()
+
+
+def make_preview(src: str, dst: str) -> bool:
+    """A JPEG at most PREVIEW_SIDE px on its long side, upright, on white. False without Pillow
+    or for an image it can't read (the page then shows the original)."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return False
+    try:
+        with Image.open(src) as im:
+            im = ImageOps.exif_transpose(im)
+            im.thumbnail((PREVIEW_SIDE, PREVIEW_SIDE), Image.LANCZOS)
+            if im.mode in ("RGBA", "LA", "P", "PA"):
+                im = im.convert("RGBA")
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.getchannel("A"))
+                im = bg
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+            tmp = dst + ".tmp"
+            im.save(tmp, "JPEG", quality=85, optimize=True, progressive=True)
+        os.replace(tmp, dst)
+        return True
+    except Exception as e:
+        log(f"preview failed for {os.path.basename(src)}: {e}")
+        return False
 MEDIA_SRC_RE = re.compile(r"^/api/media/([a-f0-9]{16,64}\.(?:png|jpe?g|gif|webp|avif|heic|mp4|m4v|mov|webm))$")
 IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
              "image/avif": "avif", "image/heic": "heic"}
@@ -239,6 +270,22 @@ _print_lock = threading.Lock()
 _registry_cache = {"mtime": None, "url": None}
 
 
+_app_cache = {"mtime": None, "info": None}
+
+
+def latest_app_build():
+    """{"version"} of the newest iPad app build on this PC (data/app/build.json), or None."""
+    path = os.path.join(DATA_DIR, "app", "build.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if mtime != _app_cache["mtime"]:
+        v = read_json_obj(path).get("version")
+        _app_cache.update(mtime=mtime, info={"version": str(v)} if v else None)
+    return _app_cache["info"]
+
+
 def registry_url():
     path = os.path.join(DATA_DIR, "link.json")
     try:
@@ -351,6 +398,77 @@ def write_json_atomic(path: str, obj, pretty: bool = False) -> None:
     write_bytes_atomic(path, (text + "\n").encode("utf-8"))
 
 
+def read_json_any(path: str):
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError) as e:
+        log(f"warning: could not read {os.path.basename(path)} ({e}); starting empty")
+        return None
+
+
+# ---- ink as changes ("ops")
+# Pages send only what changed: {"op": "put", "s": stroke, "after": id-or-null} adds or replaces a
+# stroke (a new one goes right after `after`; null = at the bottom of the stack), and
+# {"op": "del", "id": id} removes one. Every accepted batch gets the next revision number, is
+# appended to strokes.ops.jsonl at once (a crash loses nothing) and broadcast as an `ink` event;
+# strokes.json is rewritten in the background ({"rev", "strokes"}) and the log then emptied.
+INK_RECENT = 3000          # recent batches kept in memory, so a page can catch up from its revision
+INK_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+def valid_ink_ops(ops) -> bool:
+    if not isinstance(ops, list) or not ops or len(ops) > 20000:
+        return False
+    for o in ops:
+        if not isinstance(o, dict):
+            return False
+        if o.get("op") == "del":
+            if not isinstance(o.get("id"), str) or not INK_ID_RE.match(o["id"]):
+                return False
+        elif o.get("op") == "put":
+            s = o.get("s")
+            if not (isinstance(s, dict) and isinstance(s.get("id"), str) and INK_ID_RE.match(s["id"])
+                    and isinstance(s.get("pts"), list)):
+                return False
+            if "after" in o and o["after"] is not None and not isinstance(o["after"], str):
+                return False
+        else:
+            return False
+    return True
+
+
+def apply_ink_ops(strokes: list, ops: list) -> list:
+    """Apply a batch in order. Puts replace in place (or insert after `after`); dels remove."""
+    out = list(strokes)
+    index = {s.get("id"): i for i, s in enumerate(out) if isinstance(s, dict)}
+    for o in ops:
+        if o["op"] == "del":
+            i = index.pop(o["id"], None)
+            if i is not None:
+                out[i] = None
+            continue
+        s = o["s"]
+        i = index.get(s["id"])
+        if i is not None:
+            out[i] = s
+            continue
+        if "after" not in o:
+            out.append(s)
+            index[s["id"]] = len(out) - 1
+            continue
+        j = index.get(o["after"]) if o["after"] is not None else -1
+        if j is None or j == len(out) - 1:
+            out.append(s)
+            index[s["id"]] = len(out) - 1
+        else:
+            out.insert(j + 1, s)  # rare (an undo restoring a stroke mid-stack): rebuild the index
+            index = {x.get("id"): k for k, x in enumerate(out) if isinstance(x, dict)}
+    return [s for s in out if s is not None]
+
+
 class Store:
     """One session's board and chat, kept in memory and saved under its folder."""
 
@@ -358,17 +476,101 @@ class Store:
         self.lock = threading.RLock()
         self.conv_file = os.path.join(folder, "conversation.json")
         self.strokes_file = os.path.join(folder, "strokes.json")
+        self.ink_log_file = os.path.join(folder, "strokes.ops.jsonl")
         self.layer_file = os.path.join(folder, "claude_layer.json")
         self.conversation = read_json_list(self.conv_file)
-        self.strokes = read_json_list(self.strokes_file)
         self.layer = read_json_list(self.layer_file)
         self.status = {"status": "idle", "ts": now_ms()}
+        self.ink_rev = 0
+        self.ink_id = ""  # this board's identity: a page's saved copy is only good for the same id
+        self.ink_recent: collections.deque = collections.deque(maxlen=INK_RECENT)  # (rev, client, ops|None)
+        self.ink_dirty = False  # strokes.json is behind the log
+        self._load_ink()
+
+    def _load_ink(self) -> None:
+        data = read_json_any(self.strokes_file)
+        if isinstance(data, dict):  # {"id", "rev", "strokes"}
+            self.strokes = data.get("strokes") if isinstance(data.get("strokes"), list) else []
+            self.ink_rev = int(data.get("rev") or 0)
+            self.ink_id = str(data.get("id") or "")
+        else:  # the old format: a plain list
+            self.strokes = data if isinstance(data, list) else []
+        if not self.ink_id:
+            self.ink_id = secrets.token_hex(6)
+            self.ink_dirty = True  # written with the next snapshot
+        try:
+            with open(self.ink_log_file, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:  # changes saved after the last snapshot
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue  # a line cut short by a crash
+            rev = int(entry.get("rev") or 0)
+            if rev <= self.ink_rev:
+                continue
+            if entry.get("reset"):
+                self.strokes = entry.get("strokes") or []
+                self.ink_recent.append((rev, entry.get("client"), None))
+            elif valid_ink_ops(entry.get("ops")):
+                self.strokes = apply_ink_ops(self.strokes, entry["ops"])
+                self.ink_recent.append((rev, entry.get("client"), entry["ops"]))
+            self.ink_rev = rev
+            self.ink_dirty = True
 
     def save_conversation(self) -> None:
         write_json_atomic(self.conv_file, self.conversation, pretty=True)
 
-    def save_strokes(self) -> None:
-        write_json_atomic(self.strokes_file, self.strokes)
+    def apply_ink(self, ops: list, client) -> int:
+        """Apply a batch from a page; returns its revision. Call with the lock held."""
+        self.strokes = apply_ink_ops(self.strokes, ops)
+        self.ink_rev += 1
+        self._log_ink({"rev": self.ink_rev, "client": client, "ops": ops})
+        self.ink_recent.append((self.ink_rev, client, ops))
+        return self.ink_rev
+
+    def reset_ink(self, strokes: list, client) -> int:
+        """Replace the whole board (tools, older pages). Call with the lock held."""
+        self.strokes = strokes
+        self.ink_rev += 1
+        self.ink_recent.append((self.ink_rev, client, None))
+        self.ink_dirty = True
+        self.compact_ink()  # a whole board: write the snapshot now rather than log it
+        return self.ink_rev
+
+    def _log_ink(self, entry: dict) -> None:
+        line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with open(self.ink_log_file, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            size = f.tell()
+        self.ink_dirty = True
+        if size > 2_000_000:
+            self.compact_ink()
+
+    def compact_ink(self) -> None:
+        """Write strokes.json ({"rev", "strokes"}) and empty the log. Call with the lock held."""
+        if not self.ink_dirty:
+            return
+        write_json_atomic(self.strokes_file, {"id": self.ink_id, "rev": self.ink_rev, "strokes": self.strokes})
+        with open(self.ink_log_file, "w", encoding="utf-8"):
+            pass
+        self.ink_dirty = False
+
+    def ink_since(self, since: int, board_id: str = "") -> dict:
+        """What a page at revision `since` of board `board_id` is missing: the batches, or the
+        whole board (another board, too far behind, or a whole-board reset in between)."""
+        base = {"id": self.ink_id, "rev": self.ink_rev}
+        if board_id and board_id != self.ink_id:
+            return {**base, "strokes": self.strokes}
+        if since == self.ink_rev:
+            return {**base, "batches": []}
+        recent = [b for b in self.ink_recent if b[0] > since]
+        if 0 <= since < self.ink_rev and recent and recent[0][0] == since + 1 and all(b[2] is not None for b in recent):
+            return {**base, "batches": [{"rev": r, "client": c, "ops": o} for r, c, o in recent]}
+        return {**base, "strokes": self.strokes}
 
     def save_layer(self) -> None:
         write_json_atomic(self.layer_file, self.layer, pretty=True)
@@ -912,6 +1114,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("POST", "/api/draw/remove"): self._api_draw_remove,
             ("POST", "/api/draw/move"): self._api_draw_move,
             ("PUT", "/api/strokes"): self._api_strokes,
+            ("GET", "/api/ink"): self._api_ink_get,
+            ("POST", "/api/ink"): self._api_ink_post,
+            ("GET", "/api/conversation"): self._api_conversation,
             ("POST", "/api/strokes"): self._api_strokes,
         }
         fn = routes.get(("GET" if method == "HEAD" else method, path))
@@ -1018,6 +1223,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _read_json(self) -> dict:
+        raw = self._read_body()
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError):
+            raise HttpError(400, "body must be UTF-8 JSON")
+        if not isinstance(data, dict):
+            raise HttpError(400, "body must be a JSON object")
+        return data
+
+    def _read_body(self) -> bytes:
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
             self.close_connection = True
             raise HttpError(411, "chunked bodies not supported; send Content-Length")
@@ -1040,16 +1257,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ConnectionError("client closed during body")
             chunks.append(chunk)
             remaining -= len(chunk)
-        raw = b"".join(chunks)
-        if not raw.strip():
-            return {}
-        try:
-            data = json.loads(raw.decode("utf-8-sig"))
-        except (UnicodeDecodeError, ValueError):
-            raise HttpError(400, "body must be UTF-8 JSON")
-        if not isinstance(data, dict):
-            raise HttpError(400, "JSON body must be an object")
-        return data
+        return b"".join(chunks)
 
     # ---- page + static
     def _serve_index(self):
@@ -1269,18 +1477,77 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # here with no gap (an event already in the snapshot may arrive again; pages dedupe by id)
         with self.hub.cond:
             cursor = {"epoch": self.hub.epoch, "seq": self.hub.seq}
+        # Pages ask for less: ?conv=N (only the latest N chat entries; older ones on demand from
+        # /api/conversation) and ?strokes=0 (ink comes from /api/ink, and only when it changed).
+        # Without them (tools, older pages) everything comes back, as before.
+        def qint(name):
+            try:
+                return int(self.query.get(name, [""])[0])
+            except ValueError:
+                return None
+        conv_limit = qint("conv")
+        want_strokes = self.query.get("strokes", ["1"])[0] != "0"
         st = self.store
         with st.lock:
+            conv = st.conversation
+            if conv_limit and conv_limit > 0:
+                conv = conv[-conv_limit:]
             payload = {
-                "conversation": st.conversation,
-                "strokes": st.strokes,
+                "conversation": conv,
+                "conversation_more": len(conv) < len(st.conversation),
                 "claude_layer": st.layer,
                 "status": st.status,
                 "server_time": now_ms(),
                 "events": cursor,
+                "ink_rev": st.ink_rev,
             }
+            if want_strokes:
+                payload["strokes"] = st.strokes
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send(200, body, MIME[".json"])
+
+    def _api_conversation(self):
+        """Older chat entries, for scrolling up: ?before=<id>&limit=N (default 60)."""
+        before = self.query.get("before", [""])[0]
+        try:
+            limit = max(1, min(200, int(self.query.get("limit", ["60"])[0])))
+        except ValueError:
+            limit = 60
+        st = self.store
+        with st.lock:
+            conv = st.conversation
+            end = len(conv)
+            if before:
+                end = next((i for i, m in enumerate(conv) if isinstance(m, dict) and m.get("id") == before), end)
+            page = conv[max(0, end - limit):end]
+            more = end - limit > 0
+        self._send_json(200, {"conversation": page, "more": more})
+
+    def _api_ink_get(self):
+        """Ink since a revision: ?since=R&id=BOARD gives the batches after R, or the whole board."""
+        try:
+            since = int(self.query.get("since", ["-1"])[0])
+        except ValueError:
+            since = -1
+        board_id = self.query.get("id", [""])[0]
+        st = self.store
+        with st.lock:
+            res = st.ink_since(since, board_id)
+            body = json.dumps(res, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send(200, body, MIME[".json"])
+
+    def _api_ink_post(self):
+        """A page's ink changes: {client, ops: [...]} -> {rev}. See apply_ink_ops."""
+        body = self._read_json()
+        ops = body.get("ops")
+        if not valid_ink_ops(ops):
+            raise HttpError(400, "ops must be a list of {op: 'put', s: {id, pts, ...}, after?} or {op: 'del', id}")
+        client = body.get("client") if isinstance(body.get("client"), str) else None
+        st = self.store
+        with st.lock:  # broadcast under the lock too, so events go out in revision order
+            rev = st.apply_ink(ops, client)
+            self.hub.broadcast("ink", {"rev": rev, "client": client, "ops": ops})
+        self._send_json(200, {"rev": rev})
 
     def _api_snapshot(self, mid: str):
         if not MSG_ID_RE.match(mid):
@@ -1353,6 +1620,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         st = self.store
         with st.lock:
+            # a retry of a message that already arrived (its answer got lost on the way back, or
+            # the page re-sent its outbox after a reload): answer as before, deliver it once
+            if cid:
+                for m in reversed(st.conversation[-300:]):
+                    if isinstance(m, dict) and m.get("cid") == cid and m.get("role") == "user":
+                        self._send_json(200, {"id": m.get("id"), "duplicate": True})
+                        return
             mid = new_msg_id()
             while os.path.exists(os.path.join(self.session.inbox, mid)):
                 mid = new_msg_id()
@@ -1416,11 +1690,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HttpError(400, "strokes must be a list")
         client = body.get("client") if isinstance(body.get("client"), str) else None
         st = self.store
-        with st.lock:
-            st.strokes = strokes
-            st.save_strokes()
+        with st.lock:  # the whole board at once (older pages, tools): pages reload their ink
+            rev = st.reset_ink(strokes, client)
+            self.hub.broadcast("ink", {"rev": rev, "client": client, "reset": True})
         self.hub.broadcast("strokes", {"client": client, "count": len(strokes), "ts": now_ms()})
-        self._send_json(200, {"ok": True, "count": len(strokes)})
+        self._send_json(200, {"ok": True, "count": len(strokes), "rev": rev})
 
     # ---- API: Claude -> page
     def _set_status(self, status: str):
@@ -1459,23 +1733,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ---- media: images now; video and live pages later (served with Range for iOS video)
     def _api_media_upload(self):
-        """Store a file for this session. Body: {data: base64 or data URL, mime?}.
-        Returns {src: "/api/media/<hash>.<ext>", bytes, mime}. Content-addressed, so re-uploads are free."""
-        body = self._read_json()
-        data = body.get("data")
-        mime = body.get("mime") if isinstance(body.get("mime"), str) else ""
-        if not isinstance(data, str) or not data:
-            raise HttpError(400, "data (base64 or data URL) is required")
-        m = re.match(r"^data:([\w/+.-]+);base64,(.*)$", data, re.S)
-        if m:
-            mime, data = m.group(1), m.group(2)
-        ext = IMAGE_EXT.get(mime.lower())
-        if not ext:
-            raise HttpError(415, "only images for now (png, jpeg, gif, webp, avif, heic)")
-        try:
-            raw = base64.b64decode(data, validate=False)
-        except (binascii.Error, ValueError):
-            raise HttpError(400, "data is not valid base64")
+        """Store a file for this session. Body: the file itself (Content-Type: image/…), or
+        JSON {data: base64 or data URL, mime?} (agents). Returns {src: "/api/media/<hash>.<ext>",
+        bytes, mime}. Content-addressed, so re-uploads are free."""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype.startswith("image/"):  # the page sends files as they are: no base64, a third smaller
+            mime, raw = ctype, self._read_body()
+            ext = IMAGE_EXT.get(mime)
+            if not ext:
+                raise HttpError(415, "only images for now (png, jpeg, gif, webp, avif, heic)")
+        else:
+            body = self._read_json()
+            data = body.get("data")
+            mime = body.get("mime") if isinstance(body.get("mime"), str) else ""
+            if not isinstance(data, str) or not data:
+                raise HttpError(400, "data (base64 or data URL) is required")
+            m = re.match(r"^data:([\w/+.-]+);base64,(.*)$", data, re.S)
+            if m:
+                mime, data = m.group(1), m.group(2)
+            ext = IMAGE_EXT.get(mime.lower())
+            if not ext:
+                raise HttpError(415, "only images for now (png, jpeg, gif, webp, avif, heic)")
+            try:
+                raw = base64.b64decode(data, validate=False)
+            except (binascii.Error, ValueError):
+                raise HttpError(400, "data is not valid base64")
         if not raw or len(raw) > MAX_MEDIA:
             raise HttpError(413, "file is empty or too large")
         name = hashlib.sha256(raw).hexdigest()[:24] + "." + ext
@@ -1486,10 +1768,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send_json(200, {"src": f"/api/media/{name}", "bytes": len(raw), "mime": mime})
 
     def _api_media_get(self, name: str):
-        """Serve a media file, with HTTP Range (iPad video playback and seeking need it)."""
-        if not MEDIA_FILE_RE.match(name):
+        """Serve a media file, with HTTP Range (iPad video playback and seeking need it).
+        <hash>.preview.jpg is made from the original on first request (board cards use it)."""
+        pm = PREVIEW_RE.match(name)
+        if not pm and not MEDIA_FILE_RE.match(name):
             raise HttpError(404, "not found")
         path = os.path.join(self.session.media, name)
+        if pm and not os.path.isfile(path):
+            originals = [f for f in os.listdir(self.session.media)
+                         if f.startswith(pm.group(1) + ".") and MEDIA_FILE_RE.match(f)]
+            with _preview_lock:
+                if not os.path.isfile(path) and not (originals and make_preview(
+                        os.path.join(self.session.media, originals[0]), path)):
+                    raise HttpError(404, "no preview")
         if not os.path.isfile(path):
             raise HttpError(404, "not found")
         size = os.path.getsize(path)
@@ -1625,6 +1916,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         reg = registry_url()
         if reg:
             res["registry"] = reg  # where to look if this address stops answering
+        app = latest_app_build()
+        if app:
+            res["app"] = app  # the iPad app says once when a newer build is ready in SideStore
         self._send_json(200, res)
 
     def _api_mirror(self):
@@ -2074,11 +2368,27 @@ def main(argv=None) -> int:
     print(f"  Sessions: {', '.join(x.id for x in Handler.sessions.all())} (data/sessions/<id>/events.log)",
           flush=True)
     QUIET = args.quiet
+
+    def compact_all():
+        for sess in Handler.sessions.all():
+            try:
+                with sess.store.lock:
+                    sess.store.compact_ink()
+            except Exception as e:  # never let the writer die
+                log(f"warning: couldn't save {sess.id}'s ink snapshot ({e})")
+
+    def writer():  # ink changes are logged at once; the full board is rewritten every few seconds
+        while True:
+            time.sleep(5)
+            compact_all()
+
+    threading.Thread(target=writer, daemon=True, name="ink-writer").start()
     try:
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
     finally:
+        compact_all()
         for sess in Handler.sessions.all():
             sess.hub.close_all()
         httpd.server_close()

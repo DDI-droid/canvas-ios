@@ -86,6 +86,27 @@ export function prepareStroke(s) {
   return s;
 }
 
+// A cheap, slightly generous box from the points alone. A loaded board uses it until a stroke is
+// first painted (prepareStroke builds the real outline then), so opening a big board is quick:
+// strokes far off screen are never outlined until you go there.
+function quickBBox(s) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of s.pts) {
+    if (p[0] < x0) x0 = p[0];
+    if (p[1] < y0) y0 = p[1];
+    if (p[0] > x1) x1 = p[0];
+    if (p[1] > y1) y1 = p[1];
+  }
+  const r = s.size * 0.75 + 1;
+  return [x0 - r, y0 - r, x1 + r, y1 + r];
+}
+
+function lazyStroke(s) {
+  s._path = null;
+  if (!s._bbox) s._bbox = quickBBox(s); // parseStroke already measured it
+  return s;
+}
+
 export function paintStroke(ctx, s, theme, alpha = 1) {
   if (!s._path) prepareStroke(s);
   const hl = s.tool === 'hl';
@@ -138,29 +159,42 @@ function serializeStroke(s) {
   return o;
 }
 
+// One pass over the points: build them, check them, and measure the box (big boards load many
+// thousands of strokes, so this is the hot loop of opening one).
 function parseStroke(o) {
   if (!o || typeof o !== 'object' || !Array.isArray(o.pts)) return null;
   const pts = [];
   const flat = o.pts;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const add = (x, y, p) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    pts.push([x, y, p == null ? 0.5 : +p]);
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (y < y0) y0 = y;
+    if (y > y1) y1 = y;
+    return true;
+  };
   if (Array.isArray(flat[0])) {
-    for (const p of flat) if (Array.isArray(p) && p.length >= 2) pts.push([+p[0], +p[1], p[2] == null ? 0.5 : +p[2]]);
+    for (const p of flat) if (Array.isArray(p) && p.length >= 2 && !add(+p[0], +p[1], p[2])) return null;
   } else {
-    for (let i = 0; i + 2 < flat.length + 1; i += 3) {
-      if (i + 1 >= flat.length) break;
-      pts.push([+flat[i], +flat[i + 1], flat[i + 2] == null ? 0.5 : +flat[i + 2]]);
-    }
+    for (let i = 0; i + 1 < flat.length; i += 3) if (!add(+flat[i], +flat[i + 1], flat[i + 2])) return null;
   }
-  if (!pts.length || pts.some((p) => !Number.isFinite(p[0]) || !Number.isFinite(p[1]))) return null;
+  if (!pts.length) return null;
+  const size = Number.isFinite(+o.size) && +o.size > 0 ? +o.size : 3.5;
+  const r = size * 0.75 + 1;
   return {
     id: typeof o.id === 'string' ? o.id : uid('s'),
     tool: o.tool === 'hl' ? 'hl' : 'pen',
     color: typeof o.color === 'string' ? o.color : 'ink',
-    size: Number.isFinite(+o.size) && +o.size > 0 ? +o.size : 3.5,
+    size,
     t0: +o.t0 || 0,
     t1: +o.t1 || +o.t0 || 0,
     mt: +o.mt || 0,
     sim: !!o.sim,
     pts,
+    _path: null,
+    _bbox: [x0 - r, y0 - r, x1 + r, y1 + r], // generous until the stroke is first drawn (lazyStroke)
   };
 }
 
@@ -202,6 +236,8 @@ export class Board extends EventTarget {
     this.selection = null;
     this.spaceDown = false;
     this.dirty = { view: true, ink: true, live: true, cam: false };
+    this.changed = new Set(); // ids of strokes added / changed / removed here since takeOps()
+    this._dirtyRegion = null; // world rect of the ink bitmap to redraw (erase, undo, remote changes)
     this.inkCam = null;   // the camera the ink bitmap was drawn with
     this.inkM = 0;        // px the ink canvas reaches past each screen edge
     this.moving = false;  // the camera is moving (pan, pinch, animation)
@@ -259,11 +295,12 @@ export class Board extends EventTarget {
         if (this.selection.ids.has(s.id) && s.color !== key) {
           items.push({ id: s.id, from: s.color, to: key });
           s.color = key;
+          this.changed.add(s.id);
         }
       }
       if (items.length) {
         this._pushHistory({ type: 'recolor', items });
-        this._invalidate('ink');
+        this._invalidateRegion(this.selection.bbox);
         this._changed();
       }
       return;
@@ -290,10 +327,11 @@ export class Board extends EventTarget {
     this.strokes = [];
     for (const o of Array.isArray(list) ? list : []) {
       const s = parseStroke(o);
-      if (s) this.strokes.push(prepareStroke(s));
+      if (s) this.strokes.push(lazyStroke(s));
     }
     this.undoStack = [];
     this.redoStack = [];
+    this.changed.clear();
     this.clearSelection();
     this._invalidate('ink');
     this._emit('history');
@@ -302,6 +340,107 @@ export class Board extends EventTarget {
 
   serialize() {
     return this.strokes.map(serializeStroke);
+  }
+
+  // ---- undo / redo across a reload (the automatic update carries them over: app.js)
+  exportHistory() {
+    const enc = (op) => {
+      if (op.type === 'add' || op.type === 'remove') {
+        return { type: op.type, label: op.label, items: op.items.map((it) => ({ s: serializeStroke(it.s), index: it.index })) };
+      }
+      if (op.type === 'move') return { ...op, ids: [...op.ids] };
+      if (op.type === 'recolor') return { type: 'recolor', items: op.items };
+      return null;
+    };
+    return { undo: this.undoStack.map(enc).filter(Boolean), redo: this.redoStack.map(enc).filter(Boolean) };
+  }
+
+  importHistory(h) {
+    if (!h || !Array.isArray(h.undo) || !Array.isArray(h.redo)) return;
+    const byId = new Map(this.strokes.map((s) => [s.id, s]));
+    const stroke = (o) => byId.get(o && o.id) || (() => { const s = parseStroke(o); return s ? lazyStroke(s) : null; })();
+    const dec = (op) => {
+      if (op.type === 'add' || op.type === 'remove') {
+        const items = op.items.map((it) => ({ s: stroke(it.s), index: it.index })).filter((it) => it.s);
+        return items.length ? { ...op, items } : null;
+      }
+      return op;
+    };
+    this.undoStack = h.undo.map(dec).filter(Boolean);
+    this.redoStack = h.redo.map(dec).filter(Boolean);
+    this._emit('history');
+  }
+
+  // ---- ink as changes (the server keeps the board as a log of these; see server.py)
+
+  // What changed here since the last call: dels first, then puts in stack order, each put saying
+  // which stroke it sits on top of, so the server keeps everyone's stacking order the same.
+  takeOps() {
+    if (!this.changed.size) return [];
+    const pos = new Map();
+    this.strokes.forEach((s, i) => pos.set(s.id, i));
+    const dels = [], puts = [];
+    for (const id of this.changed) {
+      const i = pos.get(id);
+      if (i === undefined) dels.push({ op: 'del', id });
+      else puts.push(i);
+    }
+    puts.sort((a, b) => a - b);
+    this.changed.clear();
+    return dels.concat(puts.map((i) => ({
+      op: 'put', s: serializeStroke(this.strokes[i]), after: i > 0 ? this.strokes[i - 1].id : null,
+    })));
+  }
+
+  // Changes from another device (or replayed local ones after a reload): applied in place, not
+  // undoable here, and only the touched area of the ink is redrawn.
+  applyRemote(ops) {
+    if (!Array.isArray(ops) || !ops.length) return;
+    let out = this.strokes.slice();
+    let index = new Map();
+    out.forEach((s, i) => index.set(s.id, i));
+    let dirty = null;
+    const reindex = () => { index = new Map(); out.forEach((s, i) => { if (s) index.set(s.id, i); }); };
+    for (const o of ops) {
+      if (!o || typeof o !== 'object') continue;
+      if (o.op === 'del') {
+        const i = index.get(o.id);
+        if (i === undefined) continue;
+        dirty = unionRect(dirty, out[i]._bbox);
+        out[i] = null;
+        index.delete(o.id);
+        if (this.selection) this.selection.ids.delete(o.id);
+      } else if (o.op === 'put') {
+        const s = parseStroke(o.s);
+        if (!s) continue;
+        lazyStroke(s);
+        dirty = unionRect(dirty, s._bbox);
+        const i = index.get(s.id);
+        if (i !== undefined) {
+          dirty = unionRect(dirty, out[i]._bbox);
+          out[i] = s;
+        } else if (!('after' in o)) {
+          out.push(s);
+          index.set(s.id, out.length - 1);
+        } else {
+          const j = o.after == null ? -1 : index.get(o.after);
+          if (j === undefined || j === out.length - 1) {
+            out.push(s);
+            index.set(s.id, out.length - 1);
+          } else {
+            out.splice(j + 1, 0, s);
+            reindex();
+          }
+        }
+      }
+    }
+    this.strokes = out.filter(Boolean);
+    if (this.selection) {
+      if (!this.selection.ids.size) this.clearSelection();
+      else { this.selection.bbox = this._bboxOf(this.selection.ids); this._updateSelectionEl(); }
+    }
+    if (dirty) this._invalidateRegion(dirty);
+    this._emit('change', { local: false });
   }
 
   get busy() {
@@ -430,10 +569,10 @@ export class Board extends EventTarget {
       if (viaGesture) this._emit('hud', { text: 'Nothing to undo' });
       return;
     }
-    this._applyOp(op, true);
+    const area = this._applyOp(op, true);
     this.redoStack.push(op);
     this._emit('hud', { text: 'Undo', icon: 'undo' });
-    this._afterHistory();
+    this._afterHistory(area);
   }
 
   redo(viaGesture = false) {
@@ -443,15 +582,16 @@ export class Board extends EventTarget {
       if (viaGesture) this._emit('hud', { text: 'Nothing to redo' });
       return;
     }
-    this._applyOp(op, false);
+    const area = this._applyOp(op, false);
     this.undoStack.push(op);
     this._emit('hud', { text: 'Redo', icon: 'redo' });
-    this._afterHistory();
+    this._afterHistory(area);
   }
 
-  _afterHistory() {
+  _afterHistory(area) {
     this.clearSelection();
-    this._invalidate('ink');
+    if (area) this._invalidateRegion(area);
+    else this._invalidate('ink');
     this._emit('history');
     this._changed();
   }
@@ -463,28 +603,35 @@ export class Board extends EventTarget {
     this._emit('history');
   }
 
+  // Returns the world rect it touched (so only that part of the ink is redrawn).
   _applyOp(op, inverse) {
+    let area = null;
+    const touch = (s) => { area = unionRect(area, s._bbox); this.changed.add(s.id); };
     switch (op.type) {
       case 'add':
-        if (inverse) this._removeIds(new Set(op.items.map((it) => it.s.id)));
-        else for (const it of op.items) this.strokes.splice(Math.min(it.index, this.strokes.length), 0, it.s);
+        if (inverse) {
+          for (const it of this._removeIds(new Set(op.items.map((x) => x.s.id)))) area = unionRect(area, it.s._bbox);
+        } else {
+          for (const it of op.items) {
+            this.strokes.splice(Math.min(it.index, this.strokes.length), 0, it.s);
+            touch(it.s);
+          }
+        }
         break;
       case 'remove':
         if (inverse) {
           for (let i = op.items.length - 1; i >= 0; i--) {
             const it = op.items[i];
             this.strokes.splice(Math.min(it.index, this.strokes.length), 0, it.s);
+            touch(it.s);
           }
         } else {
-          for (const it of op.items) {
-            const idx = this.strokes.findIndex((s) => s.id === it.s.id);
-            if (idx >= 0) this.strokes.splice(idx, 1);
-          }
+          for (const it of this._removeIds(new Set(op.items.map((x) => x.s.id)))) area = unionRect(area, it.s._bbox);
         }
         break;
       case 'move': {
         const k = inverse ? -1 : 1;
-        this._translate(op.ids, op.dx * k, op.dy * k, false);
+        area = this._translate(op.ids, op.dx * k, op.dy * k, false);
         const mts = new Map(op.prevMt || []);
         for (const s of this.strokes) {
           if (mts.has(s.id)) s.mt = inverse ? mts.get(s.id) : op.newMt;
@@ -493,38 +640,52 @@ export class Board extends EventTarget {
       }
       case 'recolor': {
         const map = new Map(op.items.map((it) => [it.id, inverse ? it.from : it.to]));
-        for (const s of this.strokes) if (map.has(s.id)) s.color = map.get(s.id);
+        for (const s of this.strokes) {
+          if (map.has(s.id)) {
+            s.color = map.get(s.id);
+            touch(s);
+          }
+        }
         break;
       }
       default:
         break;
     }
+    return area;
   }
 
   _removeIds(ids) {
-    // remove in descending index order; returns items usable for a 'remove' op
+    // one pass, keeping the order; returns items (old index ascending) usable for a 'remove' op
     const items = [];
-    for (let i = this.strokes.length - 1; i >= 0; i--) {
-      if (ids.has(this.strokes[i].id)) {
-        items.push({ s: this.strokes[i], index: i });
-        this.strokes.splice(i, 1);
-      }
-    }
-    return items;
+    const kept = [];
+    this.strokes.forEach((s, i) => {
+      if (ids.has(s.id)) {
+        items.push({ s, index: i });
+        this.changed.add(s.id);
+      } else kept.push(s);
+    });
+    if (items.length) this.strokes = kept;
+    return items.reverse(); // descending, as before (undo re-inserts in reverse)
   }
 
+  // Returns the world rect covering the strokes before and after the move.
   _translate(ids, dx, dy, markModified = true) {
     const set = ids instanceof Set ? ids : new Set(ids);
     const now = Date.now();
+    let area = null;
     for (const s of this.strokes) {
       if (!set.has(s.id)) continue;
+      area = unionRect(area, s._bbox);
       for (const p of s.pts) {
         p[0] = round2(p[0] + dx);
         p[1] = round2(p[1] + dy);
       }
       if (markModified) s.mt = now;
       prepareStroke(s);
+      area = unionRect(area, s._bbox);
+      this.changed.add(s.id);
     }
+    return area;
   }
 
   clearBoard() {
@@ -562,10 +723,11 @@ export class Board extends EventTarget {
 
   deleteSelection() {
     if (!this.selection) return;
+    const area = this.selection.bbox;
     const items = this._removeIds(this.selection.ids);
     if (items.length) this._pushHistory({ type: 'remove', items });
     this.clearSelection();
-    this._invalidate('ink');
+    this._invalidateRegion(area);
     this._changed();
   }
 
@@ -580,12 +742,13 @@ export class Board extends EventTarget {
       const c = { ...s, id: uid('s'), t0: now, t1: now, mt: 0, pts: s.pts.map((p) => [round2(p[0] + off), round2(p[1] + off), p[2]]) };
       prepareStroke(c);
       this.strokes.push(c);
+      this.changed.add(c.id);
       items.push({ s: c, index: this.strokes.length - 1 });
       ids.add(c.id);
     }
     if (items.length) this._pushHistory({ type: 'add', items });
     this._setSelection(ids);
-    this._invalidate('ink');
+    if (this.selection) this._invalidateRegion(this.selection.bbox);
     this._changed();
   }
 
@@ -669,6 +832,14 @@ export class Board extends EventTarget {
     if (!this.raf) this.raf = requestAnimationFrame(this._frame);
   }
 
+  // Redraw just this world rect of the ink bitmap on the next frame (erasing, undo, a remote
+  // change, the ends of a lasso move): the rest of the bitmap is untouched.
+  _invalidateRegion(rect) {
+    if (!rect) return;
+    this._dirtyRegion = unionRect(this._dirtyRegion, rect);
+    if (!this.raf) this.raf = requestAnimationFrame(this._frame);
+  }
+
   _frame() {
     this.raf = 0;
     if (this.dirty.view) {
@@ -682,6 +853,11 @@ export class Board extends EventTarget {
     } else if (this.dirty.cam) {
       this.dirty.cam = false;
       this._placeInk();
+    }
+    if (this._dirtyRegion) {
+      const r = this._dirtyRegion;
+      this._dirtyRegion = null;
+      this._renderInkRegion(r);
     }
     if (this.dirty.live) {
       this.dirty.live = false;
@@ -738,6 +914,39 @@ export class Board extends EventTarget {
       paintStroke(ctx, s, this.theme);
     }
     this.inkCanvas.style.transform = '';
+    this._dirtyRegion = null; // everything was just drawn
+  }
+
+  // Redraw one world rect of the bitmap: clip to it (whole device pixels, a little padding),
+  // clear it, and paint only the strokes that reach into it, in stacking order.
+  _renderInkRegion(r) {
+    if (!this.inkCam) {
+      this._renderInk();
+      return;
+    }
+    const { x, y, z } = this.inkCam;
+    const d = this.dpr, M = this.inkM;
+    const c = this.inkCanvas;
+    const pad = 3 / z;
+    const px0 = Math.max(0, Math.floor(((r[0] - pad) * z + x + M) * d));
+    const py0 = Math.max(0, Math.floor(((r[1] - pad) * z + y + M) * d));
+    const px1 = Math.min(c.width, Math.ceil(((r[2] + pad) * z + x + M) * d));
+    const py1 = Math.min(c.height, Math.ceil(((r[3] + pad) * z + y + M) * d));
+    if (px1 <= px0 || py1 <= py0) return; // off the drawn area: the next full draw covers it
+    const ctx = this.inkCtx;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.beginPath();
+    ctx.rect(px0, py0, px1 - px0, py1 - py0);
+    ctx.clip();
+    ctx.clearRect(px0, py0, px1 - px0, py1 - py0);
+    this._inkTransform(ctx);
+    const area = [(px0 / d - M - x) / z, (py0 / d - M - y) / z, (px1 / d - M - x) / z, (py1 / d - M - y) / z];
+    for (const s of this.strokes) {
+      if (s._hidden || !rectsIntersect(s._bbox, area)) continue;
+      paintStroke(ctx, s, this.theme);
+    }
+    ctx.restore();
   }
 
   // Where the drawn ink bitmap sits for the current camera: a scale k and offset (tx, ty) for
@@ -818,8 +1027,16 @@ export class Board extends EventTarget {
       ctx.setLineDash([]);
       this._invalidate('live'); // marching ants
     } else if (a.kind === 'move') {
-      this._worldTransform(ctx, a.dx, a.dy);
-      for (const s of this.strokes) if (s._hidden) paintStroke(ctx, s, this.theme);
+      const pic = a.picture;
+      if (pic && pic.z === this.cam.z) {
+        const d = this.dpr;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(pic.canvas, Math.round((((pic.b[0] + a.dx) * this.cam.z + this.cam.x) - pic.pad) * d),
+          Math.round((((pic.b[1] + a.dy) * this.cam.z + this.cam.y) - pic.pad) * d));
+      } else {
+        this._worldTransform(ctx, a.dx, a.dy);
+        for (const s of this.strokes) if (s._hidden) paintStroke(ctx, s, this.theme);
+      }
     }
   }
 
@@ -1021,17 +1238,19 @@ export class Board extends EventTarget {
       this.cardHooks.end(!!discard);
     } else if (a.kind === 'move') {
       const ids = this.selection ? this.selection.ids : new Set();
+      let area = this.selection ? this.selection.bbox : null; // where they were lifted from
       for (const s of this.strokes) s._hidden = false;
       if (!discard && (Math.abs(a.dx) > 0.01 || Math.abs(a.dy) > 0.01) && ids.size) {
         const prevMt = this.strokes.filter((s) => ids.has(s.id)).map((s) => [s.id, s.mt || 0]);
-        this._translate(ids, a.dx, a.dy, true);
+        area = unionRect(area, this._translate(ids, a.dx, a.dy, true));
         const moved = this.strokes.find((s) => ids.has(s.id));
         this._pushHistory({ type: 'move', ids: [...ids], dx: a.dx, dy: a.dy, prevMt, newMt: moved ? moved.mt : Date.now() });
         this.selection.bbox = this._bboxOf(ids);
         this._changed();
       }
       this._updateSelectionEl();
-      this._invalidate('ink');
+      if (area) this._invalidateRegion(area);
+      else this._invalidate('ink');
     }
     // clear the live layer in the same task as the ink commit -> no double-draw flash
     const ctx = this.liveCtx;
@@ -1082,6 +1301,7 @@ export class Board extends EventTarget {
   _commitStroke(s) {
     prepareStroke(s);
     this.strokes.push(s);
+    this.changed.add(s.id);
     this._pushHistory({ type: 'add', items: [{ s, index: this.strokes.length - 1 }] });
     if (!this.dirty.ink && this.inkCam) {
       // incremental paint on top of the cached bitmap (in the bitmap's own camera)
@@ -1102,20 +1322,24 @@ export class Board extends EventTarget {
     const r = ERASER_SIZES[this.widthIdx.eraser] / this.cam.z;
     const dist = Math.hypot(to.x - from.x, to.y - from.y);
     const steps = Math.max(1, Math.ceil(dist / (r * 0.5)));
-    let hit = false;
+    // only strokes whose box reaches the eraser's path can be hit
+    const path = [Math.min(from.x, to.x) - r, Math.min(from.y, to.y) - r, Math.max(from.x, to.x) + r, Math.max(from.y, to.y) + r];
+    let area = null;
     for (let i = this.strokes.length - 1; i >= 0; i--) {
       const s = this.strokes[i];
+      if (!rectsIntersect(s._bbox, path)) continue;
       for (let k = 0; k <= steps; k++) {
         const t = k / steps;
         if (strokeHit(s, from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t, r)) {
           a.removed.push({ s, index: i });
           this.strokes.splice(i, 1);
-          hit = true;
+          this.changed.add(s.id);
+          area = unionRect(area, s._bbox);
           break;
         }
       }
     }
-    if (hit) this._invalidate('ink');
+    if (area) this._invalidateRegion(area); // just where the erased strokes were
   }
 
   // ---- lasso
@@ -1158,10 +1382,29 @@ export class Board extends EventTarget {
 
   // ---- move selection
   _beginMove(e, p, type) {
-    this.action = { kind: 'move', id: e.pointerId, type, start: p, dx: 0, dy: 0 };
+    this.action = { kind: 'move', id: e.pointerId, type, start: p, dx: 0, dy: 0, picture: this._pictureOfSelection() };
     for (const s of this.strokes) s._hidden = this.selection.ids.has(s.id);
-    this._invalidate('ink', 'live');
+    this._invalidateRegion(this.selection.bbox); // lift them off the ink
+    this._invalidate('live');
     this._updateSelectionEl();
+  }
+
+  // The selected strokes drawn once into their own canvas, which then slides with the finger
+  // (rather than re-drawing every stroke on every frame). Null if it would be huge.
+  _pictureOfSelection() {
+    const b = this.selection && this.selection.bbox;
+    if (!b) return null;
+    const z = this.cam.z, d = this.dpr, pad = 4;
+    const w = Math.ceil(((b[2] - b[0]) * z + pad * 2) * d);
+    const h = Math.ceil(((b[3] - b[1]) * z + pad * 2) * d);
+    if (w <= 0 || h <= 0 || w * h > 8e6) return null;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.setTransform(z * d, 0, 0, z * d, (pad - b[0] * z) * d, (pad - b[1] * z) * d);
+    for (const s of this.strokes) if (this.selection.ids.has(s.id)) paintStroke(ctx, s, this.theme);
+    return { canvas: c, b, z, pad };
   }
 
   // ---- touch: pan / pinch / taps / long-press / optional finger drawing

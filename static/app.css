@@ -1664,6 +1664,10 @@ html.is-fs #chatScroll { touch-action: none; }
 }
 .stage-close .ico { width: 18px; height: 18px; }
 
+/* top of a long chat: older messages load as you scroll up to here */
+.chat-more { padding: 10px 0 6px; text-align: center; font-size: var(--t-meta); color: var(--fg-3); }
+.chat-more.loading::after { content: " · loading…"; }
+
 /* progress notes: what the agent is doing, folded into "N steps" once it replies */
 .activity { margin: 2px 0 10px 38px; font-size: var(--t-sm); color: var(--fg-3); }
 .activity-head {

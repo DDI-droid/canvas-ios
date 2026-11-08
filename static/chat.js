@@ -42,6 +42,16 @@ export class ChatPanel extends EventTarget {
     this.unread = 0;
     this.lastDay = '';
     this.status = 'idle';
+    // older messages load when you scroll to the top (the page starts with only the latest ones)
+    this.more = false;
+    this.loadingEarlier = false;
+    this.moreEl = document.createElement('div');
+    this.moreEl.className = 'chat-more';
+    this.moreEl.textContent = 'Earlier messages';
+    this._moreSeen = new IntersectionObserver((entries) => {
+      if (entries.some((x) => x.isIntersecting)) this._loadEarlier();
+    }, { root: this.scroller, rootMargin: '400px 0px 0px 0px' });
+    this._moreSeen.observe(this.moreEl);
     this.geo = Object.assign(
       { docked: true, width: window.innerWidth < 900 ? 336 : 384, left: null, top: null, height: null, collapsed: false, ghost: false, opacity: 1 },
       store.get('chat.geo', {}),
@@ -319,17 +329,86 @@ export class ChatPanel extends EventTarget {
 
   // ------------------------------------------------------------------ messages
 
-  setConversation(list) {
+  // The server's latest chat entries. Already showing some of them (a reconnect): keep every
+  // bubble as it is and add only the new ones; nothing is re-rendered, the scroll stays put.
+  // Otherwise (first load, another session, or entries arriving out of order): rebuild.
+  setConversation(list, { more = false } = {}) {
+    list = Array.isArray(list) ? list : [];
+    const known = list.filter((m) => m.id && this.byId.has(m.id));
+    if (!known.length || !this.byId.size) return this._rebuild(list, more);
+    const newest = Math.max(...[...this.byId.values()].map((r) => r.msg.ts || 0));
+    const fresh = list.filter((m) => !(m.id && this.byId.has(m.id)));
+    if (fresh.some((m) => !(m.cid && this.byCid.has(m.cid)) && (m.ts || 0) < newest)) return this._rebuild(list, more);
+    const near = this._nearBottom();
+    for (const m of fresh) this.add(m, { animate: false });
+    this._updateEmpty();
+    if (near && fresh.length) requestAnimationFrame(() => this._scrollToBottom(false));
+  }
+
+  _rebuild(list, more) {
     const local = [...this.byCid.values()].filter((r) => r.msg.local && !r.msg.id);
     this.list.replaceChildren();
     this.byId.clear();
     this.byCid.clear();
     this.lastDay = '';
     this.activity = null;
-    for (const m of Array.isArray(list) ? list : []) this._append(m, false);
+    this.more = !!more;
+    if (this.more) this.list.appendChild(this.moreEl);
+    for (const m of list) this._append(m, false);
     for (const r of local) this._append(r.msg, false);
     this._updateEmpty();
     requestAnimationFrame(() => this._scrollToBottom(false));
+  }
+
+  // Scrolled up to the top: ask the app for the page before the oldest entry shown.
+  _loadEarlier() {
+    if (!this.more || this.loadingEarlier) return;
+    const first = [...this.byId.values()].reduce((a, r) => (!a || (r.msg.ts || 0) < (a.msg.ts || 0) ? r : a), null);
+    if (!first || !first.msg.id) return;
+    this.loadingEarlier = true;
+    this.moreEl.classList.add('loading');
+    this.dispatchEvent(new CustomEvent('loadEarlier', { detail: { before: first.msg.id } }));
+  }
+
+  // Older entries go on top; what you were reading stays exactly where it was on screen.
+  prependOlder(list, more) {
+    this.loadingEarlier = false;
+    this.moreEl.classList.remove('loading');
+    this.more = !!more;
+    list = (Array.isArray(list) ? list : []).filter((m) => !(m.id && this.byId.has(m.id)));
+    if (!list.length) {
+      if (!this.more) this.moreEl.remove();
+      return;
+    }
+    // render the older page into its own container with the usual separators and step groups
+    const saved = { list: this.list, lastDay: this.lastDay, activity: this.activity };
+    const box = document.createElement('div');
+    this.list = box;
+    this.lastDay = '';
+    this.activity = null;
+    for (const m of list) this._append(m, false);
+    this._closeActivity();
+    const lastDayOfOlder = this.lastDay;
+    Object.assign(this, saved);
+    const s = this.scroller;
+    const h0 = s.scrollHeight, top0 = s.scrollTop; // measured before anything above changes
+    // the day heading where the two pages meet would repeat: keep the older one
+    const firstOld = [...this.list.children].find((n) => n !== this.moreEl);
+    if (firstOld && firstOld.classList.contains('day-sep') && firstOld.textContent === lastDayOfOlder) firstOld.remove();
+    if (this.more) {
+      this.list.insertBefore(box, this.moreEl.nextSibling); // the marker stays on top: more to come
+    } else {
+      this.moreEl.remove(); // that was the beginning of the chat
+      this.list.insertBefore(box, this.list.firstChild);
+    }
+    box.replaceWith(...box.childNodes);
+    s.scrollTop = top0 + (s.scrollHeight - h0);
+  }
+
+  // Loading the older page failed: let the next scroll to the top try again.
+  earlierFailed() {
+    this.loadingEarlier = false;
+    this.moreEl.classList.remove('loading');
   }
 
   add(msg, { animate = true } = {}) {

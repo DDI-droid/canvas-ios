@@ -15,6 +15,16 @@ const CARD_STYLE =
   '.cap{position:absolute;left:0;top:100%;margin-top:8px;font:500 12px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;' +
   'letter-spacing:-.005em;color:#8a6a5c;white-space:nowrap}';
 
+// Board cards show a light copy of a photo (server.py makes <hash>.preview.jpg, at most 1280 px
+// on its long side): a 12 MP photo would hold ~48 MB of memory per card. Zoom in far enough and
+// the card switches to the full image; the full-screen viewer always shows the full image. GIFs
+// (they may move), AVIF and HEIC keep their original.
+const PREVIEW_SIDE = 1280;
+const previewOf = (src) => {
+  const m = /^(\/api\/media\/[a-f0-9]{16,64})\.(png|jpe?g|webp)$/i.exec(src || '');
+  return m ? `${m[1]}.preview.jpg` : null;
+};
+
 const purifier = DOMPurify(window);
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const URL_RE = /url\s*\(\s*(['"]?)(.*?)\1\s*\)/gi;
@@ -238,7 +248,8 @@ export class ClaudeLayer extends EventTarget {
     img.alt = item.label || 'Image';
     img.decoding = 'async';
     img.draggable = false;
-    img.src = withKey(item.src);
+    const preview = previewOf(item.src);
+    img.src = withKey(preview || item.src);
     card.append(img);
     root.append(style, card);
     if (item.label) {
@@ -261,8 +272,15 @@ export class ClaudeLayer extends EventTarget {
       void host.offsetWidth;
       host.classList.add('enter');
     }
-    rec = { item, host, img, kind: 'image', w, h };
+    rec = { item, host, img, kind: 'image', w, h, full: !preview };
     this.records.set(item.id, rec);
+    if (preview) {
+      img.addEventListener('error', () => { // no preview (old server, odd file): the original
+        if (rec.full) return;
+        rec.full = true;
+        img.src = withKey(item.src);
+      }, { once: true });
+    }
     // no known size yet: take the image's own shape once it loads
     if (!(item.height > 0) && !(item.aspect > 0)) {
       img.addEventListener('load', () => {
@@ -320,6 +338,22 @@ export class ClaudeLayer extends EventTarget {
       }
     }
     return best;
+  }
+
+  // The camera settled: a photo card shown bigger than its preview can draw sharply switches
+  // to the full image (decoded first, so it never flashes). It stays full from then on.
+  sharpen(cam, view, dpr = 1) {
+    for (const rec of this.records.values()) {
+      if (rec.kind !== 'image' || rec.full || !rectsIntersect(this.rectOf(rec), view)) continue;
+      if (Math.max(rec.w, rec.h) * cam.z * dpr <= PREVIEW_SIDE * 1.15) continue;
+      rec.full = true;
+      const next = new Image();
+      next.decoding = 'async';
+      next.src = withKey(rec.item.src);
+      next.decode().then(() => {
+        if (this.records.get(rec.item.id) === rec) rec.img.src = next.src;
+      }).catch(() => {});
+    }
   }
 
   flash(id) {

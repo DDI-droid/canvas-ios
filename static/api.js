@@ -49,11 +49,14 @@ export function withKey(url) {
   return url + sep + 'k=' + encodeURIComponent(KEY) + s;
 }
 
-async function request(method, path, body, { timeout = 30000 } = {}) {
+async function request(method, path, body, { timeout = 30000, type } = {}) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeout);
   const opts = { method, headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': SESSION }, cache: 'no-store', signal: ctl.signal };
-  if (body !== undefined) {
+  if (body instanceof Blob) { // a file as it is (images): no base64, no JSON
+    opts.headers['Content-Type'] = type || body.type || 'application/octet-stream';
+    opts.body = body;
+  } else if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = typeof body === 'string' ? body : JSON.stringify(body);
   }
@@ -153,6 +156,7 @@ export class EventStream extends EventTarget {
         if (body.registry) rememberRegistry(body.registry);
         if (body.sessions) this._emit('sessions', body.sessions);
         if (body.build) this._emit('build', body.build);
+        if (body.app) this._emit('app', body.app);
         if (body.reset) {
           this.epoch = body.epoch;
           this.since = body.next;

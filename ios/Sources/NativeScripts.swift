@@ -9,7 +9,11 @@
 ///    page can use every installed voice, including Premium ones (Safari hides those).
 enum NativeScripts {
     static func bootstrap(voicesJSON: String) -> String {
+        // the app's real version (project.yml MARKETING_VERSION): the page compares it with the
+        // newest build on the PC and says once when an update is ready in SideStore
+        let version = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0"
         return script.replacingOccurrences(of: "__CANVAS_VOICES__", with: voicesJSON)
+            .replacingOccurrences(of: "__CANVAS_APP_VERSION__", with: version)
     }
 
     private static let script = #"""
@@ -20,7 +24,7 @@ enum NativeScripts {
 
   window.__canvasNative = {
     platform: 'ios',
-    version: '1.4',
+    version: '__CANVAS_APP_VERSION__',
     post: function (cmd, extra) {
       var msg = { cmd: cmd };
       if (extra) for (var k in extra) msg[k] = extra[k];

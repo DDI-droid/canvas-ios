@@ -2,9 +2,8 @@
 """Inspect or erase the user's ink on the canvas (Claude-side helper).
 
 The user's strokes live in /api/state as world-coordinate polylines
-({id, tool, color, size, t0, t1, pts:[x, y, pressure, ...]}). Erasing saves the
-filtered list back with PUT /api/strokes; the page reloads remote strokes on
-the resulting "strokes" event.
+({id, tool, color, size, t0, t1, pts:[x, y, pressure, ...]}). Erasing sends
+{op: "del", id} changes to POST /api/ink; every page removes just those strokes.
 
 Usage:
   python canvas/ink.py --list [--last 30]
@@ -105,10 +104,10 @@ def main() -> None:
     if args.dry_run:
         print(f"(dry run) would erase {len(doomed)} of {len(strokes)} strokes")
         return
-    keep_ids = {id(s) for s in strokes} - {id(s) for s in doomed}
-    kept = [s for s in strokes if id(s) in keep_ids]
-    call("PUT", "/api/strokes", {"strokes": kept, "client": "claude"})
-    print(f"erased {len(doomed)} stroke(s); {len(kept)} remain")
+    # as changes: pages remove just these strokes in place (their undo history stays)
+    ops = [{"op": "del", "id": s["id"]} for s in doomed if isinstance(s.get("id"), str)]
+    call("POST", "/api/ink", {"ops": ops, "client": "claude"})
+    print(f"erased {len(ops)} stroke(s); {len(strokes) - len(ops)} remain")
 
 
 if __name__ == "__main__":

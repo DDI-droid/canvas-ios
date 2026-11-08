@@ -18,7 +18,7 @@ export function uid(prefix = '') {
 // (window.__canvasNativeStore), and a key missing here is read from that copy. In Safari, the
 // page carries its values to the new address itself (#carry=, below).
 const NS = 'canvas.';
-const LAZY = /^pendingStrokes/; // big and short-lived: given to the app only when it matters
+const LAZY = /^(pending(Strokes|Ink)|outbox)/; // short-lived, written often: given to the app only when it matters
 const toApp = (key, raw) => {
   try { window.__canvasNative && window.__canvasNative.post('store', { key, value: raw }); } catch { /* ignore */ }
 };

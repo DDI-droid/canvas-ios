@@ -1,7 +1,7 @@
 // Builds the PNG snapshot sent to Claude plus the per-message timeline.
 import { paintStroke } from './board.js';
 import { colorName, PAPER } from './palette.js';
-import { clamp, unionRect } from './util.js';
+import { clamp, rectsIntersect, unionRect } from './util.js';
 
 const MAX_SIDE = 2000;
 const OLD_INK_ALPHA = 0.35;
@@ -10,6 +10,21 @@ const GROUP_GAP_MS = 1500;
 
 function isNew(s, since) {
   return Math.max(s.t0 || 0, s.mt || 0) > since;
+}
+
+// PNG-encode without freezing the page: toBlob encodes off the main thread (toDataURL doesn't),
+// then the bytes become a data URL. Falls back to toDataURL where toBlob isn't available.
+async function encodePng(canvas) {
+  const blob = await new Promise((res) => {
+    try { canvas.toBlob(res, 'image/png'); } catch { res(null); }
+  });
+  if (!blob) return canvas.toDataURL('image/png');
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(r.error);
+    r.readAsDataURL(blob);
+  });
 }
 
 export async function buildSnapshot({ board, layer, mode, since }) {
@@ -46,9 +61,13 @@ export async function buildSnapshot({ board, layer, mode, since }) {
     if (withClaude) {
       try { items = await layer.drawInto(ctx, rect, scale, CLAUDE_ALPHA); } catch { items = 0; }
     }
-    for (const s of board.strokes) paintStroke(ctx, s, 'light', isNew(s, since) ? 1 : OLD_INK_ALPHA);
+    // only the strokes inside the picture (a big board has thousands elsewhere)
+    for (const s of board.strokes) {
+      if (s._bbox && !rectsIntersect(s._bbox, rect)) continue;
+      paintStroke(ctx, s, 'light', isNew(s, since) ? 1 : OLD_INK_ALPHA);
+    }
     try {
-      return { url: canvas.toDataURL('image/png'), items };
+      return { url: await encodePng(canvas), items };
     } finally {
       canvas.width = canvas.height = 0; // release memory promptly (iOS canvas budget)
     }

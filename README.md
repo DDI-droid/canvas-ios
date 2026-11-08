@@ -267,6 +267,14 @@ DOMPurify 3.4.17 (Apache-2.0 / MPL-2.0, used under Apache-2.0), KaTeX 0.19.1 (MI
         "command": "python \"C:/Users/AnshulThakur/Documents/training/canvas/hooks/mirror_reply.py\"" }] }]
     }
     ```
+- **Ink as changes:**
+  - `POST /api/ink {client, ops}`, where ops are `{op: "put", s: stroke, after: id|null}` or `{op: "del", id}`. Returns `{rev}`, and every page gets an `ink` event `{rev, client, ops}`.
+  - `GET /api/ink?since=REV&id=BOARD` returns `{id, rev, batches}`, or `{id, rev, strokes}` when the page is too far behind or holds a copy of another board. Pages keep a copy of the board on the device (IndexedDB), so opening is instant.
+- **Automatic updates:** each poll carries `build`. Pages reload by themselves once idle and keep their undo history and draft. Polls also carry `app.version`, so the iPad app says when a new build is ready in SideStore.
+  - Changes go to `strokes.ops.jsonl` at once, and `strokes.json` (`{rev, strokes}`) is rewritten every 5 s.
+- **Light state:** `GET /api/state?conv=N&strokes=0` returns the latest N chat entries (`conversation_more`), no ink, plus `ink_rev`. Older entries come from `GET /api/conversation?before=ID&limit=N`.
+- **Media:** `POST /api/media` also takes the image itself (`Content-Type: image/…`). `GET /api/media/<hash>.preview.jpg` is a 1280 px copy, made on first request (Pillow).
+- **Messages:** `POST /api/message` with a `cid` the server already has returns the existing id (`duplicate: true`) and delivers nothing new.
 - **Cards:** `POST /api/draw/move {id, x, y, width?, height?}` moves or resizes a Claude-layer item and broadcasts `draw_move` (pages reposition it without re-rendering). `GET /api/state` also returns `events: {epoch, seq}`, the cursor the page resumes its event stream from.
 - **Erasing the user's ink:** `python canvas/ink.py --list | --erase-ids ID… | --erase-box X0 Y0 X1 Y1 | --erase-px X0 Y0 X1 Y1 --timeline <timeline.txt>`, with `[--mode inside|center] [--dry-run]`. It saves the filtered stroke list with `PUT /api/strokes` (client `"claude"`), and the page reloads it.
 - **Full screen:** the top-bar button uses the Fullscreen API on iPadOS Safari.

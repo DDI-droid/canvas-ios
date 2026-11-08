@@ -6,6 +6,7 @@ import { Voice, voiceSupported } from './voice.js';
 import { Live, rankVoices } from './live.js';
 import { Viewer } from './viewer.js';
 import { Cards } from './cards.js';
+import { InkSync } from './inksync.js';
 import { buildSnapshot, buildTimeline, makeThumb } from './snapshot.js';
 import { api, EventStream, KEY, SESSION, sessionKey, switchSession, withKey } from './api.js';
 import { COLORS, inkColor } from './palette.js';
@@ -43,6 +44,7 @@ const cards = new Cards({
   layer,
   el: $('#cardSel'),
   onCommit: (id, g) => {
+    layer.sharpen(board.cam, board.viewRect(), board.dpr); // resized bigger: maybe the full image now
     api.post('/api/draw/move', { id, ...g }).catch((err) => {
       if (err.status !== 404) toast('Couldn’t save the new place. It may jump back after a reload.', { tone: 'error' });
     });
@@ -68,7 +70,19 @@ const events = new EventStream('/api/events');
 
 let lastSendAt = store.get(sessionKey('lastSendAt'), 0);
 let sending = false;
-const outbox = new Map();
+// Messages not yet delivered are kept in storage until the server has them, so a reload (or
+// the app moving to a new address) doesn't lose what you sent while the link was down. The
+// server ignores a message it already has (same cid), so re-sending is always safe.
+const outbox = new Map(Object.entries(store.get(sessionKey('outbox'), {}) || {}));
+function saveOutbox() {
+  const key = sessionKey('outbox');
+  if (!outbox.size) return store.remove(key);
+  if (!store.set(key, Object.fromEntries(outbox))) {
+    // too big for this page's storage: keep the words and the timeline, drop the pictures
+    store.set(key, Object.fromEntries([...outbox].map(([k, v]) => [k, { ...v, image: null }])));
+  }
+  store.keep(key);
+}
 
 // ------------------------------------------------------------------ theme
 
@@ -231,9 +245,12 @@ board.addEventListener('camera', (e) => {
   }
   saveCam();
 });
+// zoomed in on a photo card: show its full image rather than the light preview
+const sharpenCards = () => layer.sharpen(board.cam, board.viewRect(), board.dpr);
+board.addEventListener('settle', sharpenCards);
 board.addEventListener('change', (e) => {
   if (e.detail.local) {
-    scheduleSave();
+    ink.local(); // send just what changed
     hideHint();
   }
   updateInkChip();
@@ -265,6 +282,30 @@ board.onDoubleTap = ({ wx, wy }) => {
   return id ? openMedia(id) : false;
 };
 
+// A photo as it should be uploaded: as it is when it's reasonable (screenshots keep every
+// pixel), else scaled to MAX_SIDE on its long side as a high-quality JPEG. That's still plenty
+// for zooming into detail in full screen, and a fraction of a 48 MP photo's upload and memory.
+const MAX_SIDE = 4096;
+async function prepareImage(file) {
+  let bmp = null;
+  try { bmp = await createImageBitmap(file); } catch { /* can't decode here: send it as it is */ }
+  if (!bmp) return { blob: file, aspect: 0.66 };
+  const w = bmp.width, h = bmp.height, aspect = h / w, long = Math.max(w, h);
+  if (long <= MAX_SIDE && file.size <= 12e6 && /^image\/(png|jpeg|gif|webp)$/.test(file.type)) {
+    bmp.close();
+    return { blob: file, aspect };
+  }
+  const k = Math.min(1, MAX_SIDE / long);
+  const c = document.createElement('canvas');
+  c.width = Math.round(w * k);
+  c.height = Math.round(h * k);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  bmp.close();
+  const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.9));
+  c.width = c.height = 0; // free it now (iOS keeps a tight canvas budget)
+  return { blob: blob || file, aspect };
+}
+
 // + : add images from Photos / Files. Each is uploaded to the canvas server and placed in view.
 $('#btnAdd').addEventListener('click', () => $('#fileInput').click());
 $('#fileInput').addEventListener('change', async (e) => {
@@ -273,19 +314,10 @@ $('#fileInput').addEventListener('change', async (e) => {
   let i = 0;
   for (const file of files) {
     if (!file.type.startsWith('image/')) { toast('Only images for now.', { tone: 'error' }); continue; }
-    if (file.size > 18 * 1024 * 1024) { toast(`${file.name} is too big (max 18 MB).`, { tone: 'error' }); continue; }
+    if (file.size > 60 * 1024 * 1024) { toast(`${file.name} is too big (max 60 MB).`, { tone: 'error' }); continue; }
     try {
-      const data = await new Promise((res, rej) => {
-        const r = new FileReader();
-        r.onload = () => res(r.result);
-        r.onerror = () => rej(r.error);
-        r.readAsDataURL(file);
-      });
-      const probe = new Image();
-      probe.src = data;
-      await probe.decode().catch(() => {});
-      const aspect = probe.naturalWidth ? probe.naturalHeight / probe.naturalWidth : 0.66;
-      const up = await api.post('/api/media', { data }, { timeout: 120000 });
+      const { blob, aspect } = await prepareImage(file);
+      const up = await api.post('/api/media', blob, { timeout: 120000 });
       const v = board.viewRect();
       const vw = v[2] - v[0], vh = v[3] - v[1];
       let width = vw * 0.42;
@@ -325,35 +357,25 @@ function updateInkChip() {
 
 // ------------------------------------------------------------------ persistence of ink
 
-let saveInFlight = false;
-let saveAgain = false;
-let saveFailures = 0;
-const scheduleSave = debounce(saveStrokes, 700);
+// Ink goes to the server as changes (inksync.js): a stroke is a few KB, not the whole board.
+const ink = new InkSync({ board, clientId: CLIENT_ID });
+ink.addEventListener('trouble', () => toast('Can’t reach the server — your ink is kept on this device and will sync.', { tone: 'error' }));
+ink.addEventListener('recovered', () => toast('Ink saved.'));
+if (new URLSearchParams(location.search).has('debug')) window.__canvas.ink = ink;
 
-async function saveStrokes() {
-  if (saveInFlight) {
-    saveAgain = true;
-    return;
-  }
-  saveInFlight = true;
-  const body = JSON.stringify({ strokes: board.serialize(), client: CLIENT_ID });
-  store.set(sessionKey('pendingStrokes'), body.length < 4.5e6 ? body : null);
+// A page from before this version may have left a whole-board backup that never reached the
+// server: send it once the old way (it replaces the board, as it would have), then forget it.
+async function sendLegacyBackup() {
+  const key = sessionKey('pendingStrokes');
+  const raw = store.get(key, null);
+  if (!raw) return false;
   try {
-    await api.put('/api/strokes', body, { timeout: 45000 });
-    store.remove('pendingStrokes');
-    if (saveFailures >= 2) toast('Ink saved.');
-    saveFailures = 0;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(parsed.strokes)) await api.put('/api/strokes', { strokes: parsed.strokes, client: CLIENT_ID }, { timeout: 45000 });
+    store.remove(key);
+    return true;
   } catch {
-    saveFailures++;
-    store.keep(sessionKey('pendingStrokes')); // in the app, unsent ink survives a change of address
-    if (saveFailures === 2) toast('Can’t reach the server — your ink is kept on this device and will sync.', { tone: 'error' });
-    setTimeout(() => scheduleSave(), Math.min(30000, 1500 * 2 ** saveFailures));
-  } finally {
-    saveInFlight = false;
-    if (saveAgain) {
-      saveAgain = false;
-      scheduleSave();
-    }
+    return false;
   }
 }
 
@@ -531,7 +553,9 @@ async function send(opts = {}) {
   updateInkChip();
   updateCaption();
   chat.setStatus('sending');
-  outbox.set(cid, { text, image: snap.dataUrl, timeline, board_image_mode: snap.mode, cid, client_ts: clientTs });
+  outbox.set(cid, { text, image: snap.dataUrl, timeline, board_image_mode: snap.mode, cid, client_ts: clientTs,
+    width: snap.width, height: snap.height });
+  saveOutbox();
   await deliver(cid);
   sending = false;
   const sb = $('#btnSend');
@@ -549,6 +573,7 @@ async function deliver(cid) {
   try {
     const res = await api.post('/api/message', payload, { timeout: 90000 });
     outbox.delete(cid);
+    saveOutbox();
     chat.update(cid, { id: res.id, state: 'sent', local: false, image: `/api/inbox/${res.id}/snapshot.png` });
     if (chat.status === 'sending' || chat.status === 'idle') chat.setStatus('sent');
   } catch (err) {
@@ -561,6 +586,19 @@ async function deliver(cid) {
 $('#btnSend').addEventListener('click', () => send());
 chat.addEventListener('send', () => send());
 chat.addEventListener('retry', (e) => deliver(e.detail));
+
+// After a reload: show the undelivered messages again and send them (the server skips any it
+// already has, so nothing arrives twice).
+async function resendOutbox() {
+  for (const [cid, p] of [...outbox]) {
+    if (!chat.byCid.has(cid)) {
+      const thumb = p.image ? await makeThumb(p.image).catch(() => null) : null;
+      chat.add({ cid, role: 'user', text: p.text, ts: p.client_ts, thumb, full: p.image, mode: p.board_image_mode,
+        width: p.width, height: p.height, state: 'sending', local: true });
+    }
+    deliver(cid);
+  }
+}
 chat.addEventListener('cleardraft', () => {
   chat.setDraft('');
   voice.discardSegments();
@@ -897,11 +935,11 @@ if (window.visualViewport) {
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    scheduleSave.flush();
+    ink.flush();
     saveCam.flush();
   }
 });
-window.addEventListener('pagehide', () => scheduleSave.flush());
+window.addEventListener('pagehide', () => ink.flush());
 
 // ------------------------------------------------------------------ server sync
 
@@ -911,50 +949,30 @@ function deriveLastSend(conversation) {
   return ts;
 }
 
-async function resync({ includeStrokes = false } = {}) {
-  const st = await api.get('/api/state');
-  chat.setConversation(st.conversation || []);
+// The chat's latest page, Claude's layer and the status (ink comes separately, as changes).
+const CHAT_PAGE = 80;
+chat.addEventListener('loadEarlier', async (e) => {
+  try {
+    const res = await api.get(`/api/conversation?before=${encodeURIComponent(e.detail.before)}&limit=60`);
+    chat.prependOlder(res.conversation || [], !!res.more);
+  } catch {
+    chat.earlierFailed();
+  }
+});
+async function resync() {
+  const st = await api.get(`/api/state?conv=${CHAT_PAGE}&strokes=0`);
+  chat.setConversation(st.conversation || [], { more: !!st.conversation_more });
   layer.setAll(st.claude_layer || []);
   chat.setStatus(st.status || 'idle');
   if (!outbox.size) {
-    lastSendAt = deriveLastSend(st.conversation);
+    // the page only has the latest chat entries: never move "last sent" backwards
+    lastSendAt = Math.max(deriveLastSend(st.conversation), store.get(sessionKey('lastSendAt'), 0) || 0);
     store.set(sessionKey('lastSendAt'), lastSendAt);
-  }
-  if (includeStrokes) {
-    const pending = store.get(sessionKey('pendingStrokes'), null);
-    let strokes = st.strokes || [];
-    let restoredLocal = false;
-    if (pending) {
-      try {
-        const parsed = JSON.parse(pending);
-        if (Array.isArray(parsed.strokes)) {
-          strokes = parsed.strokes;
-          restoredLocal = true;
-        }
-      } catch { /* ignore */ }
-    }
-    board.load(strokes);
-    if (restoredLocal) scheduleSave();
   }
   updateInkChip();
   updateSendReady();
   return st;
 }
-
-let pendingRemoteStrokes = false;
-async function pullRemoteStrokes() {
-  if (board.busy || saveInFlight) {
-    pendingRemoteStrokes = true;
-    return;
-  }
-  pendingRemoteStrokes = false;
-  try {
-    const st = await api.get('/api/state');
-    board.load(st.strokes || []);
-    updateInkChip();
-  } catch { /* next event will retry */ }
-}
-setInterval(() => { if (pendingRemoteStrokes) pullRemoteStrokes(); }, 1500);
 
 events.addEventListener('state', (e) => {
   chat.setConnection(e.detail);
@@ -1036,20 +1054,80 @@ $('#voiceOpts').addEventListener('click', (e) => {
   renderVoices();
 });
 
-// ---- updates. The iPad app shows this live page, so a code change on the PC reaches it on the
-// next reload. Each poll reports the server's build; when it differs from the build this page
-// loaded (the ?v= on its own script URL), offer a one-tap reload. If the app was in the
-// background, just reload when it comes back (unless voice mode is on).
+// ---- updates: a code change on the PC reaches this page by itself.
+// Each poll reports the server's build. When it differs from the build this page loaded (the
+// ?v= on its own script URL), the page reloads the moment you're idle: not drawing, moving a
+// card, typing, talking (Live), sending, or looking at something full screen; at once if the
+// app is in the background. It carries over what a reload would lose (undo / redo history,
+// the draft, the camera), so it feels like nothing happened but "Canvas updated". If a reload
+// somehow still runs old code, it doesn't loop: it offers a Reload button instead.
+// (The iPad app's own native code is the one part that needs an install: see appVersion below.)
 const PAGE_BUILD = new URL(import.meta.url).searchParams.get('v');
-let updateReady = false;
+const CARRY = 'canvas.carry';
+let updateTo = null;
+let lastInput = Date.now();
+for (const t of ['pointerdown', 'pointermove', 'keydown', 'wheel', 'input']) {
+  window.addEventListener(t, () => { lastInput = Date.now(); }, { capture: true, passive: true });
+}
+function idleEnoughToUpdate() {
+  const typing = document.activeElement && /^(TEXTAREA|INPUT)$/.test(document.activeElement.tagName);
+  const quiet = Date.now() - lastInput;
+  return quiet > 4000 && !(typing && quiet < 30000) && !board.busy && !cards.drag && !live.on && !voice.on
+    && !sending && !viewer.isOpen && !viewer.busy && !document.querySelector('.modal:not([hidden])');
+}
 events.addEventListener('build', (e) => {
-  if (!PAGE_BUILD || !e.detail || e.detail === PAGE_BUILD || updateReady) return;
-  updateReady = true;
-  toast('Canvas was updated.', { action: 'Reload', onAction: () => location.reload(), ms: 24 * 3600 * 1000 });
+  if (!PAGE_BUILD || !e.detail || e.detail === PAGE_BUILD || updateTo) return;
+  if (sessionStorage.getItem('canvas.updatedTo') === e.detail) { // reloaded for it already: no loop
+    updateTo = e.detail;
+    toast('Canvas was updated.', { action: 'Reload', onAction: () => location.reload(), ms: 24 * 3600 * 1000 });
+    return;
+  }
+  updateTo = e.detail;
+  updateWhenIdle();
 });
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && updateReady && !live.on) location.reload();
+function updateWhenIdle() {
+  if (document.hidden || idleEnoughToUpdate()) applyUpdate();
+  else setTimeout(updateWhenIdle, 1500);
+}
+async function applyUpdate() {
+  try {
+    sessionStorage.setItem('canvas.updatedTo', updateTo);
+    sessionStorage.setItem(CARRY, JSON.stringify({
+      session: SESSION, at: Date.now(), history: board.exportHistory(), draft: chat.getDraft(),
+    }));
+  } catch { /* too big to carry: the update still happens */ }
+  saveCam.flush();
+  ink.saveCopy(true);
+  await Promise.race([ink.flush(), new Promise((r) => setTimeout(r, 1500))]).catch(() => {});
+  location.reload();
+}
+// after an automatic update: put back what the reload would have lost
+function restoreCarried() {
+  let c = null;
+  try { c = JSON.parse(sessionStorage.getItem(CARRY) || 'null'); sessionStorage.removeItem(CARRY); } catch { /* none */ }
+  if (!c || c.session !== SESSION || Date.now() - (c.at || 0) > 120000) return;
+  board.importHistory(c.history);
+  if (c.draft && !chat.getDraft()) chat.setDraft(c.draft);
+  hud('Canvas updated');
+}
+
+// The iPad app's own code (not this page) changes only with an install from SideStore: when
+// the PC has a newer build than the one running, say so once per version.
+events.addEventListener('app', (e) => {
+  const latest = e.detail && e.detail.version;
+  const mine = window.__canvasNative && window.__canvasNative.version;
+  if (!latest || !mine || !newerVersion(latest, mine) || store.get('appNoticeFor', '') === latest) return;
+  store.set('appNoticeFor', latest);
+  toast(`Canvas ${latest} is ready: update the app in SideStore.`, { ms: 9000 });
 });
+function newerVersion(a, b) {
+  const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d > 0;
+  }
+  return false;
+}
 
 // ---- sessions: one board + chat per Claude session (on this PC, another machine, or in the cloud).
 // The switcher is in the panel title. A Claude session attaches with canvas_agent.py; the
@@ -1258,7 +1336,10 @@ liveBtn.addEventListener('click', (e) => {
 
 // 'hello' = the server couldn't replay what we missed (it restarted, or we slept through more
 // than it keeps): reload the conversation and the layer from its state.
-events.addEventListener('hello', () => { resync().catch(() => {}); });
+events.addEventListener('hello', () => {
+  resync().catch(() => {});
+  ink.catchUp(); // just the ink changes we missed (or the whole board if too many)
+});
 events.addEventListener('message', (e) => {
   const m = e.detail;
   if (!m) return;
@@ -1305,10 +1386,7 @@ events.addEventListener('draw_move', (e) => {
   layer.place(g.id, g);
 });
 events.addEventListener('draw_clear', () => layer.clear());
-events.addEventListener('strokes', (e) => {
-  if (!e.detail || e.detail.client === CLIENT_ID) return;
-  pullRemoteStrokes();
-});
+events.addEventListener('ink', (e) => ink.onEvent(e.detail));
 
 // ------------------------------------------------------------------ boot
 
@@ -1339,9 +1417,14 @@ async function boot() {
     $('#lockedMsg').textContent = 'Open the link that includes ?k=<key> (printed by server.py).';
     $('#locked').hidden = false;
   }
+  const inkReady = ink.start(); // the board at once from this device's copy, if it has one
   try {
-    const st = await resync({ includeStrokes: true });
+    const st = await resync();
     events.resume(st.events); // live updates pick up exactly where this snapshot ends
+    await sendLegacyBackup();
+    await inkReady;    // the board, then anything drawn here that never reached the server
+    restoreCarried();  // after an automatic update: undo history and the draft, as they were
+    resendOutbox();    // and any message that never reached it
     if (!board.strokes.length && !layer.count && !(st.conversation || []).length) showHint();
   } catch (err) {
     if (err.status === 404 && SESSION !== 'main') {
@@ -1353,11 +1436,8 @@ async function boot() {
       $('#locked').hidden = false;
     } else {
       toast('Can’t reach the Canvas server — retrying…', { tone: 'error' });
-      const pending = store.get(sessionKey('pendingStrokes'), null);
-      if (pending) {
-        try { board.load(JSON.parse(pending).strokes || []); } catch { /* ignore */ }
-      }
-      setTimeout(() => resync({ includeStrokes: !board.strokes.length }).catch(() => {}), 3000);
+      inkReady.then(() => ink.showUnsent()); // this device's copy, or at least what was drawn here
+      setTimeout(() => resync().catch(() => {}), 3000);
     }
   }
   events.connect();
@@ -1367,4 +1447,5 @@ async function boot() {
   }));
 }
 
+if (window.__canvas) Object.assign(window.__canvas, { resync, events, chat }); // tests (?debug)
 boot();
