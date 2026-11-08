@@ -1289,9 +1289,16 @@ events.addEventListener('build', (e) => {
   updateTo = e.detail;
   updateWhenIdle();
 });
+let updateWaitSince = 0, updateNoticeShown = false;
 function updateWhenIdle() {
-  if (document.hidden || idleEnoughToUpdate()) applyUpdate();
-  else setTimeout(updateWhenIdle, 1500);
+  if (document.hidden || idleEnoughToUpdate()) return applyUpdate();
+  // voice keeps the page from reloading under you: after a while, say an update is waiting
+  if (!updateWaitSince) updateWaitSince = Date.now();
+  if (!updateNoticeShown && Date.now() - updateWaitSince > 20000 && (live.on || voice.on)) {
+    updateNoticeShown = true;
+    toast('A canvas update is ready (it waits while voice is on).', { action: 'Reload', onAction: () => applyUpdate(), ms: 24 * 3600 * 1000 });
+  }
+  setTimeout(updateWhenIdle, 1500);
 }
 async function applyUpdate() {
   try {
