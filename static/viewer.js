@@ -1,11 +1,13 @@
-// Full-screen viewer for media cards on the board (Phase 1: images).
+// Full-screen viewer for cards on the board: images, video, live pages and browsers.
 //
 // Opening, the card itself grows from its place on the board into the middle of the screen
 // while the canvas dims and blurs behind it; closing, it shrinks back into its spot. Inside:
 // pinch to zoom, double-tap to zoom in/out, drag to pan while zoomed. To close: the ✕ in the
 // corner, a tap on the dimmed area around the card, or Esc. No swipe to close: swipes clash
 // with system gestures (Safari's full-screen exit, the iPadOS menu bar), and the content
-// itself owns the finger (zoom here; scrolling pages and rotating 3D later).
+// itself owns the finger (zoom here; the video's controls, the page, the browser tab).
+// Images zoom and pan here; every other kind brings its own content (`mount`), which gets the
+// finger directly (in full screen there's no ink to draw, so nothing needs routing).
 
 const EASE = 'cubic-bezier(.2, .85, .25, 1)';
 const DUR = 420;
@@ -18,7 +20,9 @@ export class Viewer {
     this.frame = root.querySelector('.stage-frame');
     this.title = root.querySelector('.stage-title');
     this.closeBtn = root.querySelector('.stage-close');
-    this.media = null;          // the <img> inside the frame
+    this.media = null;          // the <img> inside the frame (images)
+    this.kind = 'image';
+    this.unmount = null;        // other kinds: removes their content
     this.from = null;           // () => DOMRect of the card on the board
     this.onHide = null;         // (hidden: boolean) => void: hide the card while it's "lifted"
     this.isOpen = false;
@@ -30,24 +34,34 @@ export class Viewer {
     this._bindGestures();
   }
 
-  // Open an image from a card. aspect = height / width.
-  async show({ src, title = '', aspect = 0.66, from, onHide }) {
+  // Open a card full screen. aspect = height / width. kind 'image' shows `src` with zoom;
+  // any other kind passes mount(frame) => { destroy } to build its own content.
+  async show({ kind = 'image', src, title = '', aspect = 0.66, from, onHide, mount }) {
     if (this.isOpen || this.busy) return;
     this.busy = true;
     this.from = from;
     this.onHide = onHide || null;
     this.title.textContent = title;
-    const img = document.createElement('img');
-    img.alt = title || 'Image';
-    img.draggable = false;
-    img.src = src;
-    try { await Promise.race([img.decode(), new Promise((r) => setTimeout(r, 700))]); } catch { /* show anyway */ }
-    if (img.naturalWidth && img.naturalHeight) aspect = img.naturalHeight / img.naturalWidth;
-    this.aspect = aspect;
-    this.media = img;
-    this.frame.replaceChildren(img);
+    this.kind = kind;
+    this.root.dataset.kind = kind;
     this.z = 1; this.tx = 0; this.ty = 0;
-    this._applyZoom(false);
+    if (kind === 'image') {
+      const img = document.createElement('img');
+      img.alt = title || 'Image';
+      img.draggable = false;
+      img.src = src;
+      try { await Promise.race([img.decode(), new Promise((r) => setTimeout(r, 700))]); } catch { /* show anyway */ }
+      if (img.naturalWidth && img.naturalHeight) aspect = img.naturalHeight / img.naturalWidth;
+      this.media = img;
+      this.frame.replaceChildren(img);
+      this._applyZoom(false);
+    } else {
+      this.media = null;
+      this.frame.replaceChildren();
+      const m = mount(this.frame) || {};
+      this.unmount = m.destroy || null;
+    }
+    this.aspect = aspect;
 
     this.root.hidden = false;
     this._layout(false);
@@ -80,6 +94,10 @@ export class Viewer {
     this.frame.style.borderRadius = '14px';
     setTimeout(() => {
       this.root.hidden = true;
+      if (this.unmount) {
+        this.unmount();
+        this.unmount = null;
+      }
       this.frame.replaceChildren();
       this.frame.style.transition = 'none';
       this.frame.style.transform = '';
@@ -144,7 +162,7 @@ export class Viewer {
     const local = (e) => { const r = f.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
 
     f.addEventListener('pointerdown', (e) => {
-      if (!this.isOpen) return;
+      if (!this.isOpen || this.kind !== 'image') return; // other kinds handle their own input
       f.setPointerCapture(e.pointerId);
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (pts.size === 1) {
@@ -213,7 +231,7 @@ export class Viewer {
     this.bg.addEventListener('click', () => this.close());
     // trackpad / mouse wheel zoom (handy on the PC)
     f.addEventListener('wheel', (e) => {
-      if (!this.isOpen) return;
+      if (!this.isOpen || this.kind !== 'image') return;
       e.preventDefault();
       const p = local(e);
       this._zoomAt(p.x, p.y, this.z * Math.exp(-e.deltaY * 0.002));

@@ -24,7 +24,11 @@ The user has an iPad canvas: an infinite board they draw on with Apple Pencil, a
 The board is the user's main medium. When they draw or write, answer there too:
 - Draw an SVG at their ink, in world coordinates, using the timeline's view and mapping: `canvas_agent.py draw -s <board> --svg fig.svg --x X --y Y --width W --label "what it shows"`. Also `--list`, `--remove ID` and `--clear`.
   - Set a `viewBox`, `font-family="-apple-system, system-ui, sans-serif"`, dark text `#1d1d1f`, blue `#0a84ff`, red `#ff3b30`, and text at least 16 px. No scripts.
-- Put an image (a plot, a screenshot, a photo) on the board as a card: `canvas_agent.py embed -s <board> --file plot.png --label "what it shows"`. Without `--x/--y` it lands in the middle of the user's view. They can tap it to move or resize it, and double-tap it to open it full screen.
+- Put things on the board as cards. Without `--x/--y` a card lands in the middle of the user's view, or the nearest free spot, so it never covers another card. The user taps a card to move or resize it, and double-taps it to open it full screen.
+  - An image, a video or a 3D model: `canvas_agent.py embed -s <board> --file plot.png|clip.mp4|part.glb --label "what it shows"`.
+  - A chart that grows live: `canvas_agent.py chart -s <board> --data d.json`, with `{type: line|bar|scatter|area, title, x: [...], series: [{name, y: [...]}]}`. Add points with `canvas_agent.py update -s <board> --id CARD --data more.json --append`.
+  - A live, interactive page (a demo, a simulation, a small tool): `canvas_agent.py page -s <board> --file demo.html --label "..."`. It runs sandboxed. It can load `/vendor/three/...` and `/vendor/chartjs/...` from the canvas, and it gets live data from `update` with `window.addEventListener('canvas:data', e => e.detail.data)`.
+  - A live website: `canvas_agent.py browse -s <board> --url example.com`. It's a real Chrome tab on the PC, streamed into the card; the user taps and scrolls it.
 - Keep the chat reply short and point to what you put on the board. The first sentence should stand on its own; end with one clear question when you need their input.
 
 ## Show progress while you work

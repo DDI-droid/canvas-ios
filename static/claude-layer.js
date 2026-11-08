@@ -3,6 +3,7 @@
 import DOMPurify from './vendor/dompurify/purify.es.mjs';
 import { rectsIntersect, unionRect } from './util.js';
 import { withKey } from './api.js';
+import { BAR, LIVE_KINDS, makeLiveCard } from './livecards.js';
 
 const CARD_STYLE =
   ':host{all:initial;display:block;position:absolute;contain:layout style}' +
@@ -124,7 +125,8 @@ export class ClaudeLayer extends EventTarget {
 
   // same picture, maybe somewhere else: only the geometry needs updating
   static sameContent(a, b) {
-    return (a.type || '') === (b.type || '') && a.svg === b.svg && a.src === b.src && (a.label || null) === (b.label || null);
+    return (a.type || '') === (b.type || '') && a.svg === b.svg && a.src === b.src && (a.label || null) === (b.label || null)
+      && (a.page || null) === (b.page || null) && (a.browser || null) === (b.browser || null);
   }
 
   // Move / resize an item in place (no re-render, so no flicker and no entrance animation).
@@ -175,6 +177,7 @@ export class ClaudeLayer extends EventTarget {
   upsert(item, { animate = true } = {}) {
     if (!item || typeof item.id !== 'string') return null;
     if (item.type === 'image') return this._upsertImage(item, animate);
+    if (LIVE_KINDS.has(item.type)) return this._upsertLive(item, animate);
     const svg = sanitizeSvg(item.svg);
     if (!svg) {
       this.remove(item.id, { animate: false });
@@ -294,10 +297,56 @@ export class ClaudeLayer extends EventTarget {
     return rec;
   }
 
+  // A video, live page or browser card (livecards.js). The same card moved or relabelled keeps
+  // running (no reload of its page, no restart of its video); anything else rebuilds it.
+  _upsertLive(item, animate) {
+    let rec = this.records.get(item.id);
+    if (rec && rec.live && ClaudeLayer.sameContent(rec.item, item)) {
+      this.place(item.id, item);
+      return rec;
+    }
+    if (rec) this.remove(item.id, { animate: false });
+    const host = document.createElement('div');
+    host.className = 'claude-item media-item live-item';
+    host.dataset.id = item.id;
+    host.dataset.kind = item.type;
+    host.attachShadow({ mode: 'open' });
+    this.el.appendChild(host);
+    const w = item.width > 0 ? item.width : 600;
+    const h = item.height > 0 ? item.height : w * (item.aspect > 0 ? item.aspect : 0.66) + BAR;
+    host.style.left = `${item.x || 0}px`;
+    host.style.top = `${item.y || 0}px`;
+    host.style.width = `${w}px`;
+    host.style.height = `${h}px`;
+    rec = { item, host, kind: item.type, w, h, live: null };
+    rec.live = makeLiveCard(rec, host.shadowRoot, this.liveOpts || {});
+    if (animate) host.classList.add('enter');
+    this.records.set(item.id, rec);
+    this._changed();
+    return rec;
+  }
+
+  // On screen, live cards run; off screen (or the page hidden) they rest.
+  // (`focused`: the card open full screen; its full-screen copy runs instead)
+  updateVisibility(view) {
+    for (const rec of this.records.values()) {
+      if (!rec.live) continue;
+      rec.live.setVisible(this.visible && !document.hidden && !!view && rec.item.id !== this.focused
+        && rectsIntersect(this.rectOf(rec), view));
+    }
+  }
+
+  // the live card showing a page (for its live data)
+  byPage(token) {
+    for (const rec of this.records.values()) if (rec.live && rec.item.page === token) return rec;
+    return null;
+  }
+
   remove(id, { animate = true } = {}) {
     const rec = this.records.get(id);
     if (!rec) return;
     this.records.delete(id);
+    if (rec.live) rec.live.destroy();
     if (animate) {
       rec.host.classList.add('leave');
       setTimeout(() => rec.host.remove(), 220);
@@ -379,6 +428,25 @@ export class ClaudeLayer extends EventTarget {
           ctx.globalAlpha = 1;
           n++;
         } catch { /* not loaded: skip */ }
+        continue;
+      }
+      if (rec.live) {
+        // a live card in the snapshot: its frame, title, and what it shows if we can draw it
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = '#f6f6f8';
+        ctx.fillRect(r[0], r[1], rec.w, BAR);
+        ctx.fillStyle = rec.kind === 'video' ? '#111' : '#fff';
+        ctx.fillRect(r[0], r[1] + BAR, rec.w, rec.h - BAR);
+        ctx.strokeStyle = 'rgba(0,0,0,.25)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(r[0], r[1], rec.w, rec.h);
+        ctx.fillStyle = '#3a3a3c';
+        ctx.font = '600 14px -apple-system, system-ui, sans-serif';
+        ctx.fillText(`${{ video: 'Video', page: 'Live page', browser: 'Browser' }[rec.kind]}: ${rec.live.titleEl.textContent || ''}`.slice(0, 80), r[0] + 10, r[1] + 20);
+        const pic = rec.kind === 'browser' ? rec.live.stream.img : rec.kind === 'video' ? rec.live.media : null;
+        try { if (pic && (pic.naturalWidth || pic.videoWidth)) ctx.drawImage(pic, r[0], r[1] + BAR, rec.w, rec.h - BAR); } catch { /* not drawable */ }
+        ctx.globalAlpha = 1;
+        n++;
         continue;
       }
       const pw = Math.max(1, Math.round(rec.w * scale));

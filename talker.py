@@ -63,6 +63,7 @@ Tools:
 - look_at_board: a fresh picture of their screen. You usually already have one with their words; call this only if you need a newer look. After looking, always answer with speak, or hand off.
 - hand_off: real work for the main agent: checking or explaining work in depth, drawing on the board, code, files, experiments, research, long answers. Write the task so it stands on its own, in their words where useful. Then say in a few words what's being done, in their terms: "Checking your scale math now." Not "Passing that to Claude" or "I've given it to the main agent".
 - dismiss: what you heard wasn't for you.
+- open_website: open a site on their board as a live browser card they can tap and scroll ("open the docs", "show me the weather"). A few words become a search. Say a few words too.
 - write_on_board: put a short note on their board (a formula, a key term, up to three short lines; separate lines with " / "). Plain text and symbols like x², √, ≤, ×, θ; no LaTeX. It appears at the top right of what they're looking at. Say a few words too.
 
 The board is shared, and the user wants it used, not just talk: when seeing it written down helps (a formula they asked for, the term you mean, a short list), write it on the board as well as saying it. Anything bigger, like a diagram or marking up their work, is for the main agent: hand it off.
@@ -134,7 +135,7 @@ class Talker:
             "args": [os.path.join(HERE, "voice_mcp.py")],
             "env": {"CANVAS_URL": self.canvas_url, "CANVAS_SESSION": self.session},
         }}}
-        tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "dismiss", "write_on_board"))
+        tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "dismiss", "write_on_board", "open_website"))
         args = [
             exe, "-p",
             "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",

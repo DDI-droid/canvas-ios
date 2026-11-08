@@ -1,0 +1,111 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D model</title>
+<!-- A 3D model card: window.__canvasData = {src: "media/<file>.glb|gltf|obj|stl", title?, color?}.
+     Drag to turn it, pinch to zoom (full screen). It turns slowly by itself for a few seconds after
+     it loads (or until touched), then rests: it only draws while something is moving. -->
+<script type="importmap">{"imports": {"three": "/vendor/three/build/three.module.min.js", "three/addons/": "/vendor/three/examples/jsm/"}}</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: radial-gradient(120% 90% at 50% 20%, #fbfbfd 0%, #e9e9ee 100%);
+    font: 13px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; color: #6e6e73; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #msg { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="msg">Loading…</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+
+const data = window.__canvasData || {};
+const msg = document.getElementById('msg');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 1000);
+scene.add(new THREE.HemisphereLight(0xffffff, 0xb9b9c4, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.position.set(3, 5, 4);
+scene.add(sun);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 1.2;
+const SPIN_MS = 15000; // turning by itself: a short show, then rest (battery)
+let dirty = true, running = false, touching = false, visible = true;
+controls.addEventListener('start', () => { touching = true; controls.autoRotate = false; kick(); }); // touched: stop turning by itself
+controls.addEventListener('end', () => { touching = false; kick(); });
+controls.addEventListener('change', () => { dirty = true; kick(); });
+
+function fit(obj) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3()).length() || 1;
+  const center = box.getCenter(new THREE.Vector3());
+  obj.position.sub(center);
+  camera.position.set(size * 0.55, size * 0.35, size * 0.85);
+  camera.near = size / 100;
+  camera.far = size * 100;
+  camera.updateProjectionMatrix();
+  controls.target.set(0, 0, 0);
+  controls.update();
+}
+
+function material() {
+  return new THREE.MeshStandardMaterial({ color: data.color || '#9aa7b8', metalness: 0.15, roughness: 0.55 });
+}
+
+const src = data.src || '';
+const ext = (src.split('?')[0].split('.').pop() || '').toLowerCase();
+const done = (obj) => {
+  scene.add(obj); fit(obj); msg.remove();
+  setTimeout(() => { controls.autoRotate = false; }, SPIN_MS);
+  dirty = true; kick();
+};
+const fail = (e) => { msg.textContent = "Couldn't load this model."; console.error(e); };
+if (ext === 'glb' || ext === 'gltf') new GLTFLoader().load(src, (g) => done(g.scene), undefined, fail);
+else if (ext === 'obj') new OBJLoader().load(src, (o) => { o.traverse((c) => { if (c.isMesh) c.material = material(); }); done(o); }, undefined, fail);
+else if (ext === 'stl') new STLLoader().load(src, (geo) => { geo.computeVertexNormals(); done(new THREE.Mesh(geo, material())); }, undefined, fail);
+else msg.textContent = 'No model.';
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / Math.max(1, h);
+  camera.updateProjectionMatrix();
+  dirty = true;
+  kick();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// draw only while the card is on screen, and only while something moves (turning by itself,
+// a finger on it, or the last of its glide after one)
+window.addEventListener('canvas:visibility', (e) => { visible = e.detail.visible; kick(); });
+function kick() {
+  if (running || !visible) return;
+  running = true;
+  requestAnimationFrame(loop);
+}
+function loop() {
+  running = false;
+  if (!visible) return;
+  const moved = controls.update();
+  if (moved || dirty) {
+    renderer.render(scene, camera);
+    dirty = false;
+  }
+  if (moved || touching || controls.autoRotate) kick();
+}
+kick();
+</script>
+</body>
+</html>

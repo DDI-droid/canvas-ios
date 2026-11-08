@@ -1,0 +1,85 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chart</title>
+<!-- A chart card: window.__canvasData = {type: line | bar | scatter | area, title?, x: [...],
+     series: [{name, y: [...], color?}], xLabel?, yLabel?}. Live updates append or replace. -->
+<script src="/vendor/chartjs/chart.umd.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff; }
+  body { display: flex; flex-direction: column; font: 13px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; color: #1d1d1f; }
+  h1 { margin: 0; padding: 12px 16px 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+  h1:empty { display: none; }
+  .wrap { position: relative; flex: 1; min-height: 0; padding: 8px 12px 10px 6px; }
+</style>
+</head>
+<body>
+<h1 id="title"></h1>
+<div class="wrap"><canvas id="chart"></canvas></div>
+<script>
+(function () {
+  var PALETTE = ['#0a84ff', '#ff9f0a', '#30d158', '#ff375f', '#bf5af2', '#64d2ff', '#ffd60a', '#8e8e93'];
+  var data = window.__canvasData || {};
+  var chart = null;
+
+  function datasets(d) {
+    var type = d.type || 'line';
+    return (d.series || []).map(function (s, i) {
+      var c = s.color || PALETTE[i % PALETTE.length];
+      var ys = s.y || [];
+      var points = type === 'scatter' ? ys.map(function (y, j) { return { x: (d.x || [])[j], y: y }; }) : ys;
+      return {
+        label: s.name || ('Series ' + (i + 1)), data: points, borderColor: c, backgroundColor: type === 'bar' ? c : c + '22',
+        fill: type === 'area', tension: 0.25, borderWidth: 2, pointRadius: ys.length > 60 ? 0 : 2.5, pointHoverRadius: 4,
+      };
+    });
+  }
+
+  function render(d) {
+    document.getElementById('title').textContent = d.title || '';
+    var type = d.type === 'area' ? 'line' : (d.type || 'line');
+    var cfg = {
+      type: type,
+      data: { labels: type === 'scatter' ? undefined : (d.x || []), datasets: datasets(d) },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: { duration: 250 },
+        interaction: { mode: 'nearest', intersect: false },
+        plugins: { legend: { display: (d.series || []).length > 1, labels: { boxWidth: 10, usePointStyle: true } } },
+        scales: {
+          x: { type: type === 'scatter' ? 'linear' : 'category', title: { display: !!d.xLabel, text: d.xLabel || '' },
+               grid: { display: false }, ticks: { maxTicksLimit: 8, color: '#6e6e73' } },
+          y: { title: { display: !!d.yLabel, text: d.yLabel || '' }, grid: { color: 'rgba(0,0,0,.06)' },
+               ticks: { maxTicksLimit: 6, color: '#6e6e73' } },
+        },
+      },
+    };
+    Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif';
+    if (chart) chart.destroy();
+    chart = new Chart(document.getElementById('chart'), cfg);
+  }
+
+  // live updates: append new points to the named series, or replace everything
+  function append(n) {
+    if (Array.isArray(n.x)) data.x = (data.x || []).concat(n.x);
+    (n.series || []).forEach(function (s) {
+      var cur = (data.series || []).filter(function (o) { return o.name === s.name; })[0];
+      if (cur) cur.y = (cur.y || []).concat(s.y || []);
+      else (data.series = data.series || []).push(s);
+    });
+    if (!chart || chart.data.datasets.length !== (data.series || []).length) return render(data);
+    chart.data.labels = chart.config.type === 'scatter' ? undefined : data.x;
+    var fresh = datasets(data);
+    chart.data.datasets.forEach(function (ds, i) { ds.data = fresh[i].data; ds.pointRadius = fresh[i].pointRadius; });
+    chart.update();
+  }
+  window.onCanvasData = function (d, mode) {
+    if (mode === 'append') append(d || {});
+    else { data = d || {}; render(data); }
+  };
+  render(data);
+})();
+</script>
+</body>
+</html>

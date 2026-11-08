@@ -63,9 +63,9 @@
     <button class="icon-btn" id="btnSettings" data-icon="sliders" aria-label="Settings" aria-haspopup="true" aria-expanded="false" title="Settings"></button>
     <button class="zoom-btn" id="btnZoom" aria-label="Zoom — tap to reset or fit" title="Tap: 100% / fit"><span id="zoomLabel">100%</span></button>
     <button class="icon-btn" id="btnLayer" aria-label="Toggle Claude's drawings" aria-pressed="true" title="Claude's drawings"></button>
-    <button class="icon-btn" id="btnAdd" data-icon="plus" aria-label="Add an image" title="Add an image"></button>
+    <button class="icon-btn" id="btnAdd" data-icon="plus" aria-label="Add an image, video or 3D model" title="Add an image, video or 3D model"></button>
     <button class="icon-btn" id="btnFullscreen" data-icon="expand" aria-label="Full screen" aria-pressed="false" title="Full screen" hidden></button>
-    <input type="file" id="fileInput" accept="image/*" multiple hidden>
+    <input type="file" id="fileInput" accept="image/*,video/*,.glb,.gltf,.obj,.stl" multiple hidden>
   </div>
 
   <div class="pop settings-pop glass" id="settingsPop" hidden role="dialog" aria-label="Settings">

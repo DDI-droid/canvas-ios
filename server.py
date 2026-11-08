@@ -53,9 +53,11 @@ SERVER_INFO = os.path.join(DATA_DIR, "server.json")
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")  # one folder per canvas session (board + chat)
 SESSION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 # media files are content-addressed: <sha256 prefix>.<ext>
-MEDIA_FILE_RE = re.compile(r"^[a-f0-9]{16,64}\.(png|jpe?g|gif|webp|avif|heic|mp4|m4v|mov|webm)$")
+MEDIA_FILE_RE = re.compile(r"^[a-f0-9]{16,64}\.(png|jpe?g|gif|webp|avif|heic|mp4|m4v|mov|webm|glb|gltf|obj|stl)$")
 # a light copy of an image for board cards, made on first request (<hash>.preview.jpg)
 PREVIEW_RE = re.compile(r"^([a-f0-9]{16,64})\.preview\.jpg$")
+# a video's first frame, made by the first page that shows the video (no ffmpeg needed)
+POSTER_RE = re.compile(r"^([a-f0-9]{16,64})\.poster\.jpg$")
 PREVIEW_SIDE = 1280
 _preview_lock = threading.Lock()
 
@@ -85,10 +87,14 @@ def make_preview(src: str, dst: str) -> bool:
     except Exception as e:
         log(f"preview failed for {os.path.basename(src)}: {e}")
         return False
-MEDIA_SRC_RE = re.compile(r"^/api/media/([a-f0-9]{16,64}\.(?:png|jpe?g|gif|webp|avif|heic|mp4|m4v|mov|webm))$")
+MEDIA_SRC_RE = re.compile(r"^/api/media/([a-f0-9]{16,64}\.(?:png|jpe?g|gif|webp|avif|heic|mp4|m4v|mov|webm|glb|gltf|obj|stl))$")
 IMAGE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
              "image/avif": "avif", "image/heic": "heic"}
-MAX_MEDIA = 60 * 1024 * 1024
+VIDEO_EXT = {"video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm", "video/x-m4v": "m4v"}
+MODEL_EXT = {"model/gltf-binary": "glb", "model/gltf+json": "gltf", "model/obj": "obj", "model/stl": "stl"}
+MEDIA_EXT = {**IMAGE_EXT, **VIDEO_EXT, **MODEL_EXT}
+MAX_MEDIA = 60 * 1024 * 1024        # base64 JSON uploads (agents' small files)
+MAX_UPLOAD = 1024 * 1024 * 1024     # a file sent as it is (videos): streamed to disk, never in memory
 AGENT_CLIENT = os.path.join(BASE_DIR, "canvas_agent.py")
 STATIC_ROOT = os.path.normcase(os.path.realpath(STATIC_DIR))
 
@@ -210,12 +216,19 @@ drawings are your job.
   ```
   For SVGs, set a `viewBox`, use `font-family="-apple-system, system-ui, sans-serif"`, dark text
   `#1d1d1f`, blue `#0a84ff`, red `#ff3b30`, and text at least 16 px. Don't use scripts.
-- Put an image (a plot, a screenshot, a photo) on the board as a card. Without --x/--y it goes
-  in the middle of the user's view. The user can tap it to move or resize it, and double-tap it
-  to open it full screen:
+- Put things on the board as cards. Without --x/--y a card goes in the middle of the user's
+  view, or the nearest free spot, so it never covers another card. The user taps a card to move
+  or resize it, and double-taps it to open it full screen:
   ```bash
-  python canvas_agent.py embed -s {SESSION} --file plot.png --label "what it shows"
+  python canvas_agent.py embed  -s {SESSION} --file plot.png|clip.mp4|part.glb --label "what it shows"
+  python canvas_agent.py chart  -s {SESSION} --data d.json    # {type: line|bar|scatter|area, title, x: [...], series: [{name, y: [...]}]}
+  python canvas_agent.py update -s {SESSION} --id CARD --data more.json --append   # the chart grows live
+  python canvas_agent.py page   -s {SESSION} --file demo.html --label "..."        # a live, interactive page
+  python canvas_agent.py browse -s {SESSION} --url example.com                      # a real browser tab, live
   ```
+  A page runs sandboxed. It can load `/vendor/three/...` and `/vendor/chartjs/...` from the
+  canvas, and it gets live data from `update` with
+  `window.addEventListener('canvas:data', e => e.detail.data)`.
 - Show where you're going with short progress notes: one for each meaningful step (something
   you found, changed or tested), usually 4 to 8 for a piece of work, each a few plain words. No
   tool names, commands, file paths or arguments. Notes fold into "N steps" above your reply, and they're never spoken:
@@ -249,6 +262,10 @@ MIME = {
     ".m4v": "video/mp4",
     ".mov": "video/quicktime",
     ".webm": "video/webm",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".obj": "text/plain; charset=utf-8",
+    ".stl": "model/stl",
     ".woff2": "font/woff2",
     ".woff": "font/woff",
     ".ttf": "font/ttf",
@@ -286,6 +303,84 @@ def latest_app_build():
         v = read_json_obj(path).get("version")
         _app_cache.update(mtime=mtime, info={"version": str(v)} if v else None)
     return _app_cache["info"]
+
+
+CARD_TYPES = ("image", "video", "page", "browser")
+LIVE_BAR = 30  # world px: a live card's title strip (static/livecards.js BAR)
+PAGE_TEMPLATES = ("chart", "model")
+PAGE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+PAGE_INDEX: dict = {}  # live page token -> session id
+# Live pages run in a sandboxed iframe (no access to the canvas page or its key). They may load
+# libraries from the canvas (/vendor/) or the web, and can't be framed by anything but the canvas.
+LIVE_CSP = ("default-src 'self' https: data: blob:; script-src 'self' https: 'unsafe-inline' 'unsafe-eval' blob:; "
+            "style-src 'self' https: 'unsafe-inline'; img-src * data: blob:; media-src * data: blob:; "
+            "font-src * data:; connect-src 'self' https: data: blob:; frame-ancestors 'self'")
+# reachable without the key: live pages (their token is the permission) and public code they load
+PUBLIC_PREFIXES = ("/live/", "/vendor/")
+PUBLIC_FILES = ("/live-bridge.js",)
+
+
+def pages_dir(session) -> str:
+    d = os.path.join(session.dir, "pages")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def load_page(session, token):
+    if not isinstance(token, str) or not PAGE_TOKEN_RE.match(token):
+        return None
+    meta = read_json_obj(os.path.join(pages_dir(session), f"{token}.json"))
+    return meta or None
+
+
+def save_page(session, meta: dict) -> None:
+    write_json_atomic(os.path.join(pages_dir(session), f"{meta['token']}.json"), meta)
+
+
+def find_page_session(sessions, token):
+    if not PAGE_TOKEN_RE.match(token or ""):
+        return None
+    sid = PAGE_INDEX.get(token)
+    sess = sessions.get(sid) if sid else None
+    if sess and load_page(sess, token):
+        return sess
+    for sess in sessions.all():  # not seen since the server started: look in every session
+        if load_page(sess, token):
+            PAGE_INDEX[token] = sess.id
+            return sess
+    return None
+
+
+def append_chart_data(old: dict, new: dict, keep: int = 100_000) -> dict:
+    """Append points to chart data: x values and each named series' y values (last `keep`)."""
+    out = dict(old)
+    if isinstance(new.get("x"), list):
+        out["x"] = (list(old.get("x") or []) + new["x"])[-keep:]
+    series = {s.get("name"): dict(s) for s in (old.get("series") or []) if isinstance(s, dict)}
+    order = [s.get("name") for s in (old.get("series") or []) if isinstance(s, dict)]
+    for s in new.get("series") or []:
+        if not isinstance(s, dict):
+            continue
+        cur = series.get(s.get("name"))
+        if cur is None:
+            series[s.get("name")] = dict(s)
+            order.append(s.get("name"))
+        else:
+            cur["y"] = (list(cur.get("y") or []) + list(s.get("y") or []))[-keep:]
+    out["series"] = [series[n] for n in order]
+    return out
+
+
+_browsers = None
+
+
+def browser_manager():
+    """The browser-card Chrome (browser.py), created on first use."""
+    global _browsers
+    if _browsers is None:
+        import browser
+        _browsers = browser.BrowserManager(DATA_DIR, log)
+    return _browsers
 
 
 def registry_url():
@@ -687,6 +782,41 @@ def num(v, default=None):
     return f if math.isfinite(f) else default
 
 
+def free_spot(layer: list, view, w: float, h: float, gap: float = 28.0) -> tuple[float, float]:
+    """Where a new card goes when the caller didn't say: the middle of the user's view, or the
+    nearest place to it that covers no other card (so a new card never lands on the last one).
+    Places that stay inside the view win over slightly nearer ones that don't."""
+    vx0, vy0, vx1, vy1 = view
+    x0, y0 = (vx0 + vx1 - w) / 2, (vy0 + vy1 - h) / 2
+    boxes = []
+    for it in layer:
+        if not isinstance(it, dict) or it.get("type") not in CARD_TYPES:
+            continue
+        x, y, iw = num(it.get("x")), num(it.get("y")), num(it.get("width"))
+        if x is None or y is None or not iw or iw <= 0:
+            continue
+        ih = num(it.get("height")) or iw * (num(it.get("aspect")) or 0.66)
+        boxes.append((x - gap, y - gap, x + iw + gap, y + ih + gap))
+
+    def free(x, y):
+        return all(x + w <= b[0] or x >= b[2] or y + h <= b[1] or y >= b[3] for b in boxes)
+
+    if free(x0, y0):
+        return x0, y0
+    sx, sy = (w + gap) / 2, (h + gap) / 2  # half a card at a time
+    best = None
+    for i in range(-8, 9):
+        for j in range(-8, 9):
+            x, y = x0 + i * sx, y0 + j * sy
+            if not free(x, y):
+                continue
+            inside = x >= vx0 and y >= vy0 and x + w <= vx1 and y + h <= vy1
+            score = math.hypot(i * sx, j * sy) * (1.0 if inside else 1.6)
+            if best is None or score < best[0]:
+                best = (score, x, y)
+    return (best[1], best[2]) if best else (x0, y0)
+
+
 def clean_line(s, limit: int | None = None) -> str:
     if not isinstance(s, str):
         return ""
@@ -1039,6 +1169,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             parts = urllib.parse.urlsplit(self.path)
             self.query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
             path = urllib.parse.unquote(parts.path) or "/"
+            self._public = path.startswith(PUBLIC_PREFIXES) or path in PUBLIC_FILES
+            if self._public:  # live pages and the code they load: no key (see PUBLIC_PREFIXES)
+                if self.command not in ("GET", "HEAD", "OPTIONS"):
+                    raise HttpError(405, "method not allowed")
+                self.session = self.store = self.hub = self.voice = None
+                if path.startswith("/live/"):
+                    return self._serve_live(path)
+                return self._serve_static(path)
             if not self._authorized():
                 self._unauthorized(path)
                 return
@@ -1109,6 +1247,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("POST", "/api/reply"): self._api_reply,
             ("POST", "/api/progress"): self._api_progress,
             ("POST", "/api/media"): self._api_media_upload,
+            ("POST", "/api/media/poster"): self._api_media_poster,
+            ("POST", "/api/page"): self._api_page,
+            ("POST", "/api/card/data"): self._api_card_data,
+            ("POST", "/api/browser"): self._api_browser_open,
             ("POST", "/api/view"): self._api_view,
             ("POST", "/api/status"): self._api_status,
             ("POST", "/api/draw"): self._api_draw,
@@ -1135,6 +1277,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/api/inbox/([^/]+)/timeline\.txt$", path)
         if m and method in ("GET", "HEAD"):
             return self._api_timeline(m.group(1))
+        m = re.match(r"^/api/browser/([A-Za-z0-9_.:-]{1,64})/(frame|input)$", path)
+        if m:
+            if self.session is None:
+                raise HttpError(404, f"no canvas session {self.sid!r}")
+            if m.group(2) == "frame" and method in ("GET", "HEAD"):
+                return self._api_browser_frame(m.group(1))
+            if m.group(2) == "input" and method == "POST":
+                return self._api_browser_input(m.group(1))
+            raise HttpError(405, "method not allowed")
         m = re.match(r"^/api/media/([^/]+)$", path)
         if m and method in ("GET", "HEAD"):
             if self.session is None:
@@ -1190,6 +1341,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _security_headers(self, html: bool = False):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        if getattr(self, "_public", False):
+            # live pages (sandboxed: an opaque origin) load these: libraries, their page, its media
+            self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            return
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         if html:
             self.send_header("Content-Security-Policy", CSP)
@@ -1748,11 +1904,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         JSON {data: base64 or data URL, mime?} (agents). Returns {src: "/api/media/<hash>.<ext>",
         bytes, mime}. Content-addressed, so re-uploads are free."""
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if ctype.startswith("image/"):  # the page sends files as they are: no base64, a third smaller
-            mime, raw = ctype, self._read_body()
-            ext = IMAGE_EXT.get(mime)
+        if ctype.split("/")[0] in ("image", "video", "model"):
+            # a file as it is (no base64): streamed to disk while it's hashed, so a 1 GB video
+            # never sits in memory
+            ext = MEDIA_EXT.get(ctype)
             if not ext:
-                raise HttpError(415, "only images for now (png, jpeg, gif, webp, avif, heic)")
+                raise HttpError(415, "images (png, jpeg, gif, webp, avif, heic), videos (mp4, mov, webm) "
+                                     "or 3D models (glb, gltf, obj, stl)")
+            name, size = self._stream_upload(ext)
+            log(f"media {name} [{self.session.id}] ({size / 1e6:.1f} MB)")
+            self._send_json(200, {"src": f"/api/media/{name}", "bytes": size, "mime": ctype})
+            return
         else:
             body = self._read_json()
             data = body.get("data")
@@ -1778,11 +1940,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
         log(f"media {name} [{self.session.id}] ({len(raw) / 1e6:.1f} MB)")
         self._send_json(200, {"src": f"/api/media/{name}", "bytes": len(raw), "mime": mime})
 
+    def _stream_upload(self, ext: str, limit: int = MAX_UPLOAD, name: str | None = None):
+        """Read the request body straight into the session's media folder, hashing as it goes.
+        Returns (file name, size). Content-addressed: <sha256[:24]>.<ext> (or `name`)."""
+        try:
+            n = int(self.headers.get("Content-Length") or -1)
+        except ValueError:
+            n = -1
+        if n <= 0:
+            raise HttpError(411, "Content-Length required")
+        if n > limit:
+            self.close_connection = True
+            raise HttpError(413, f"file too large (max {limit // (1024 * 1024)} MB)")
+        tmp = os.path.join(self.session.media, f".upload-{secrets.token_hex(6)}")
+        h = hashlib.sha256()
+        left = n
+        try:
+            with open(tmp, "wb") as f:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise ConnectionError("client closed during upload")
+                    h.update(chunk)
+                    f.write(chunk)
+                    left -= len(chunk)
+            name = name or h.hexdigest()[:24] + "." + ext
+            path = os.path.join(self.session.media, name)
+            if os.path.exists(path) and not name.endswith(".poster.jpg"):
+                os.remove(tmp)
+            else:
+                os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        return name, n
+
+    def _api_media_poster(self):
+        """A video's first frame, from the page that first showed it: POST image/jpeg body,
+        ?for=<video file name>. Stored as <hash>.poster.jpg next to the video."""
+        target = self.query.get("for", [""])[0]
+        if not MEDIA_FILE_RE.match(target) or not os.path.isfile(os.path.join(self.session.media, target)):
+            raise HttpError(404, "no such video in this session")
+        if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "image/jpeg":
+            raise HttpError(415, "a JPEG, please")
+        name, _ = self._stream_upload("jpg", limit=4 * 1024 * 1024, name=target.split(".")[0] + ".poster.jpg")
+        self._send_json(200, {"poster": f"/api/media/{name}"})
+
     def _api_media_get(self, name: str):
         """Serve a media file, with HTTP Range (iPad video playback and seeking need it).
         <hash>.preview.jpg is made from the original on first request (board cards use it)."""
         pm = PREVIEW_RE.match(name)
-        if not pm and not MEDIA_FILE_RE.match(name):
+        if not pm and not MEDIA_FILE_RE.match(name) and not POSTER_RE.match(name):
             raise HttpError(404, "not found")
         path = os.path.join(self.session.media, name)
         if pm and not os.path.isfile(path):
@@ -1848,36 +2059,65 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.voice.view = self.session.view
         self._send_json(200, {"ok": True})
 
-    def _draw_image(self, body: dict):
-        """An image card on the board: {type: "image", src: "/api/media/…", x?, y?, width?, height?,
-        aspect?, id?, label?}. Without x/y it goes in the middle of the user's current view."""
-        src = body.get("src")
-        if not isinstance(src, str) or not MEDIA_SRC_RE.match(src):
-            raise HttpError(400, "src must be a /api/media/... path from POST /api/media")
-        if not os.path.isfile(os.path.join(self.session.media, src.rsplit("/", 1)[1])):
-            raise HttpError(404, "that media file isn't in this session")
+    def _draw_card(self, body: dict):
+        """A card on the board. {type, x?, y?, width?, height?, aspect?, id?, label?} plus:
+          image:   src  (/api/media/... from POST /api/media)
+          video:   src  (an mp4 / mov / webm from POST /api/media)
+          page:    page (a live page from POST /api/page: an agent's HTML, a chart, a 3D model)
+          browser: browser (a live browser tab, from POST /api/browser)
+        Without x/y it goes in the middle of the user's current view."""
+        kind = body.get("type")
         item_id = body.get("id")
         if item_id is not None and (not isinstance(item_id, str) or not DRAW_ID_RE.match(item_id)):
             raise HttpError(400, "id must match [A-Za-z0-9_.:-]{1,64}")
-        item_id = item_id or "m-" + secrets.token_hex(4)
-        aspect = num(body.get("aspect"))  # height / width of the image, if known
-        v = self.session.view or [0.0, 0.0, 1200.0, 800.0]
+        extra = {}
+        if kind in ("image", "video"):
+            src = body.get("src")
+            m = MEDIA_SRC_RE.match(src) if isinstance(src, str) else None
+            want = set(IMAGE_EXT.values()) | {"jpeg"} if kind == "image" else set(VIDEO_EXT.values())
+            if not m or m.group(1).rsplit(".", 1)[1] not in want:
+                raise HttpError(400, f"src must be {'an image' if kind == 'image' else 'a video'} path from POST /api/media")
+            if not os.path.isfile(os.path.join(self.session.media, m.group(1))):
+                raise HttpError(404, "that media file isn't in this session")
+            extra["src"] = src
+        elif kind == "page":
+            token = body.get("page")
+            if not isinstance(token, str) or not load_page(self.session, token):
+                raise HttpError(400, "page must be a page id from POST /api/page")
+            extra.update(page=token, src=f"/live/{token}/")
+        elif kind == "browser":
+            bid = body.get("browser")
+            if not isinstance(bid, str) or not DRAW_ID_RE.match(bid):
+                raise HttpError(400, "browser must be a browser id from POST /api/browser")
+            extra.update(browser=bid, url=body.get("url") if isinstance(body.get("url"), str) else None)
+        item_id = item_id or {"image": "m-", "video": "v-", "page": "p-", "browser": "b-"}[kind] + secrets.token_hex(4)
+        aspect = num(body.get("aspect"))  # height / width, if known
+        if not (aspect and aspect > 0):
+            aspect = {"page": 0.66, "browser": 0.625}.get(kind)
+        v = body.get("view")  # the caller's own view, else the one the page last reported
+        if not (isinstance(v, list) and len(v) == 4 and all(num(c) is not None for c in v) and v[2] > v[0] and v[3] > v[1]):
+            v = self.session.view or [0.0, 0.0, 1200.0, 800.0]
+        v = [float(c) for c in v]
         vw, vh = v[2] - v[0], v[3] - v[1]
         width = num(body.get("width"))
-        width = width if width and width > 0 else vw * 0.42
+        width = width if width and width > 0 else vw * (0.5 if kind in ("page", "browser") else 0.42)
         height = num(body.get("height"))
-        height = height if height and height > 0 else (width * aspect if aspect and aspect > 0 else None)
+        if not (height and height > 0):
+            height = width * aspect if aspect and aspect > 0 else None
+            if height and kind in ("video", "page", "browser"):
+                height += LIVE_BAR  # live cards have a title strip above their content
         x, y = num(body.get("x")), num(body.get("y"))
-        if x is None or y is None:
-            x = v[0] + (vw - width) / 2
-            y = v[1] + (vh - (height or width * 0.66)) / 2
         label = body.get("label")
-        item = {"id": item_id, "type": "image", "src": src, "x": x, "y": y, "width": width,
+        item = {"id": item_id, "type": kind, **extra, "x": x, "y": y, "width": width,
                 "height": height, "aspect": aspect if aspect and aspect > 0 else None,
                 "label": clean_line(label, 200) if isinstance(label, str) and label.strip() else None,
                 "ts": now_ms()}
         st = self.store
         with st.lock:
+            if x is None or y is None:  # the middle of the view, or the nearest free spot to it
+                others = [it for it in st.layer if not (isinstance(it, dict) and it.get("id") == item_id)]
+                x, y = free_spot(others, v, width, height or width * 0.66)
+                item["x"], item["y"] = x, y
             for i, old in enumerate(st.layer):
                 if isinstance(old, dict) and old.get("id") == item_id:
                     st.layer[i] = item
@@ -1885,10 +2125,172 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 st.layer.append(item)
             st.save_layer()
-        log(f"image {item_id} [{self.session.id}] at ({x:.0f},{y:.0f}) w={width:.0f}")
+        log(f"{kind} {item_id} [{self.session.id}] at ({x:.0f},{y:.0f}) w={width:.0f}")
         self.session.touch_agent()
         self.hub.broadcast("draw", item)
         self._send_json(200, {"id": item_id, "x": x, "y": y, "width": width, "height": height})
+
+    # ---- live pages: an agent's HTML, or a built-in template (chart, 3D model) with its data.
+    # Served at /live/<token>/ with no key (the long random token is the permission) into a
+    # sandboxed iframe that can't reach the canvas page or its key. Data can be updated live.
+    # ---- browser cards (browser.py): a real Chrome tab on this PC, streamed into a card
+    def _browser_tab(self, bid: str):
+        """The tab behind a browser card; reopened at its last address if Chrome restarted."""
+        mgr = browser_manager()
+        tab = mgr.get(bid)
+        if tab:
+            return tab
+        with self.store.lock:
+            item = next((it for it in self.store.layer if isinstance(it, dict) and it.get("browser") == bid), None)
+        if item is None:
+            raise HttpError(404, "no such browser card")
+        try:
+            return mgr.open(item.get("url") or "about:blank", bid)
+        except Exception as e:
+            raise HttpError(503, str(e))
+
+    def _api_browser_open(self):
+        """{url, label?, x?, y?, width?} -> a browser card showing that page."""
+        body = self._read_json()
+        url = body.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise HttpError(400, "url is required")
+        try:
+            tab = browser_manager().open(url)
+        except Exception as e:
+            raise HttpError(503, str(e))
+        import browser  # already loaded by browser_manager()
+        return self._draw_card({"type": "browser", "browser": tab.id, "url": browser.normalize_url(url), "aspect": 800 / 1280,
+                                **{k: body.get(k) for k in ("label", "x", "y", "width", "id") if body.get(k) is not None}})
+
+    def _api_browser_frame(self, bid: str):
+        """The tab's newest frame (JPEG) once it's newer than ?after=N; waits up to 20 s."""
+        tab = self._browser_tab(bid)
+        try:
+            after = int(self.query.get("after", ["0"])[0])
+        except ValueError:
+            after = 0
+        seq, jpeg = tab.next_frame(after, wait=20.0)
+        with self.store.lock:  # remember where the tab is, to reopen it there after a restart
+            for it in self.store.layer:
+                if isinstance(it, dict) and it.get("browser") == bid and tab.url and it.get("url") != tab.url:
+                    it["url"] = tab.url
+                    self.store.save_layer()
+                    break
+        if not jpeg:
+            return self._send_json(200, {"seq": seq, "pending": True})  # no picture yet
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(jpeg)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Seq", str(seq))
+        self.send_header("X-Browser-Url", urllib.parse.quote(tab.url or "", safe=":/?&=#%"))
+        self.send_header("X-Browser-Title", urllib.parse.quote(tab.title or "", safe=" "))
+        self._security_headers()
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(jpeg)
+
+    def _api_browser_input(self, bid: str):
+        """{kind: down | move | up | wheel | text | key | nav | back | forward | reload, x, y, ...}
+        in the tab's own pixels (1280 x 800)."""
+        ev = self._read_json()
+        self._browser_tab(bid).input(ev)
+        self._send_json(200, {"ok": True})
+
+    def _api_page(self):
+        """{html} or {template: "chart" | "model", data}, plus title?; page: <token> updates one.
+        Returns {page, src}."""
+        body = self._read_json()
+        html, template, data = body.get("html"), body.get("template"), body.get("data")
+        token = body.get("page")
+        meta = load_page(self.session, token) if isinstance(token, str) else None
+        if meta is None:
+            token = secrets.token_urlsafe(18)
+            meta = {"token": token, "created": now_ms()}
+        if isinstance(html, str) and html.strip():
+            if len(html.encode("utf-8")) > 5 * 1024 * 1024:
+                raise HttpError(413, "html too large (max 5 MB)")
+            write_bytes_atomic(os.path.join(pages_dir(self.session), f"{token}.html"), html.encode("utf-8"))
+            meta.update(html=True, template=None)
+        elif template in PAGE_TEMPLATES:
+            meta.update(html=False, template=template)
+        elif not meta.get("html") and not meta.get("template"):
+            raise HttpError(400, "give html, or template: chart | model with its data")
+        if data is not None:
+            if len(json.dumps(data)) > 5 * 1024 * 1024:
+                raise HttpError(413, "data too large (max 5 MB)")
+            meta["data"] = data
+        if isinstance(body.get("title"), str):
+            meta["title"] = clean_line(body["title"], 200)
+        meta["updated"] = now_ms()
+        save_page(self.session, meta)
+        PAGE_INDEX[token] = self.session.id
+        if body.get("page"):  # an update: open pages reload it
+            self.hub.broadcast("page_reload", {"page": token})
+        self._send_json(200, {"page": token, "src": f"/live/{token}/"})
+
+    def _api_card_data(self):
+        """Live data for a page card: {page | id, data, mode: replace | append}. Charts append
+        points ({x: [...], series: [{name, y: [...]}]}); any page gets it as a canvas:data event."""
+        body = self._read_json()
+        token = body.get("page")
+        if not token and isinstance(body.get("id"), str):
+            with self.store.lock:
+                item = next((it for it in self.store.layer if isinstance(it, dict) and it.get("id") == body["id"]), None)
+            token = item.get("page") if item else None
+        meta = load_page(self.session, token) if isinstance(token, str) else None
+        if meta is None:
+            raise HttpError(404, "no such page card")
+        data, mode = body.get("data"), body.get("mode") or "replace"
+        if mode == "append" and isinstance(meta.get("data"), dict) and isinstance(data, dict):
+            meta["data"] = append_chart_data(meta["data"], data)
+        else:
+            meta["data"], mode = data, "replace"
+        meta["updated"] = now_ms()
+        save_page(self.session, meta)
+        self.hub.broadcast("card_data", {"page": token, "data": data, "mode": mode})
+        self._send_json(200, {"ok": True})
+
+    def _serve_live(self, path: str):
+        """/live/<token>/ (the page) and /live/<token>/media/<file> (its session's media)."""
+        m = re.match(r"^/live/([A-Za-z0-9_-]{16,64})/(.*)$", path)
+        if not m:
+            raise HttpError(404, "not found")
+        token, rest = m.groups()
+        sess = find_page_session(self.sessions, token)
+        if sess is None:
+            raise HttpError(404, "no such page")
+        self.session, self.store, self.hub = sess, sess.store, sess.hub
+        if rest.startswith("media/"):
+            return self._api_media_get(rest[len("media/"):])
+        if rest not in ("", "index.html"):
+            raise HttpError(404, "not found")
+        meta = load_page(sess, token)
+        if meta.get("template") in PAGE_TEMPLATES:
+            with open(os.path.join(STATIC_DIR, "templates", f"{meta['template']}.html"), "r", encoding="utf-8") as f:
+                html = f.read()
+        else:
+            try:
+                with open(os.path.join(pages_dir(sess), f"{token}.html"), "r", encoding="utf-8") as f:
+                    html = f.read()
+            except OSError:
+                raise HttpError(404, "no such page")
+        data = json.dumps(meta.get("data"), ensure_ascii=False).replace("</", "<\\/")
+        boot = (f'<script>window.__canvasData = {data}; window.__canvasPage = "{token}";</script>'
+                '<script src="/live-bridge.js"></script>')
+        hm = re.search(r"<head[^>]*>", html, re.I)
+        html = html[:hm.end()] + boot + html[hm.end():] if hm else boot + html
+        out = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Cache-Control", "no-store")
+        self._security_headers()
+        self.send_header("Content-Security-Policy", LIVE_CSP)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(out)
 
     def _api_progress(self):
         """A one-line note of what the agent is doing now. Shown in the chat (folded into
@@ -2218,8 +2620,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _api_draw(self):
         body = self._read_json()
-        if body.get("type") == "image":
-            return self._draw_image(body)
+        if body.get("type") in CARD_TYPES:
+            return self._draw_card(body)
         svg = body.get("svg")
         if not isinstance(svg, str) or "<svg" not in svg.lower():
             raise HttpError(400, "svg (string containing an <svg> element) is required")
@@ -2304,6 +2706,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _remove_draw(self, item_id: str):
         st = self.store
+        with st.lock:
+            gone = next((it for it in st.layer if isinstance(it, dict) and it.get("id") == item_id), None)
+        if gone and gone.get("browser") and _browsers is not None:
+            _browsers.close(gone["browser"])
         with st.lock:
             before = len(st.layer)
             st.layer = [it for it in st.layer if not (isinstance(it, dict) and it.get("id") == item_id)]
@@ -2400,6 +2806,8 @@ def main(argv=None) -> int:
         pass
     finally:
         compact_all()
+        if _browsers is not None:
+            _browsers.shutdown()
         for sess in Handler.sessions.all():
             sess.hub.close_all()
         httpd.server_close()

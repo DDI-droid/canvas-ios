@@ -72,6 +72,19 @@ TOOLS = [
         },
     },
     {
+        "name": "open_website",
+        "description": (
+            "Open a website on the user's board as a live browser card (a real browser on their PC, "
+            "streamed into a card they can tap and scroll). Use when they ask to open, show or look up "
+            "a site. A bare name or a few words become a search."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"url": {"type": "string", "description": "An address (example.com) or what to search for."}},
+            "required": ["url"],
+        },
+    },
+    {
         "name": "dismiss",
         "description": (
             "What you heard wasn't meant for you: TV, someone else talking, background noise, your "
@@ -85,10 +98,25 @@ TOOLS = [
 
 def _token() -> str:
     try:
-        with open(os.path.join(BASE_DIR, "data", "token.txt"), "r", encoding="utf-8") as f:
+        data_dir = os.environ.get("CANVAS_DATA") or os.path.join(BASE_DIR, "data")
+        with open(os.path.join(data_dir, "token.txt"), "r", encoding="utf-8") as f:
             return f.read().strip()
     except OSError:
         return ""
+
+
+def _open_website(url: str) -> list:
+    body = json.dumps({"url": url}).encode("utf-8")
+    req = urllib.request.Request(CANVAS_URL + "/api/browser", data=body, method="POST", headers={
+        "X-Canvas-Key": _token(), "X-Canvas-Session": CANVAS_SESSION, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=40) as res:
+            res.read()
+    except urllib.error.HTTPError as exc:
+        return [{"type": "text", "text": f"It didn't open ({exc.read().decode('utf-8', 'replace')[:160]}). Tell the user briefly."}]
+    except (urllib.error.URLError, OSError) as exc:
+        return [{"type": "text", "text": f"It didn't open ({exc}). Tell the user briefly."}]
+    return [{"type": "text", "text": "It's on the board now as a browser card. Say so in a few words."}]
 
 
 def _look() -> list:
@@ -116,6 +144,8 @@ def _call(name: str, args: dict) -> tuple[list, bool]:
         return [{"type": "text", "text": "Written on the board."}], False
     if name == "dismiss":
         return [{"type": "text", "text": "Dismissed. End your turn."}], False
+    if name == "open_website":
+        return _open_website(str(args.get("url") or "")), False
     return [{"type": "text", "text": f"unknown tool {name}"}], True
 
 

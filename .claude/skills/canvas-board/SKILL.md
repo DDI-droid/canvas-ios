@@ -30,6 +30,16 @@ For SVGs, set a `viewBox`, use `font-family="-apple-system, system-ui, sans-seri
 `#1d1d1f`, blue `#0a84ff`, red `#ff3b30`, and text at least 16 px at the drawn width. Don't use
 scripts.
 
+**Cards** (without `--x/--y` they land in the middle of the view, or the nearest free spot):
+
+```bash
+python canvas_agent.py embed  -s <session> --file plot.png|clip.mp4|part.glb --label "…"   # image, video, 3D
+python canvas_agent.py chart  -s <session> --data d.json        # {type, title, x: [...], series: [{name, y: [...]}]}
+python canvas_agent.py update -s <session> --id <card> --data more.json --append   # live points
+python canvas_agent.py page   -s <session> --file demo.html     # a live, interactive page (sandboxed)
+python canvas_agent.py browse -s <session> --url example.com    # a real Chrome tab, streamed live
+```
+
 ## The voice assistant (Haiku) and you
 
 - **What it does:** it talks with the user hands-free and sees their screen. It can write **short

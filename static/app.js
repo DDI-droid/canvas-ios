@@ -7,6 +7,7 @@ import { Live, rankVoices } from './live.js';
 import { Viewer } from './viewer.js';
 import { Cards } from './cards.js';
 import { InkSync } from './inksync.js';
+import { BAR, BrowserStream, PageLink, pageFrame } from './livecards.js';
 import { buildSnapshot, buildTimeline, makeThumb } from './snapshot.js';
 import { api, EventStream, KEY, SESSION, sessionKey, switchSession, withKey } from './api.js';
 import { COLORS, inkColor } from './palette.js';
@@ -38,6 +39,16 @@ const board = new Board({
   hover: $('#hover'),
 });
 const layer = new ClaudeLayer($('#claudeLayer'));
+layer.liveOpts = {
+  // a video placed with a guessed shape (an agent's upload): fix it to the real one, for everyone
+  onAspect: (rec, aspect) => {
+    const height = rec.w * aspect + BAR;
+    if (Math.abs(height - rec.h) < 2) return;
+    const g = { x: rec.item.x, y: rec.item.y, width: rec.w, height };
+    layer.place(rec.item.id, g);
+    api.post('/api/draw/move', { id: rec.item.id, ...g }).catch(() => {});
+  },
+};
 // cards: tap to select, drag to move, corners to resize (same for every kind of card)
 const cards = new Cards({
   board,
@@ -248,6 +259,15 @@ board.addEventListener('camera', (e) => {
 // zoomed in on a photo card: show its full image rather than the light preview
 const sharpenCards = () => layer.sharpen(board.cam, board.viewRect(), board.dpr);
 board.addEventListener('settle', sharpenCards);
+// live cards run while on screen and rest off it (pages paused, browsers not fetching, video paused)
+let liveCheck = 0;
+const updateLiveCards = () => {
+  cancelAnimationFrame(liveCheck);
+  liveCheck = requestAnimationFrame(() => layer.updateVisibility(board.viewRect()));
+};
+board.addEventListener('settle', updateLiveCards);
+layer.addEventListener('change', updateLiveCards);
+document.addEventListener('visibilitychange', updateLiveCards);
 board.addEventListener('change', (e) => {
   if (e.detail.local) {
     ink.local(); // send just what changed
@@ -264,18 +284,111 @@ board.addEventListener('fingerdraw', () => {
 });
 // ---- media cards: a finger double-tap opens one full screen (the Pencil keeps drawing over them)
 const viewer = new Viewer($('#stage'));
+let stagePage = null; // the live page open full screen: {page, src, link}
+
 function openMedia(id) {
   const rec = layer.records.get(id);
-  if (!rec || rec.kind !== 'image') return false;
+  if (!rec || (rec.kind !== 'image' && !rec.live)) return false;
   cards.clear();
-  viewer.show({
-    src: withKey(rec.item.src),
-    title: rec.item.label || '',
-    aspect: rec.h / rec.w,
+  const base = {
+    title: rec.item.label || (rec.live ? rec.live.titleEl.textContent : '') || '',
     from: () => rec.host.getBoundingClientRect(),
-    onHide: (hidden) => { rec.host.style.visibility = hidden ? 'hidden' : ''; },
-  });
+    onHide: (hidden) => {
+      rec.host.style.visibility = hidden ? 'hidden' : '';
+      if (!rec.live) return;
+      // full screen runs its own copy: the card rests meanwhile (no double rendering or fetching)
+      layer.focused = hidden ? id : null;
+      if (!hidden) stagePage = null;
+      updateLiveCards();
+    },
+  };
+  if (rec.kind === 'image') {
+    viewer.show({ ...base, src: withKey(rec.item.src), aspect: rec.h / rec.w });
+    return true;
+  }
+  const aspect = (rec.h - BAR) / rec.w;
+  if (rec.kind === 'video') {
+    const card = rec.live.media;
+    const t = card.currentTime || 0;
+    card.pause();
+    viewer.show({ ...base, kind: 'video', aspect, mount: (frame) => {
+      const v = document.createElement('video');
+      Object.assign(v, { controls: true, playsInline: true, autoplay: true, className: 'stage-media', poster: card.poster });
+      v.setAttribute('playsinline', '');
+      v.src = withKey(rec.item.src);
+      v.addEventListener('loadedmetadata', () => { if (t) v.currentTime = t; v.play().catch(() => {}); }, { once: true });
+      frame.append(v);
+      return { destroy: () => { try { card.currentTime = v.currentTime; } catch { /* not loaded */ } v.pause(); v.removeAttribute('src'); v.load(); } };
+    } });
+  } else if (rec.kind === 'page') {
+    viewer.show({ ...base, kind: 'page', aspect, mount: (frame) => {
+      const f = pageFrame(rec.item.src, rec.item.label);
+      f.className = 'stage-media';
+      frame.append(f);
+      const link = new PageLink(f, { onReady: () => link.post({ type: 'visibility', visible: true }) });
+      stagePage = { page: rec.item.page, src: rec.item.src, link }; // live data reaches it too
+      return { destroy: () => { if (stagePage && stagePage.link === link) stagePage = null; link.destroy(); } };
+    } });
+  } else if (rec.kind === 'browser') {
+    viewer.show({ ...base, kind: 'browser', aspect, mount: (frame) => mountBrowser(frame, rec) });
+  }
   return true;
+}
+
+// A browser card full screen: the tab's picture (the finger is the tab's touch: taps click,
+// drags scroll), and in the top bar: back, forward, reload, the address, and a box to type into
+// the page (tap a field in the page first, type, Return).
+function mountBrowser(frame, rec) {
+  const img = document.createElement('img');
+  img.className = 'stage-media';
+  img.alt = '';
+  img.draggable = false;
+  frame.append(img);
+  const tools = document.createElement('div');
+  tools.className = 'stage-tools';
+  tools.innerHTML = '<button class="st-btn" data-b="back" aria-label="Back">‹</button>'
+    + '<button class="st-btn" data-b="forward" aria-label="Forward">›</button>'
+    + '<button class="st-btn" data-b="reload" aria-label="Reload">↻</button>'
+    + '<input class="st-url" type="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Address or search">'
+    + '<input class="st-type" type="text" autocapitalize="off" placeholder="Type into the page, then Return">';
+  const bar = viewer.root.querySelector('.stage-bar');
+  bar.insertBefore(tools, viewer.closeBtn);
+  const url = tools.querySelector('.st-url');
+  const typer = tools.querySelector('.st-type');
+  const stream = new BrowserStream(rec.item.browser, img, {
+    onMeta: (u) => { if (document.activeElement !== url && u) url.value = u; },
+  });
+  stream.start();
+  const send = (kind, extra) => stream.send(kind, 0, 0, 1, 1, extra);
+  tools.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-b]');
+    if (b) send(b.dataset.b);
+  });
+  url.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && url.value.trim()) { send('nav', { url: url.value.trim() }); url.blur(); }
+  });
+  typer.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    if (typer.value) send('text', { text: typer.value });
+    send('key', { key: 'Enter' });
+    typer.value = '';
+  });
+  let down = false, last = 0;
+  const pos = (e) => { const r = img.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top, r.width, r.height]; };
+  img.addEventListener('pointerdown', (e) => {
+    down = true;
+    img.setPointerCapture(e.pointerId);
+    stream.send('down', ...pos(e));
+  });
+  img.addEventListener('pointermove', (e) => {
+    if (!down || performance.now() - last < 33) return;
+    last = performance.now();
+    stream.send('move', ...pos(e));
+  });
+  const up = (e) => { if (!down) return; down = false; stream.send('up', ...pos(e)); };
+  img.addEventListener('pointerup', up);
+  img.addEventListener('pointercancel', up);
+  return { destroy: () => { stream.destroy(); tools.remove(); } };
 }
 board.onDoubleTap = ({ wx, wy }) => {
   const id = layer.hitTest(wx, wy, 6 / board.cam.z);
@@ -313,28 +426,85 @@ $('#fileInput').addEventListener('change', async (e) => {
   e.target.value = '';
   let i = 0;
   for (const file of files) {
-    if (!file.type.startsWith('image/')) { toast('Only images for now.', { tone: 'error' }); continue; }
-    if (file.size > 60 * 1024 * 1024) { toast(`${file.name} is too big (max 60 MB).`, { tone: 'error' }); continue; }
+    const kind = fileKind(file);
+    if (!kind) { toast(`${file.name}: images, videos and 3D models (glb, gltf, obj, stl) only.`, { tone: 'error' }); continue; }
     try {
-      const { blob, aspect } = await prepareImage(file);
-      const up = await api.post('/api/media', blob, { timeout: 120000 });
       const v = board.viewRect();
       const vw = v[2] - v[0], vh = v[3] - v[1];
-      let width = vw * 0.42;
-      if (width * aspect > vh * 0.7) width = (vh * 0.7) / aspect;
-      const off = i * Math.min(vw, vh) * 0.04;
-      await api.post('/api/draw', {
-        type: 'image', src: up.src, aspect, width,
-        x: v[0] + (vw - width) / 2 + off, y: v[1] + (vh - width * aspect) / 2 + off,
-        label: file.name && !/^image\.(jpe?g|png|heic)$/i.test(file.name) ? file.name.replace(/\.[^.]+$/, '') : '',
-      });
+      const label = file.name && !/^(image|video|IMG_\d+|trim\.[\w-]+)\.\w+$/i.test(file.name) ? file.name.replace(/\.[^.]+$/, '') : '';
+      // its size here; the server puts it in the middle of this view, or the nearest free spot
+      const place = (aspect, share = 0.42, bar = 0) => {
+        let width = vw * share;
+        if (width * aspect + bar > vh * 0.75) width = (vh * 0.75 - bar) / aspect;
+        return { width, view: v };
+      };
+      if (kind === 'image') {
+        if (file.size > 60 * 1024 * 1024) throw new Error('too big (max 60 MB)');
+        const { blob, aspect } = await prepareImage(file);
+        const up = await api.post('/api/media', blob, { timeout: 120000 });
+        await api.post('/api/draw', { type: 'image', src: up.src, aspect, label, ...place(aspect) });
+      } else if (kind === 'video') {
+        toast(`Uploading ${file.name}…`, { ms: 4000 });
+        const { aspect, poster } = await probeVideo(file);
+        const up = await api.post('/api/media', file, { type: videoType(file), timeout: 30 * 60000 });
+        if (poster) await api.post(`/api/media/poster?for=${encodeURIComponent(up.src.split('/').pop())}`, poster).catch(() => {});
+        await api.post('/api/draw', { type: 'video', src: up.src, aspect, label, ...place(aspect, 0.42, BAR) });
+      } else {
+        const up = await api.post('/api/media', file, { type: modelType(file), timeout: 600000 });
+        const page = await api.post('/api/page', { template: 'model', data: { src: `media/${up.src.split('/').pop()}` }, title: label });
+        await api.post('/api/draw', { type: 'page', page: page.page, aspect: 0.75, label: label || '3D model', ...place(0.75, 0.42, BAR) });
+      }
       i++;
     } catch (err) {
-      toast(`Couldn’t add ${file.name || 'the image'}: ${err.message}`, { tone: 'error' });
+      toast(`Couldn’t add ${file.name || 'that file'}: ${err.message}`, { tone: 'error' });
     }
   }
-  if (i) toast(i === 1 ? 'Image added. Double-tap it to open.' : `${i} images added.`);
+  if (i) toast(i === 1 ? 'Added. Double-tap it to open full screen.' : `${i} added.`);
 });
+
+function fileKind(file) {
+  if (file.type.startsWith('image/')) return 'image';
+  if (file.type.startsWith('video/') || /\.(mp4|m4v|mov|webm)$/i.test(file.name)) return 'video';
+  if (/\.(glb|gltf|obj|stl)$/i.test(file.name)) return 'model';
+  return null;
+}
+function videoType(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  return { mov: 'video/quicktime', webm: 'video/webm', m4v: 'video/x-m4v' }[ext] || (file.type.startsWith('video/') ? file.type : 'video/mp4');
+}
+function modelType(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  return { glb: 'model/gltf-binary', gltf: 'model/gltf+json', obj: 'model/obj', stl: 'model/stl' }[ext];
+}
+// A video's shape and first frame, read here before uploading (no server-side tools needed).
+async function probeVideo(file) {
+  const v = document.createElement('video');
+  v.muted = true;
+  v.playsInline = true;
+  v.preload = 'auto';
+  const url = URL.createObjectURL(file);
+  v.src = url;
+  try {
+    await new Promise((res, rej) => { v.onloadeddata = res; v.onerror = rej; setTimeout(rej, 15000); });
+    const aspect = v.videoWidth ? v.videoHeight / v.videoWidth : 0.5625;
+    v.currentTime = Math.min(0.5, (v.duration || 1) / 10);
+    await new Promise((res) => { v.onseeked = res; setTimeout(res, 3000); });
+    const k = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
+    const c = document.createElement('canvas');
+    c.width = Math.round(v.videoWidth * k);
+    c.height = Math.round(v.videoHeight * k);
+    c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+    const poster = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.82));
+    c.width = c.height = 0;
+    return { aspect, poster };
+  } catch {
+    return { aspect: 0.5625, poster: null };
+  } finally {
+    v.removeAttribute('src');
+    v.load();
+    URL.revokeObjectURL(url);
+  }
+}
 
 // tell the server where you're looking, so agents and the voice place things in view
 const reportView = debounce(() => {
@@ -1387,6 +1557,17 @@ events.addEventListener('draw', (e) => {
   }
 });
 events.addEventListener('draw_remove', (e) => e.detail && layer.remove(e.detail.id));
+// a live card's new data (charts growing, an agent's page updating): straight into its page
+events.addEventListener('card_data', (e) => {
+  const rec = e.detail && layer.byPage(e.detail.page);
+  if (rec) rec.live.data(e.detail);
+  if (e.detail && stagePage && stagePage.page === e.detail.page) stagePage.link.data(e.detail);
+});
+events.addEventListener('page_reload', (e) => {
+  const rec = e.detail && layer.byPage(e.detail.page);
+  if (rec) rec.live.reload();
+  if (e.detail && stagePage && stagePage.page === e.detail.page) stagePage.link.reload(stagePage.src);
+});
 // a card was moved or resized (here or on another device): just reposition it
 events.addEventListener('draw_move', (e) => {
   const g = e.detail;

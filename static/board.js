@@ -1109,9 +1109,17 @@ export class Board extends EventTarget {
       if (e.button !== 0) return;
       // the mouse can move / resize a selected card too (handy on the PC)
       const part = this.cardHooks && !this.action ? this.cardHooks.hit(e.clientX, e.clientY) : null;
-      if (part && this.cardHooks.begin(part, e.clientX, e.clientY)) {
+      const use = !part && this.cardHooks && !this.action ? this.cardHooks.useAt(e.clientX, e.clientY) : null;
+      if ((part && this.cardHooks.begin(part, e.clientX, e.clientY))
+          || (use && use.part === 'bar' && this.cardHooks.grabBar(use.id, e.clientX, e.clientY))) {
         this._capture(e);
         this.action = { kind: 'card', id: e.pointerId, type: 'mouse' };
+        return;
+      }
+      if (use && use.part === 'content') { // the mouse uses live cards too (handy on the PC)
+        this._capture(e);
+        this.cardHooks.useStart(use, e.clientX, e.clientY);
+        this.action = { kind: 'use', id: e.pointerId, type: 'mouse' };
         return;
       }
     }
@@ -1180,6 +1188,10 @@ export class Board extends EventTarget {
       this.cardHooks.move(e.clientX, e.clientY);
       return;
     }
+    if (a.kind === 'use') {
+      this.cardHooks.useMove(e.clientX, e.clientY);
+      return;
+    }
     const events = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
     const list = events && events.length ? events : [e];
     if (a.kind === 'stroke') {
@@ -1236,6 +1248,9 @@ export class Board extends EventTarget {
       if (!discard) this._finishLasso(a);
     } else if (a.kind === 'card') {
       this.cardHooks.end(!!discard);
+    } else if (a.kind === 'use') {
+      if (discard || !e) this.cardHooks.useCancel();
+      else this.cardHooks.useEnd(e.clientX, e.clientY);
     } else if (a.kind === 'move') {
       const ids = this.selection ? this.selection.ids : new Set();
       let area = this.selection ? this.selection.bbox : null; // where they were lifted from
@@ -1418,8 +1433,12 @@ export class Board extends EventTarget {
       const p = this._pt(e);
       // a finger on the selected card (or one of its corners) arranges it
       const part = this.cardHooks && !this.action ? this.cardHooks.hit(e.clientX, e.clientY) : null;
+      const use = !part && this.cardHooks && !this.action && !this.fingerDraw ? this.cardHooks.useAt(e.clientX, e.clientY) : null;
       if (part && this.cardHooks.begin(part, e.clientX, e.clientY)) {
         this.gesture.owner = 'card';
+        this.gesture.cardPointer = e.pointerId;
+      } else if (use && use.part === 'bar' && this.cardHooks.grabBar(use.id, e.clientX, e.clientY)) {
+        this.gesture.owner = 'card'; // a live card's title strip: arranging, like a window's
         this.gesture.cardPointer = e.pointerId;
       } else if (this.fingerDraw && !this.action) {
         this._startAction(e, 'touch');
@@ -1427,6 +1446,10 @@ export class Board extends EventTarget {
       } else if (this.selection && this._inSelection(p) && !this.action) {
         this._beginMove(e, p, 'touch');
         this.gesture.owner = 'action';
+      } else if (use && use.part === 'content') {
+        this.cardHooks.useStart(use, e.clientX, e.clientY); // a finger on a live card: using it
+        this.gesture.owner = 'use';
+        this.gesture.cardPointer = e.pointerId;
       }
       if (this.gesture.owner !== 'card' && !(e.width > 60 || e.height > 60)) this._startLongPress(e); // large contact = palm
     } else {
@@ -1436,6 +1459,9 @@ export class Board extends EventTarget {
       if (g.owner === 'card') {
         // a second finger: keep the card where it is now and let two fingers move the board
         this.cardHooks.end(false);
+        g.owner = null;
+      } else if (g.owner === 'use') {
+        this.cardHooks.useCancel(); // two fingers move the board, wherever they are
         g.owner = null;
       }
       if (this.action && this.action.type === 'touch') {
@@ -1471,10 +1497,14 @@ export class Board extends EventTarget {
       return;
     }
     const g = this.gesture;
-    if (g && g.owner === 'card') {
+    if (g && (g.owner === 'card' || g.owner === 'use')) {
       if (e.pointerId === g.cardPointer) {
-        this.cardHooks.move(e.clientX, e.clientY);
-        if (!g.moved && Math.hypot(t.x - t.sx, t.y - t.sy) > PAN_SLOP) g.moved = true;
+        if (g.owner === 'card') this.cardHooks.move(e.clientX, e.clientY);
+        else this.cardHooks.useMove(e.clientX, e.clientY);
+        if (!g.moved && Math.hypot(t.x - t.sx, t.y - t.sy) > PAN_SLOP) {
+          g.moved = true;
+          this._cancelLongPress();
+        }
       }
       return;
     }
@@ -1508,6 +1538,9 @@ export class Board extends EventTarget {
     if (g && g.owner === 'card' && e.pointerId === g.cardPointer) {
       // a press on the selected card that never moved is still a tap (a double-tap opens it)
       if (!this.cardHooks.end(!!cancelled)) g.owner = null;
+    } else if (g && g.owner === 'use' && e.pointerId === g.cardPointer) {
+      if (cancelled) this.cardHooks.useCancel();
+      else this.cardHooks.useEnd(e.clientX, e.clientY); // taps and double-taps are the card's own
     }
     if (this.touches.size === 0) {
       if (g && !cancelled && !g.moved && !g.suspended && !g.owner) {
@@ -1547,6 +1580,9 @@ export class Board extends EventTarget {
       // most likely a palm on a selected card as the Pencil lands: put the card back
       this.cardHooks.end(true);
       g.owner = null;
+    } else if (g.owner === 'use') {
+      this.cardHooks.useCancel(); // a palm on a live card as the Pencil lands
+      g.owner = null;
     }
     if (g.moved && performance.now() - g.t0 < 450) {
       this.setCamera(g.camStart.x, g.camStart.y, g.camStart.z);
@@ -1563,6 +1599,7 @@ export class Board extends EventTarget {
       const handled = this.onLongPress({ x, y, wx: (x - this.cam.x) / this.cam.z, wy: (y - this.cam.y) / this.cam.z });
       if (handled) {
         if (this.action && this.action.type === 'touch') this._endAction(null, true);
+        if (g.owner === 'use') this.cardHooks.useCancel(); // a long-press arranges, even on live content
         g.owner = 'longpress';
         // a long-press on a card selects it and picks it up: keep moving to drag it
         if (handled === 'card' && this.cardHooks && this.touches.size === 1) {

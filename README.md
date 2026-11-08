@@ -223,6 +223,11 @@ All JSON bodies are UTF-8; all routes need the token.
 | `POST /api/reply` | `{text: markdown, status?}` → `{id}`; appends a `claude` message, pushes SSE `reply`, sets status (default `idle`). |
 | `POST /api/status` | `{status: "thinking"\|"idle"\|<short text>}` → `{ok, status}`; pushes SSE `status`. |
 | `POST /api/draw` | `{svg, x, y, width?, height?, id?, label?}` → `{id}`; upserts into `claude_layer.json`, pushes SSE `draw`. |
+| `POST /api/draw` (cards) | `{type: image\|video\|page\|browser, src\|page\|browser, aspect?, x?, y?, width?, label?, view?}`; without x/y the card goes in the middle of the view or the nearest free spot. |
+| `POST /api/media` | raw body (image, video, 3D model; up to 1 GB) → `{src}`; `POST /api/media/poster?for=<file>` a video's first frame. |
+| `POST /api/page` | `{html}` or `{template: chart\|model, data}`, `title?` → `{page, src}`; served keyless at `/live/<token>/` (sandboxed, with `live-bridge.js`). |
+| `POST /api/card/data` | `{id\|page, data, mode: replace\|append}` → live data into the card's page (`canvas:data` event). |
+| `POST /api/browser` | `{url, label?}` → a browser card (headless Chrome on this PC, `browser.py`); `GET /api/browser/<tab>/frame?after=N` (JPEG long-poll), `POST /api/browser/<tab>/input`. |
 | `POST /api/draw/remove` | `{id}` → `{ok}` (404 if unknown); also `DELETE /api/draw/<id>`. Pushes `draw_remove`. |
 | `POST /api/draw/clear` | `{}` → `{ok, removed}`; pushes `draw_clear`. |
 | `PUT /api/strokes` | page → server (debounced): `{strokes: [...], client}`; persists `strokes.json`, pushes `strokes`. |
@@ -259,6 +264,11 @@ in world units; `color` is a palette key (`ink, blue, red, green, orange, purple
 - Keyboard: `P/H/E/L` tools, `1–8` colours, `[ ]` width, `⌘Z / ⇧⌘Z` undo/redo, `⌘↩` send,
   `M` mic, `F` fit, `0` 100 %, `Delete` removes the selection; mouse: wheel pans, ⌘/Ctrl-wheel zooms,
   Space-drag or middle-drag pans.
+- **Cards** (images, videos, 3D models, charts, live pages, browser tabs): tap a card to select it
+  (drag to move, corners to resize), double-tap to open it full screen, ✕ to come back. On live
+  cards a finger *uses* the content (play, scroll, tap links, turn the model) and the title strip
+  arranges it; the Pencil always draws over everything. **+** adds images, videos and 3D models
+  (glb, gltf, obj, stl). Off screen, live cards rest (pages pause, browsers stop streaming).
 - **Mic**: toggles Web Speech recognition (continuous, interim results, auto-restart). Final speech
   lands in the composer; live words show above it. You can keep drawing while listening.
 - **Send** (bottom-left arrow or the composer's arrow) captures the snapshot + timeline and posts it.

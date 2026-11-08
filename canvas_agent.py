@@ -12,7 +12,12 @@ canvas link is reachable. Python 3.8+, standard library only.
   python canvas_agent.py status -s NAME "Running the sweep..."
   python canvas_agent.py draw   -s NAME --svg fig.svg --x X --y Y [--width W] [--id ID] [--label L]
   python canvas_agent.py draw   -s NAME --list | --remove ID | --clear
-  python canvas_agent.py embed  -s NAME --file chart.png [--x X --y Y --width W] [--label L] [--id ID]
+  python canvas_agent.py embed  -s NAME --file chart.png|clip.mp4|part.glb [--x X --y Y --width W] [--label L] [--id ID]
+  python canvas_agent.py page   -s NAME --file demo.html [--label L]     # a live, interactive HTML card
+  python canvas_agent.py chart  -s NAME --data d.json [--title T]       # {type, x, series: [{name, y}]}
+  python canvas_agent.py model  -s NAME --file part.glb|.gltf|.obj|.stl  # a 3D model you can turn
+  python canvas_agent.py update -s NAME --id CARD --data d.json [--append]  # live data for a card
+  python canvas_agent.py browse -s NAME --url example.com [--label L]   # a live browser card
   python canvas_agent.py sessions
 
 The link (with its secret key) is saved in ~/.canvas_agent/config.json by `connect`, or taken
@@ -179,6 +184,22 @@ def _request(cfg: dict, sid: str | None, method: str, path: str, payload=None, t
         return body
     text = body.decode("utf-8")
     return json.loads(text) if text.strip() else {}
+
+
+def upload(cfg: dict, sid: str, path: str, mime: str, timeout: float = 1800) -> dict:
+    """Send a file to the canvas as it is (no base64): images, videos, 3D models."""
+    with open(path, "rb") as f:
+        data = f.read()
+    headers = {"X-Canvas-Key": cfg["key"], "X-Canvas-Session": sid, "User-Agent": UA,
+               "Accept": "application/json", "Content-Type": mime}
+    req = urllib.request.Request(cfg["origin"] + "/api/media", data=data, method="POST", headers=headers)
+    try:
+        with opener_for(cfg["origin"]).open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        die(f"HTTP {e.code} uploading {os.path.basename(path)}: {e.read().decode('utf-8', 'replace')[:200]}")
+    except (urllib.error.URLError, OSError) as e:
+        die(f"can't reach the canvas at {cfg['origin']} ({getattr(e, 'reason', e)})")
 
 
 def call(cfg: dict, sid: str | None, method: str, path: str, payload=None, timeout: float = 30):
@@ -367,6 +388,8 @@ def cmd_draw(args) -> None:
 
 IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
               ".webp": "image/webp", ".avif": "image/avif", ".heic": "image/heic"}
+VIDEO_MIME = {".mp4": "video/mp4", ".m4v": "video/x-m4v", ".mov": "video/quicktime", ".webm": "video/webm"}
+MODEL_MIME = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json", ".obj": "model/obj", ".stl": "model/stl"}
 
 
 def image_size(raw: bytes):
@@ -393,24 +416,98 @@ def image_size(raw: bytes):
     return None
 
 
+def card_place(args) -> dict:
+    return {k: v for k, v in (("x", args.x), ("y", args.y), ("width", args.width), ("id", args.id),
+                              ("label", args.label)) if v is not None}
+
+
 def cmd_embed(args) -> None:
-    cfg = load_config()
+    """An image, a video or a 3D model as a card (by its file type)."""
     ext = os.path.splitext(args.file)[1].lower()
+    if ext in MODEL_MIME:
+        return cmd_model(args)
+    cfg = load_config()
+    if ext in VIDEO_MIME:
+        up = upload(cfg, args.session, args.file, VIDEO_MIME[ext])
+        # its real shape and first frame are filled in by the first page that shows it
+        res = call(cfg, args.session, "POST", "/api/draw", {"type": "video", "src": up["src"], "aspect": 9 / 16, **card_place(args)})
+        print(f"embedded video {res.get('id')} ({up.get('bytes', 0) / 1e6:.1f} MB): tap to play, double-tap for full screen")
+        return
     mime = IMAGE_MIME.get(ext)
     if not mime:
-        die("only images for now: png, jpg, gif, webp, avif, heic")
+        die("images (png, jpg, gif, webp, avif, heic), videos (mp4, mov, m4v, webm) or 3D models (glb, gltf, obj, stl)")
     with open(args.file, "rb") as f:
         raw = f.read()
-    up = call(cfg, args.session, "POST", "/api/media",
-              {"data": base64.b64encode(raw).decode("ascii"), "mime": mime}, timeout=180)
-    payload = {"type": "image", "src": up["src"], "x": args.x, "y": args.y, "width": args.width,
-               "id": args.id, "label": args.label}
+    up = upload(cfg, args.session, args.file, mime)
+    payload = {"type": "image", "src": up["src"], **card_place(args)}
     size = image_size(raw)
     if size and size[0]:
         payload["aspect"] = size[1] / size[0]
-    res = call(cfg, args.session, "POST", "/api/draw", {k: v for k, v in payload.items() if v is not None})
+    res = call(cfg, args.session, "POST", "/api/draw", payload)
     print(f"embedded {res.get('id')} at ({res.get('x', 0):.0f}, {res.get('y', 0):.0f}), "
           f"width {res.get('width', 0):.0f} (double-tap it on the iPad to open full screen)")
+
+
+def _page_card(cfg, args, page: dict, aspect: float) -> None:
+    res = call(cfg, args.session, "POST", "/api/draw", {"type": "page", "page": page["page"], "aspect": aspect, **card_place(args)})
+    print(f"card {res.get('id')} (page {page['page']}): live on the board; "
+          f"update its data with: update -s {args.session} --id {res.get('id')} --data new.json")
+
+
+def cmd_page(args) -> None:
+    """A live HTML page as a card: interactive in place (a finger uses it) and full screen.
+    It runs sandboxed; it can load /vendor/three/... and /vendor/chartjs/... from the canvas, or
+    libraries from the web. Live data: window.addEventListener('canvas:data', e => e.detail.data)."""
+    cfg = load_config()
+    with open(args.file, "rb") as f:
+        html = f.read().decode("utf-8-sig")
+    page = call(cfg, args.session, "POST", "/api/page", {"html": html, "title": args.label or os.path.basename(args.file)})
+    _page_card(cfg, args, page, args.aspect or 0.66)
+
+
+def cmd_chart(args) -> None:
+    """A chart card from data: {type: line|bar|scatter|area, title?, x: [...], series: [{name, y: [...]}],
+    xLabel?, yLabel?}. Grows live with: update --append --data {x: [...], series: [{name, y: [...]}]}."""
+    cfg = load_config()
+    with open(args.data, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if args.type:
+        data["type"] = args.type
+    if args.title:
+        data["title"] = args.title
+    page = call(cfg, args.session, "POST", "/api/page", {"template": "chart", "data": data, "title": data.get("title") or args.label})
+    args.label = args.label or data.get("title")
+    _page_card(cfg, args, page, args.aspect or 0.62)
+
+
+def cmd_model(args) -> None:
+    """A 3D model card (glb, gltf, obj, stl): turn it with a finger; it turns slowly by itself until touched."""
+    cfg = load_config()
+    ext = os.path.splitext(args.file)[1].lower()
+    if ext not in MODEL_MIME:
+        die("3D models: glb, gltf (single file), obj or stl")
+    up = upload(cfg, args.session, args.file, MODEL_MIME[ext])
+    name = up["src"].rsplit("/", 1)[1]
+    page = call(cfg, args.session, "POST", "/api/page", {"template": "model", "data": {"src": f"media/{name}"},
+                                                        "title": args.label or os.path.basename(args.file)})
+    args.label = args.label or os.path.splitext(os.path.basename(args.file))[0]
+    _page_card(cfg, args, page, getattr(args, "aspect", None) or 0.75)
+
+
+def cmd_update(args) -> None:
+    """New data for a live card (chart or page). --append adds points to a chart."""
+    cfg = load_config()
+    with open(args.data, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    call(cfg, args.session, "POST", "/api/card/data", {"id": args.id, "data": data, "mode": "append" if args.append else "replace"})
+    print("updated")
+
+
+def cmd_browse(args) -> None:
+    """A live browser card: a real Chrome tab on the canvas's PC, streamed into the card."""
+    cfg = load_config()
+    res = call(cfg, args.session, "POST", "/api/browser", {"url": args.url, **card_place(args)}, timeout=60)
+    print(f"browser card {res.get('id')} -> {args.url}: tap and scroll it on the iPad, double-tap for full screen")
 
 
 def cmd_setup(args) -> None:
@@ -590,14 +687,49 @@ def main() -> None:
     p.add_argument("--clear", action="store_true")
     p.set_defaults(fn=cmd_draw)
 
-    p = with_session(sub.add_parser("embed", help="put an image on the board as a card"))
-    p.add_argument("--file", required=True, help="png, jpg, gif, webp, avif or heic")
+    p = with_session(sub.add_parser("embed", help="put an image, video or 3D model on the board as a card"))
+    p.add_argument("--file", required=True, help="an image (png, jpg, gif, webp, avif, heic), video (mp4, mov, m4v, webm) or 3D model (glb, gltf, obj, stl)")
     p.add_argument("--x", type=float, help="world x (default: centred in the user's view)")
     p.add_argument("--y", type=float)
     p.add_argument("--width", type=float, help="world width (default: ~40%% of the view)")
     p.add_argument("--label")
     p.add_argument("--id")
     p.set_defaults(fn=cmd_embed)
+
+    def placing(p):
+        p.add_argument("--x", type=float, help="world x (default: centred in the user's view)")
+        p.add_argument("--y", type=float)
+        p.add_argument("--width", type=float, help="world width")
+        p.add_argument("--label")
+        p.add_argument("--id")
+        return p
+
+    p = placing(with_session(sub.add_parser("page", help="a live, interactive HTML page as a card")))
+    p.add_argument("--file", required=True)
+    p.add_argument("--aspect", type=float, help="height / width of the page area (default 0.66)")
+    p.set_defaults(fn=cmd_page)
+
+    p = placing(with_session(sub.add_parser("chart", help="a chart card from JSON data (updates live)")))
+    p.add_argument("--data", required=True, help="{type, title?, x: [...], series: [{name, y: [...]}]}")
+    p.add_argument("--type", choices=["line", "bar", "scatter", "area"])
+    p.add_argument("--title")
+    p.add_argument("--aspect", type=float)
+    p.set_defaults(fn=cmd_chart)
+
+    p = placing(with_session(sub.add_parser("model", help="a 3D model card (glb, gltf, obj, stl)")))
+    p.add_argument("--file", required=True)
+    p.add_argument("--aspect", type=float)
+    p.set_defaults(fn=cmd_model)
+
+    p = with_session(sub.add_parser("update", help="new data for a live card (chart / page)"))
+    p.add_argument("--id", required=True, help="the card id")
+    p.add_argument("--data", required=True, help="a JSON file")
+    p.add_argument("--append", action="store_true", help="add points to a chart instead of replacing")
+    p.set_defaults(fn=cmd_update)
+
+    p = placing(with_session(sub.add_parser("browse", help="a live browser card (a real Chrome tab on the PC)")))
+    p.add_argument("--url", required=True)
+    p.set_defaults(fn=cmd_browse)
 
     p = sub.add_parser("sessions", help="list the canvas sessions")
     p.set_defaults(fn=cmd_sessions)

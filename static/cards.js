@@ -15,6 +15,9 @@
 // While a card moves, only its CSS transform changes (GPU work, no re-layout); the new place
 // and size are committed when you let go, then saved to the server, which tells every page.
 import { clamp } from './util.js';
+import { BAR } from './livecards.js';
+
+const TAP_HOLD = 260;     // ms a tap on live content waits for a second tap (= full screen)
 
 const DRAG_SLOP = 7;      // px before a press on a selected card becomes a move (same as panning)
 const HANDLE_HIT = 24;    // px around a corner that grabs its handle (a ~48 px target)
@@ -31,8 +34,11 @@ export class Cards {
     this.bar = el.querySelector('.card-actions');
     this.openBtn = el.querySelector('[data-card="open"]');
     this.onCommit = onCommit;
+    this.onOpen = onOpen;
     this.id = null;
     this.drag = null;
+    this.using = null;     // a finger using a live card's content
+    this.heldTap = null;   // a tap on live content, held briefly in case a second one follows
     this._bar = null; // cached pill size
     el.querySelector('[data-card="open"]').addEventListener('click', () => {
       const id = this.id;
@@ -74,7 +80,7 @@ export class Cards {
       void this.bar.offsetWidth;
       this.bar.style.animation = '';
     }
-    this.openBtn.hidden = rec.kind !== 'image';
+    this.openBtn.hidden = rec.kind !== 'image' && !rec.live;
     this._bar = null;
     this.sync();
   }
@@ -96,7 +102,7 @@ export class Cards {
     const r = this._rect(rec);
     const { x, y, z } = this.board.cam;
     return { left: r[0] * z + x, top: r[1] * z + y, width: (r[2] - r[0]) * z, height: (r[3] - r[1]) * z,
-             radius: rec.kind === 'image' ? 14 * z : 8 };
+             radius: rec.kind === 'image' || rec.live ? 14 * z : 8 };
   }
 
   // What's under a screen point on the selected card: a corner ('nw' | 'ne' | 'sw' | 'se'),
@@ -118,6 +124,86 @@ export class Cards {
     if (best) return best;
     if (sx >= r.left && sx <= r.left + r.width && sy >= r.top && sy <= r.top + r.height) return 'body';
     return null;
+  }
+
+  // ---- using a live card (video, page, browser): the board routes the finger here
+  // What a finger at a screen point would do to a live card: null (not on one, or it's the
+  // selected card: that's arranging), {part: 'bar'} (its title strip: arrange), or use.
+  useAt(sx, sy) {
+    const { x, y, z } = this.board.cam;
+    const wx = (sx - x) / z, wy = (sy - y) / z;
+    const id = this.layer.hitTest(wx, wy, 0);
+    const rec = id && this.layer.records.get(id);
+    if (!rec || !rec.live || id === this.id) return null;
+    const r = this.layer.rectOf(rec);
+    if (wy - r[1] < BAR) return { id, part: 'bar' };
+    return { id, rec, part: 'content' };
+  }
+
+  // content-local CSS px (the card's world units, which are its content's CSS pixels)
+  _local(rec, sx, sy) {
+    const { x, y, z } = this.board.cam;
+    const r = this.layer.rectOf(rec);
+    return { x: (sx - x) / z - r[0], y: (sy - y) / z - r[1] - BAR };
+  }
+
+  // The title strip: select the card and pick it up (a drag moves it at once; a tap selects).
+  grabBar(id, sx, sy) {
+    this.select(id);
+    return this.begin('body', sx, sy);
+  }
+
+  useStart(t, sx, sy) {
+    this.using = { id: t.id, rec: t.rec, sx, sy, moved: false, sent: false };
+  }
+
+  useMove(sx, sy) {
+    const u = this.using;
+    if (!u) return;
+    const p = this._local(u.rec, sx, sy);
+    if (!u.moved) {
+      if (Math.hypot(sx - u.sx, sy - u.sy) <= DRAG_SLOP) return;
+      u.moved = true;
+      if (u.rec.kind !== 'video') { // a drag: the content gets it from where it started, live
+        const p0 = this._local(u.rec, u.sx, u.sy);
+        u.rec.live.input('down', p0.x, p0.y);
+        u.sent = true;
+      }
+    }
+    if (u.sent) u.rec.live.input('move', p.x, p.y);
+  }
+
+  // Let go. A drag ends; a tap waits a moment: a second tap opens the card full screen, else
+  // the first one reaches the content (a click, or play / pause).
+  useEnd(sx, sy) {
+    const u = this.using;
+    this.using = null;
+    if (!u) return;
+    const p = this._local(u.rec, sx, sy);
+    if (u.sent) {
+      u.rec.live.input('up', p.x, p.y);
+      return;
+    }
+    if (u.moved) return;
+    const held = this.heldTap;
+    if (held && held.id === u.id && performance.now() - held.t < TAP_HOLD + 120) {
+      clearTimeout(held.timer);
+      this.heldTap = null;
+      this.onOpen(u.id); // double-tap: full screen
+      return;
+    }
+    if (held) { clearTimeout(held.timer); held.fire(); }
+    const fire = () => {
+      if (this.heldTap && this.heldTap.fire === fire) this.heldTap = null;
+      if (this.layer.records.get(u.id) === u.rec) u.rec.live.input('tap', p.x, p.y);
+    };
+    this.heldTap = { id: u.id, t: performance.now(), fire, timer: setTimeout(fire, TAP_HOLD) };
+  }
+
+  useCancel() {
+    const u = this.using;
+    this.using = null;
+    if (u && u.sent) u.rec.live.input('cancel', 0, 0);
   }
 
   // ---- drag (board calls these: begin on press, move on every pointermove, end on release)
