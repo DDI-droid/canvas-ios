@@ -22,11 +22,14 @@ This repo is also a Claude Code plugin. On every machine where you run Claude Co
 computer, a cloud server you log into), install it once:
 
 ```
-/plugin install canvas --marketplace DDI-droid/canvas-ios
+/plugin marketplace add https://github.com/DDI-droid/canvas-ios.git
+/plugin install canvas@ddi-canvas
 ```
 
-On older Claude Code versions, use the two-step form: `/plugin marketplace add DDI-droid/canvas-ios`,
-then `/plugin install canvas@ddi-canvas`. The repo is private, so the machine must be logged in to GitHub.
+The repo is private, so git on that machine must be able to sign in to GitHub without asking. The
+simplest way is `gh auth login`, then `gh auth setup-git`. On the PC that hosts the canvas, git
+already signs in through the repo's own credential helper. To pick up a new version later, run
+`claude plugin marketplace update ddi-canvas`.
 
 Then, in any session:
 
