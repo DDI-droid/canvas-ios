@@ -73,5 +73,27 @@
       window.dispatchEvent(new CustomEvent('canvas:visibility', { detail: { visible: !!m.visible } }));
     }
   });
+  // outside links (another site, or a new tab) open in this same card as a live browser: the
+  // canvas does it (a sandboxed page can't open tabs, and a card is one page at a time)
+  function outside(href, target) {
+    try {
+      var u = new URL(href, location.href);
+      return /^https?:$/.test(u.protocol) && (u.origin !== location.origin || (!!target && target !== '_self'));
+    } catch (e) { return false; }
+  }
+  document.addEventListener('click', function (e) {
+    var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+    if (!a || e.defaultPrevented || !outside(a.href, a.getAttribute('target'))) return;
+    e.preventDefault();
+    parent.postMessage({ canvas: 1, type: 'link', url: new URL(a.href, location.href).href }, '*');
+  }, true);
+  var open0 = window.open;
+  window.open = function (u) {
+    if (u && outside(u, '_blank')) {
+      parent.postMessage({ canvas: 1, type: 'link', url: new URL(u, location.href).href }, '*');
+      return null;
+    }
+    return open0.apply(window, arguments);
+  };
   window.addEventListener('load', function () { parent.postMessage({ canvas: 1, type: 'ready' }, '*'); });
 })();

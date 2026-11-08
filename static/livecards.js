@@ -10,6 +10,7 @@
 import { api, KEY, SESSION, withKey } from './api.js';
 
 export const BAR = 30;                                    // world px: the title strip
+export const BACK_W = 40;                                 // world px: ‹ at the start of a browsing page's strip
 export const LIVE_KINDS = new Set(['video', 'page', 'browser']);
 const BROWSER_W = 1280, BROWSER_H = 800;                   // a browser tab's own pixels (browser.py)
 
@@ -24,6 +25,7 @@ export const LIVE_STYLE =
   '.bar .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
   '.bar .k{flex:none;font-weight:500;color:#8e8e93}' +
   '.bar .dot{flex:none;width:7px;height:7px;border-radius:50%;background:#34c759;box-shadow:0 0 0 3px rgba(52,199,89,.18)}' +
+  '.bar .back{flex:none;margin:0 -2px 0 -4px;font:600 22px/1 -apple-system,system-ui,sans-serif;color:#0a84ff}' +
   '.bar .grip{flex:none;width:14px;height:10px;opacity:.35;background:radial-gradient(circle,#3a3a3c 1.1px,transparent 1.4px) 0 0/5px 5px}' +
   '.body{position:relative;flex:1;min-height:0;background:#fff}' +
   '.body.dark{background:#111}' +
@@ -168,7 +170,7 @@ export function pageFrame(src, title) {
 // Talking to a live page (live-bridge.js inside it): messages wait until it says it's ready;
 // input that arrives before then is dropped (it would land on a page that isn't there yet).
 export class PageLink {
-  constructor(frame, { onReady } = {}) {
+  constructor(frame, { onReady, onLink } = {}) {
     this.frame = frame;
     this.ready = false;
     this.queue = [];
@@ -178,6 +180,8 @@ export class PageLink {
         this.ready = true;
         if (onReady) onReady();
         for (const m of this.queue.splice(0)) this.post(m);
+      } else if (e.data.type === 'link' && typeof e.data.url === 'string' && /^https?:\/\//.test(e.data.url) && onLink) {
+        onLink(e.data.url); // an outside link: it opens in the same card, as a live browser
       }
     };
     window.addEventListener('message', this._onMsg);
@@ -213,7 +217,10 @@ class PageCard extends LiveCard {
     f.setAttribute('loading', 'lazy');
     this.frame = f;
     this.body.append(f);
-    this.link = new PageLink(f, { onReady: () => this.link.post({ type: 'visibility', visible: this.visible }) });
+    this.link = new PageLink(f, {
+      onReady: () => this.link.post({ type: 'visibility', visible: this.visible }),
+      onLink: (url) => this.opts.onLink && this.opts.onLink(this.rec, url),
+    });
   }
 
   post(m) { this.link.post(m); }
@@ -238,91 +245,118 @@ class PageCard extends LiveCard {
   destroy() { this.link.destroy(); }
 }
 
-// ---- a browser tab on the PC (browser.py): its newest picture, and the finger as touch input
+// ---- a browser tab on the PC (browser.py): its newest picture, and the finger as touch input.
+// Two picture requests are always in flight, so a new picture is on its way while one is shown
+// and nothing queues up on a slow link. The picture's size and quality follow the link (measured
+// on every picture) and the card's size on screen: small and light on cellular, sharp on Wi-Fi.
+const STEP_W = [480, 640, 800, 960, 1280];
+const STEP_Q = [30, 40, 50, 62];
+
 export class BrowserStream {
   constructor(bid, img, { onMeta } = {}) {
     this.bid = bid;
     this.img = img;
     this.onMeta = onMeta;
-    this.seq = 0;
+    this.viewer = Math.random().toString(36).slice(2, 10);
+    this.shown = 0;
     this.on = false;
     this.url = null;
     this.gen = 0;
+    this.wi = 2;            // 800 px to start
+    this.qi = 2;            // quality 50
+    this.fitW = 1280;       // the card's width on screen, in device pixels
+    this.rtt = 0;           // the link's round trip (ms)
+    this.bps = 0;           // its bandwidth (bytes/s)
+    this.avg = 0;           // recent picture size (bytes)
+    this.changed = 0;
+    this.lastMeta = '';
   }
 
   start() {
     if (this.on) return;
     this.on = true;
     const gen = ++this.gen;
-    if (this.pushed === false) return this._loop(gen); // the stream didn't work here: one at a time
-    // one pushed stream (a plain <img> shows multipart JPEG): no request per picture
-    let got = false;
-    this.img.onload = () => {
-      if (!got && gen === this.gen) { got = true; this._metaLoop(gen); }
-    };
-    this.img.onerror = () => {
-      if (gen !== this.gen || !this.on) return;
-      this.img.onload = this.img.onerror = null;
-      this.pushed = false;
-      this._loop(gen);
-    };
-    this.img.src = withKey(`/api/browser/${encodeURIComponent(this.bid)}/stream?t=${Date.now()}`);
-    // restart it now and then (a proxy may end long responses; the picture stays meanwhile)
-    this.renew = setTimeout(() => { if (gen === this.gen && this.on) { this.on = false; this.start(); } }, 4 * 60000);
+    this._lane(gen, 0);
+    this._lane(gen, 1);
   }
 
   stop() {
     this.on = false;
     this.gen++;
-    clearTimeout(this.renew);
-    if (this.pushed !== false && this.img.src.includes('/stream')) {
-      this.img.onload = this.img.onerror = null;
-      this.img.removeAttribute('src'); // closes the stream (it's off screen)
-    }
   }
 
-  // the page's address and title, beside the stream
-  async _metaLoop(gen) {
-    while (this.on && gen === this.gen) {
-      try {
-        const res = await fetch(withKey(`/api/browser/${encodeURIComponent(this.bid)}/frame?meta=1`), {
-          headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': SESSION }, cache: 'no-store' });
-        if (gen !== this.gen) return;
-        const m = await res.json();
-        if (this.onMeta && (m.url !== this.lastUrl || m.title !== this.lastTitle)) {
-          this.lastUrl = m.url;
-          this.lastTitle = m.title;
-          this.onMeta(m.url || '', m.title || '');
-        }
-      } catch { /* the PC is restarting */ }
-      await new Promise((r) => setTimeout(r, 1500));
-    }
+  // the card's on-screen width in device pixels: no point fetching bigger pictures than that
+  fit(px) {
+    this.fitW = STEP_W.find((w) => w >= px) || STEP_W[STEP_W.length - 1];
   }
 
-  async _loop(gen) {
+  get width() { return Math.min(STEP_W[this.wi], this.fitW); }
+
+  async _lane(gen, lane) {
+    if (lane) await new Promise((r) => setTimeout(r, 40));
     while (this.on && gen === this.gen) {
       const t0 = performance.now();
       try {
-        const res = await fetch(withKey(`/api/browser/${encodeURIComponent(this.bid)}/frame?after=${this.seq}`), {
+        const res = await fetch(withKey(`/api/browser/${encodeURIComponent(this.bid)}/frame?after=${this.shown}`
+          + `&v=${this.viewer}&w=${this.width}&q=${STEP_Q[this.qi]}`), {
           headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': SESSION }, cache: 'no-store' });
         if (gen !== this.gen) return;
         if (!res.ok) throw new Error(res.status);
         if ((res.headers.get('Content-Type') || '').startsWith('image/')) {
-          this.seq = +res.headers.get('X-Frame-Seq') || this.seq;
+          const seq = +res.headers.get('X-Frame-Seq') || 0;
+          const waited = +res.headers.get('X-Wait-Ms') || 0;
           const blob = await res.blob();
-          const url = URL.createObjectURL(blob);
-          await new Promise((r) => { this.img.onload = r; this.img.onerror = r; this.img.src = url; });
-          if (this.url) URL.revokeObjectURL(this.url);
-          this.url = url;
-          if (this.onMeta) this.onMeta(decodeURIComponent(res.headers.get('X-Browser-Url') || ''),
-            decodeURIComponent(res.headers.get('X-Browser-Title') || ''));
+          if (gen !== this.gen) return;
+          this._measure(blob.size, performance.now() - t0 - waited);
+          if (seq > this.shown) this._show(seq, blob, res.headers);
         } else await res.json();
       } catch {
         await new Promise((r) => setTimeout(r, 1500)); // the PC or its Chrome is restarting
       }
-      const wait = 66 - (performance.now() - t0); // at most ~15 pictures a second
+      const wait = 90 - (performance.now() - t0); // two lanes: at most ~20 pictures a second
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
+  }
+
+  _show(seq, blob, headers) {
+    this.shown = seq;
+    const url = URL.createObjectURL(blob);
+    const prev = this.url;
+    this.url = url;
+    this.img.src = url;
+    if (prev) setTimeout(() => URL.revokeObjectURL(prev), 2000);
+    const u = decodeURIComponent(headers.get('X-Browser-Url') || '');
+    const t = decodeURIComponent(headers.get('X-Browser-Title') || '');
+    if (this.onMeta && `${u}\n${t}` !== this.lastMeta) {
+      this.lastMeta = `${u}\n${t}`;
+      this.onMeta(u, t);
+    }
+  }
+
+  // ms: from asking to having the whole picture, minus the time the PC waited for a new one
+  _measure(bytes, ms) {
+    if (ms <= 0) return;
+    this.rtt = this.rtt ? Math.min(this.rtt * 1.03, ms) : ms; // the quickest recent trip
+    const transfer = ms - this.rtt;
+    if (bytes > 4000 && transfer > 8) {
+      const bps = bytes / (transfer / 1000);
+      this.bps = this.bps ? this.bps * 0.75 + bps * 0.25 : bps;
+    } else if (bytes > 4000 && !this.bps) this.bps = 5e6; // arrived at once: a fast link
+    this.avg = this.avg ? this.avg * 0.75 + bytes * 0.25 : bytes;
+    const now = performance.now();
+    if (!this.bps || now - this.changed < 2500) return;
+    const budget = this.bps * 0.1; // a picture should take ~100 ms to arrive
+    if (this.avg > budget) { // too heavy for this link: lighter first, then smaller
+      if (this.qi > 0) this.qi--;
+      else if (this.wi > 0) this.wi--;
+      else return;
+    } else if (this.avg < budget / 3) { // room to spare: bigger first (up to the card), then sharper
+      if (this.wi < STEP_W.length - 1 && STEP_W[this.wi] < this.fitW) this.wi++;
+      else if (this.qi < STEP_Q.length - 1) this.qi++;
+      else return;
+    } else return;
+    this.changed = now;
+    this.avg = 0;
   }
 
   // x, y in the shown picture's CSS px; (w, h) its size: mapped to the tab's own pixels
@@ -341,6 +375,11 @@ class BrowserCard extends LiveCard {
   constructor(rec, root, opts) {
     super(rec, root, opts);
     this.bar.insertBefore(Object.assign(document.createElement('span'), { className: 'dot' }), this.bar.firstChild.nextSibling);
+    this.browsing = !!this.item.browsing; // a page card following one of its links
+    if (this.browsing) {
+      const back = Object.assign(document.createElement('span'), { className: 'back', textContent: '‹' });
+      this.bar.insertBefore(back, this.bar.firstChild);
+    }
     const img = document.createElement('img');
     img.className = 'frame';
     img.alt = '';
@@ -349,7 +388,7 @@ class BrowserCard extends LiveCard {
     wait.className = 'wait';
     wait.textContent = 'Opening…';
     this.body.append(img, wait);
-    this.stream = new BrowserStream(this.item.browser, img, {
+    this.stream = new BrowserStream(this.browsing ? this.item.browsing.browser : this.item.browser, img, {
       onMeta: (url, title) => {
         wait.remove();
         this.setTitle(this.item.label || title || hostOf(url));
@@ -359,6 +398,10 @@ class BrowserCard extends LiveCard {
   }
 
   input(kind, x, y) {
+    if (this.browsing && kind === 'tap' && y < 0 && x < BACK_W) { // ‹ in the strip: back to the page
+      if (this.opts.onBack) this.opts.onBack(this.rec);
+      return;
+    }
     if (kind === 'tap') {
       this.stream.send('down', x, y, this.cw, this.ch);
       this.stream.send('up', x, y, this.cw, this.ch);
@@ -373,8 +416,10 @@ class BrowserCard extends LiveCard {
 
   setVisible(on) {
     super.setVisible(on);
-    if (on) this.stream.start();
-    else this.stream.stop();
+    if (on) {
+      this.stream.fit(this.rec.host.getBoundingClientRect().width * (window.devicePixelRatio || 1));
+      this.stream.start();
+    } else this.stream.stop();
   }
 
   destroy() { this.stream.destroy(); }
@@ -386,6 +431,7 @@ function hostOf(url) {
 
 export function makeLiveCard(rec, root, opts = {}) {
   root.append(Object.assign(document.createElement('style'), { textContent: LIVE_STYLE }));
-  const K = { video: VideoCard, page: PageCard, browser: BrowserCard }[rec.item.type];
+  const K = rec.item.type === 'page' && rec.item.browsing ? BrowserCard
+    : { video: VideoCard, page: PageCard, browser: BrowserCard }[rec.item.type];
   return new K(rec, root, opts);
 }

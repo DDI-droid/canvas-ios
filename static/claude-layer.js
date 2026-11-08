@@ -126,7 +126,8 @@ export class ClaudeLayer extends EventTarget {
   // same picture, maybe somewhere else: only the geometry needs updating
   static sameContent(a, b) {
     return (a.type || '') === (b.type || '') && a.svg === b.svg && a.src === b.src && (a.label || null) === (b.label || null)
-      && (a.page || null) === (b.page || null) && (a.browser || null) === (b.browser || null);
+      && (a.page || null) === (b.page || null) && (a.browser || null) === (b.browser || null)
+      && ((a.browsing || {}).browser || null) === ((b.browsing || {}).browser || null);
   }
 
   // Move / resize an item in place (no re-render, so no flicker and no entrance animation).
@@ -443,7 +444,7 @@ export class ClaudeLayer extends EventTarget {
         ctx.fillStyle = '#3a3a3c';
         ctx.font = '600 14px -apple-system, system-ui, sans-serif';
         ctx.fillText(`${{ video: 'Video', page: 'Live page', browser: 'Browser' }[rec.kind]}: ${rec.live.titleEl.textContent || ''}`.slice(0, 80), r[0] + 10, r[1] + 20);
-        const pic = rec.kind === 'browser' ? rec.live.stream.img : rec.kind === 'video' ? rec.live.media : null;
+        const pic = rec.live.stream ? rec.live.stream.img : rec.kind === 'video' ? rec.live.media : null;
         try { if (pic && (pic.naturalWidth || pic.videoWidth)) ctx.drawImage(pic, r[0], r[1] + BAR, rec.w, rec.h - BAR); } catch { /* not drawable */ }
         ctx.globalAlpha = 1;
         n++;

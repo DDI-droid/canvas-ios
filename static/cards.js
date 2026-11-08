@@ -15,7 +15,7 @@
 // While a card moves, only its CSS transform changes (GPU work, no re-layout); the new place
 // and size are committed when you let go, then saved to the server, which tells every page.
 import { clamp } from './util.js';
-import { BAR } from './livecards.js';
+import { BAR, BACK_W } from './livecards.js';
 
 const TAP_HOLD = 260;     // ms a tap on live content waits for a second tap (= full screen)
 
@@ -136,6 +136,7 @@ export class Cards {
     const rec = id && this.layer.records.get(id);
     if (!rec || !rec.live || id === this.id) return null;
     const r = this.layer.rectOf(rec);
+    if (rec.item.browsing && wy - r[1] < BAR && wx - r[0] < BACK_W) return { id, rec, part: 'content' }; // ‹ back
     // the title strip arranges; zoomed far out it stays at least a finger tall (28 px)
     if (wy - r[1] < Math.max(BAR, 28 / z)) return { id, part: 'bar' };
     return { id, rec, part: 'content' };

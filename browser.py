@@ -95,6 +95,10 @@ class Tab:
         self.frame = b""
         self.seq = 0
         self.cond = threading.Condition()
+        self.viewers: dict[str, tuple] = {}  # viewer -> (width, quality, last seen): what it can use
+        self.cursors: dict[str, int] = {}     # viewer -> the last picture handed to it
+        self.cast = (55, 960)                 # the screencast's (quality, max width) now
+        self.cast_at = 0.0
         self.alive = True
         self.ws = ws_connect(target["webSocketDebuggerUrl"], max_size=64 * 1024 * 1024, open_timeout=10)
         self.send_lock = threading.Lock()
@@ -107,9 +111,9 @@ class Tab:
             self.call("Emulation.setUserAgentOverride", **identity)
         self.call("Emulation.setDeviceMetricsOverride", width=VIEW_W, height=VIEW_H, deviceScaleFactor=1, mobile=False)
         self.call("Emulation.setTouchEmulationEnabled", enabled=True, maxTouchPoints=1)
-        self.call("Page.startScreencast", format="jpeg", quality=62, maxWidth=VIEW_W, maxHeight=VIEW_H, everyNthFrame=1)
+        self._start_cast()
         if url:
-            self.want = url
+            self.pending_url = url
             self.call("Page.navigate", url=url)
             # a fresh tab's own blank page can swallow the first navigation: check, and go again
             for delay in (4.0, 10.0, 20.0):
@@ -127,12 +131,34 @@ class Tab:
                 self.alive = False
             return self.msg_id
 
-    want = None  # the address it was opened at, until it's really there
+    pending_url = None  # the address it was opened at, until it's really there
 
     def _ensure_loaded(self) -> None:
-        if self.alive and self.want and (not self.url or self.url == "about:blank"):
-            self.log(f"browser: {self.id} still blank; loading {self.want} again")
-            self.call("Page.navigate", url=self.want)
+        if self.alive and self.pending_url and (not self.url or self.url == "about:blank"):
+            self.log(f"browser: {self.id} still blank; loading {self.pending_url} again")
+            self.call("Page.navigate", url=self.pending_url)
+
+    def _start_cast(self) -> None:
+        q, w = self.cast
+        self.call("Page.startScreencast", format="jpeg", quality=q, maxWidth=w,
+                  maxHeight=round(w * VIEW_H / VIEW_W), everyNthFrame=1)
+
+    def want(self, viewer: str, width: int, quality: int) -> None:
+        """A viewer's picture size and quality (what its card shows, what its link carries).
+        Chrome makes pictures for the most demanding viewer that's still watching."""
+        now = time.monotonic()
+        with self.cond:
+            self.viewers[viewer] = (width, quality, now)
+            for v, (_, _, seen) in list(self.viewers.items()):
+                if now - seen > 15:
+                    self.viewers.pop(v, None)
+                    self.cursors.pop(v, None)
+            best = (max(x[1] for x in self.viewers.values()), max(x[0] for x in self.viewers.values()))
+            if best == self.cast or now - self.cast_at < 1.0:
+                return
+            self.cast, self.cast_at = best, now
+        self.call("Page.stopScreencast")
+        self._start_cast()
 
     def _ask_title(self) -> None:
         self.title_asks.add(self.call("Runtime.evaluate", expression="[document.title, location.href]", returnByValue=True))
@@ -162,7 +188,7 @@ class Tab:
                     if not fr.get("parentId") and fr.get("url") and fr["url"] != self.url:
                         self.url = fr["url"]
                         if self.url != "about:blank":
-                            self.want = None
+                            self.pending_url = None
                         self._changed()
                 elif method == "Page.navigatedWithinDocument":
                     url = msg["params"].get("url")
@@ -188,15 +214,22 @@ class Tab:
         with self.cond:
             self.cond.notify_all()
 
-    def next_frame(self, after: int, wait: float = 20.0):
-        """The newest frame once it's newer than `after` (waits up to `wait` s): (seq, jpeg)."""
+    def next_frame(self, after: int, wait: float = 20.0, viewer: str | None = None):
+        """The newest frame once it's newer than `after` (waits up to `wait` s): (seq, jpeg).
+        With a viewer, each picture goes to one of its requests only (it keeps two in flight)."""
         deadline = time.monotonic() + wait
         with self.cond:
+            if viewer:
+                after = max(after, self.cursors.get(viewer, 0))
             while self.alive and self.seq <= after:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     break
                 self.cond.wait(left)
+                if viewer:
+                    after = max(after, self.cursors.get(viewer, 0))
+            if viewer and self.seq > self.cursors.get(viewer, 0):
+                self.cursors[viewer] = self.seq
             return self.seq, self.frame
 
     def input(self, ev: dict) -> None:
@@ -296,8 +329,9 @@ def normal_identity(info: dict) -> dict:
 class BrowserManager:
     """The one Chrome and its tabs (browser cards), started on first use."""
 
-    def __init__(self, data_dir: str, log):
+    def __init__(self, data_dir: str, log, profile: str = "browser-profile"):
         self.data_dir = data_dir
+        self.profile_name = profile  # one Chrome per profile: a second canvas server needs its own
         self.log = log
         self.lock = threading.Lock()
         self.proc: subprocess.Popen | None = None
@@ -322,7 +356,7 @@ class BrowserManager:
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
-        profile = os.path.join(self.data_dir, "browser-profile")
+        profile = os.path.join(self.data_dir, self.profile_name)
         os.makedirs(profile, exist_ok=True)
         args = [find_chrome(), "--headless=new", f"--remote-debugging-port={self.port}",
                 "--remote-debugging-address=127.0.0.1", f"--user-data-dir={profile}", "--no-first-run",
@@ -463,7 +497,7 @@ class BrowserManager:
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
             self.proc = None
-            profile = os.path.join(self.data_dir, "browser-profile")
+            profile = os.path.join(self.data_dir, self.profile_name)
             os.makedirs(profile, exist_ok=True)
             self.signing = subprocess.Popen(
                 [find_chrome(), f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",

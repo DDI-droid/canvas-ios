@@ -375,13 +375,22 @@ def append_chart_data(old: dict, new: dict, keep: int = 100_000) -> dict:
 _browsers = None
 
 
+SERVER_PORT = 0  # set at start
+
+
 def browser_manager():
     """The browser-card Chrome (browser.py), created on first use."""
     global _browsers
     if _browsers is None:
         import browser
-        _browsers = browser.BrowserManager(DATA_DIR, log)
+        # the canvas on its usual port keeps the sign-ins; another server (tests) gets its own profile
+        _browsers = browser.BrowserManager(DATA_DIR, log, "browser-profile" if SERVER_PORT in (0, 8765) else f"browser-profile-{SERVER_PORT}")
     return _browsers
+
+
+def tab_of(item: dict):
+    """The browser tab behind a card: a browser card's, or a page card's that's browsing a link."""
+    return item.get("browser") or (item.get("browsing") or {}).get("browser")
 
 
 def registry_url():
@@ -1252,6 +1261,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("POST", "/api/page"): self._api_page,
             ("POST", "/api/card/data"): self._api_card_data,
             ("POST", "/api/browser"): self._api_browser_open,
+            ("POST", "/api/card/browse"): self._api_card_browse,
+            ("POST", "/api/card/back"): self._api_card_back,
             ("POST", "/api/browser/signin"): self._api_browser_signin,
             ("POST", "/api/view"): self._api_view,
             ("POST", "/api/status"): self._api_status,
@@ -1279,12 +1290,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/api/inbox/([^/]+)/timeline\.txt$", path)
         if m and method in ("GET", "HEAD"):
             return self._api_timeline(m.group(1))
-        m = re.match(r"^/api/browser/([A-Za-z0-9_.:-]{1,64})/(frame|input|stream)$", path)
+        m = re.match(r"^/api/browser/([A-Za-z0-9_.:-]{1,64})/(frame|input)$", path)
         if m:
             if self.session is None:
                 raise HttpError(404, f"no canvas session {self.sid!r}")
-            if m.group(2) == "stream" and method == "GET":
-                return self._api_browser_stream(m.group(1))
             if m.group(2) == "frame" and method in ("GET", "HEAD"):
                 return self._api_browser_frame(m.group(1))
             if m.group(2) == "input" and method == "POST":
@@ -2145,11 +2154,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if tab:
             return tab
         with self.store.lock:
-            item = next((it for it in self.store.layer if isinstance(it, dict) and it.get("browser") == bid), None)
+            item = next((it for it in self.store.layer if isinstance(it, dict) and tab_of(it) == bid), None)
         if item is None:
             raise HttpError(404, "no such browser card")
         try:
-            return mgr.open(item.get("url") or "about:blank", bid)
+            return mgr.open((item.get("browsing") or item).get("url") or "about:blank", bid)
         except Exception as e:
             raise HttpError(503, str(e))
 
@@ -2167,6 +2176,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._draw_card({"type": "browser", "browser": tab.id, "url": browser.normalize_url(url), "aspect": 800 / 1280,
                                 **{k: body.get(k) for k in ("label", "x", "y", "width", "id") if body.get(k) is not None}})
 
+    def _page_item(self, cid):
+        if not isinstance(cid, str):
+            raise HttpError(400, "id is required")
+        with self.store.lock:
+            item = next((it for it in self.store.layer if isinstance(it, dict) and it.get("id") == cid), None)
+        if item is None or item.get("type") != "page":
+            raise HttpError(404, "no such page card")
+        return item
+
+    def _api_card_browse(self):
+        """{id, url}: a page card's outside link opens in the same card, as a live browser
+        (`browsing`); POST /api/card/back returns it to its page."""
+        body = self._read_json()
+        item = self._page_item(body.get("id"))
+        url = body.get("url")
+        if not isinstance(url, str) or not re.match(r"^https?://", url.strip()):
+            raise HttpError(400, "an http(s) url, please")
+        url = url.strip()
+        mgr = browser_manager()
+        cur = (item.get("browsing") or {}).get("browser")
+        tab = mgr.get(cur) if cur else None
+        try:
+            if tab:
+                tab.call("Page.navigate", url=url)
+            else:
+                tab = mgr.open(url)
+        except Exception as e:
+            raise HttpError(503, str(e))
+        with self.store.lock:
+            item["browsing"] = {"browser": tab.id, "url": url}
+            self.store.save_layer()
+            out = dict(item)
+        self.hub.broadcast("draw", out)
+        self._send_json(200, {"item": out})
+
+    def _api_card_back(self):
+        body = self._read_json()
+        item = self._page_item(body.get("id"))
+        with self.store.lock:
+            gone = item.pop("browsing", None)
+            self.store.save_layer()
+            out = dict(item)
+        if gone and _browsers is not None:
+            _browsers.close(gone.get("browser"))
+        self.hub.broadcast("draw", out)
+        self._send_json(200, {"item": out})
+
     def _api_browser_signin(self):
         """{url?}: open a normal Chrome window on this PC with the browser cards' profile, for
         sites that won't sign in a hidden browser (Google). Cards pause until it's closed."""
@@ -2178,37 +2234,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HttpError(503, str(e))
         self._send_json(200, {"ok": True, "url": url})
 
-    def _api_browser_stream(self, bid: str):
-        """The tab's pictures as one pushed stream (multipart JPEG, shown by a plain <img>): each new
-        picture goes out as Chrome paints it, at most ~20 a second, with no request per picture."""
-        tab = self._browser_tab(bid)
-        boundary = "canvasframe"
-        self.send_response(200)
-        self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Accel-Buffering", "no")
-        self._security_headers()
-        self.end_headers()
-        self.close_connection = True
-        seq = 0
-        try:
-            while tab.alive:
-                t0 = time.monotonic()
-                s, jpeg = tab.next_frame(seq, wait=15.0)  # nothing new for 15 s: resend (keeps it open)
-                if not jpeg:
-                    continue
-                seq = s
-                self.wfile.write(f"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpeg)}\r\n\r\n".encode()
-                                 + jpeg + b"\r\n")
-                self.wfile.flush()
-                left = 0.05 - (time.monotonic() - t0)
-                if left > 0:
-                    time.sleep(left)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            pass  # the card went off screen or closed
-
     def _api_browser_frame(self, bid: str):
         """The tab's newest frame (JPEG) once it's newer than ?after=N; waits up to 20 s.
+        ?v=<viewer>&w=<px>&q=<quality>: the viewer's picture size and quality (it adapts them
+        to its link and its card's size), and each picture goes to one of its requests only.
         ?meta=1: just {url, title}, at once."""
         tab = self._browser_tab(bid)
         if self.query.get("meta"):
@@ -2217,12 +2246,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             after = int(self.query.get("after", ["0"])[0])
         except ValueError:
             after = 0
-        seq, jpeg = tab.next_frame(after, wait=20.0)
+        viewer = self.query.get("v", [""])[0]
+        viewer = viewer if re.match(r"^[A-Za-z0-9_-]{1,40}$", viewer) else None
+        if viewer:
+            w = int(num(self.query.get("w", ["0"])[0], 0))
+            q = int(num(self.query.get("q", ["0"])[0], 0))
+            if w and q:
+                tab.want(viewer, max(320, min(1280, w)), max(20, min(80, q)))
+        t0 = time.monotonic()
+        seq, jpeg = tab.next_frame(after, wait=20.0, viewer=viewer)
+        waited = int((time.monotonic() - t0) * 1000)
         with self.store.lock:  # remember where the tab is, to reopen it there after a restart
             for it in self.store.layer:
-                if isinstance(it, dict) and it.get("browser") == bid and tab.url and it.get("url") != tab.url:
-                    it["url"] = tab.url
-                    self.store.save_layer()
+                if isinstance(it, dict) and tab_of(it) == bid:
+                    where = it.get("browsing") or it
+                    if tab.url and tab.url != "about:blank" and where.get("url") != tab.url:
+                        where["url"] = tab.url
+                        self.store.save_layer()
                     break
         if not jpeg:
             return self._send_json(200, {"seq": seq, "pending": True})  # no picture yet
@@ -2231,6 +2271,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(jpeg)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Seq", str(seq))
+        self.send_header("X-Wait-Ms", str(waited))
         self.send_header("X-Browser-Url", urllib.parse.quote(tab.url or "", safe=":/?&=#%"))
         self.send_header("X-Browser-Title", urllib.parse.quote(tab.title or "", safe=" "))
         self._security_headers()
@@ -2755,8 +2796,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         st = self.store
         with st.lock:
             gone = next((it for it in st.layer if isinstance(it, dict) and it.get("id") == item_id), None)
-        if gone and gone.get("browser") and _browsers is not None:
-            _browsers.close(gone["browser"])
+        if gone and tab_of(gone) and _browsers is not None:
+            _browsers.close(tab_of(gone))
         with st.lock:
             before = len(st.layer)
             st.layer = [it for it in st.layer if not (isinstance(it, dict) and it.get("id") == item_id)]
@@ -2804,6 +2845,8 @@ def main(argv=None) -> int:
 
     ensure_dirs()
     token = load_or_create_token()
+    global SERVER_PORT
+    SERVER_PORT = args.port
     Handler.sessions = Sessions(canvas_url=f"http://{HOST}:{args.port}")
     Handler.token = token
     main_talker = Handler.sessions.get("main").talker()

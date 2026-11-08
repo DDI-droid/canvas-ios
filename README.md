@@ -226,6 +226,7 @@ All JSON bodies are UTF-8; all routes need the token.
 | `POST /api/draw` (cards) | `{type: image\|video\|page\|browser, src\|page\|browser, aspect?, x?, y?, width?, label?, view?}`; without x/y the card goes in the middle of the view or the nearest free spot. |
 | `POST /api/media` | raw body (image, video, 3D model; up to 1 GB) → `{src}`; `POST /api/media/poster?for=<file>` a video's first frame. |
 | `POST /api/page` | `{html}` or `{template: chart\|model, data}`, `title?` → `{page, src}`; served keyless at `/live/<token>/` (sandboxed, with `live-bridge.js`). |
+| `POST /api/card/browse` | `{id, url}` → a page card's outside link opens in the same card as a live browser (`browsing`); `POST /api/card/back {id}` returns to the page. |
 | `POST /api/card/data` | `{id\|page, data, mode: replace\|append}` → live data into the card's page (`canvas:data` event). |
 | `POST /api/browser` | `{url, label?}` → a browser card (headless Chrome on this PC, `browser.py`); `GET /api/browser/<tab>/frame?after=N` (JPEG long-poll), `POST /api/browser/<tab>/input`. |
 | `POST /api/browser/signin` | `{url?}` → opens a normal Chrome window on the PC with the browser cards' profile (sites that won't sign in a hidden browser); cards pause until it's closed. |

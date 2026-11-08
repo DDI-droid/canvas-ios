@@ -39,7 +39,28 @@ const board = new Board({
   hover: $('#hover'),
 });
 const layer = new ClaudeLayer($('#claudeLayer'));
+// a page card's outside link: the card browses it (same card); ‹ comes back to the page
+async function browseInCard(rec, url, fullScreen) {
+  try {
+    const res = await api.post('/api/card/browse', { id: rec.item.id, url }, { timeout: 60000 });
+    if (res && res.item) layer.upsert(res.item, { animate: false });
+    if (fullScreen && viewer.isOpen) {
+      viewer.close();
+      setTimeout(() => openMedia(rec.item.id), 480);
+    }
+  } catch (err) {
+    toast(`Couldn’t open that link: ${err.message}`, { tone: 'error' });
+  }
+}
+async function backToPage(id) {
+  try {
+    const res = await api.post('/api/card/back', { id });
+    if (res && res.item) layer.upsert(res.item, { animate: false });
+  } catch { /* the next refresh shows it */ }
+}
 layer.liveOpts = {
+  onLink: (rec, url) => browseInCard(rec, url, false),
+  onBack: (rec) => backToPage(rec.item.id),
   // a video placed with a guessed shape (an agent's upload): fix it to the real one, for everyone
   onAspect: (rec, aspect) => {
     const height = rec.w * aspect + BAR;
@@ -309,7 +330,9 @@ function openMedia(id) {
     return true;
   }
   const aspect = (rec.h - BAR) / rec.w;
-  if (rec.kind === 'video') {
+  if (rec.kind === 'browser' || (rec.kind === 'page' && rec.item.browsing)) {
+    viewer.show({ ...base, kind: 'browser', aspect, mount: (frame) => mountBrowser(frame, rec) });
+  } else if (rec.kind === 'video') {
     const card = rec.live.media;
     const t = card.currentTime || 0;
     card.pause();
@@ -327,12 +350,13 @@ function openMedia(id) {
       const f = pageFrame(rec.item.src, rec.item.label);
       f.className = 'stage-media';
       frame.append(f);
-      const link = new PageLink(f, { onReady: () => link.post({ type: 'visibility', visible: true }) });
+      const link = new PageLink(f, {
+        onReady: () => link.post({ type: 'visibility', visible: true }),
+        onLink: (u) => browseInCard(rec, u, true),
+      });
       stagePage = { page: rec.item.page, src: rec.item.src, link }; // live data reaches it too
       return { destroy: () => { if (stagePage && stagePage.link === link) stagePage = null; link.destroy(); } };
     } });
-  } else if (rec.kind === 'browser') {
-    viewer.show({ ...base, kind: 'browser', aspect, mount: (frame) => mountBrowser(frame, rec) });
   }
   return true;
 }
@@ -348,7 +372,8 @@ function mountBrowser(frame, rec) {
   frame.append(img);
   const tools = document.createElement('div');
   tools.className = 'stage-tools';
-  tools.innerHTML = '<button class="st-btn" data-b="back" aria-label="Back">‹</button>'
+  tools.innerHTML = (rec.item.browsing ? '<button class="st-btn st-page" data-b="page" aria-label="Back to the page">Page</button>' : '')
+    + '<button class="st-btn" data-b="back" aria-label="Back">‹</button>'
     + '<button class="st-btn" data-b="forward" aria-label="Forward">›</button>'
     + '<button class="st-btn" data-b="reload" aria-label="Reload">↻</button>'
     + '<input class="st-url" type="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Address or search">'
@@ -357,14 +382,21 @@ function mountBrowser(frame, rec) {
   bar.insertBefore(tools, viewer.closeBtn);
   const url = tools.querySelector('.st-url');
   const typer = tools.querySelector('.st-type');
-  const stream = new BrowserStream(rec.item.browser, img, {
+  const stream = new BrowserStream(rec.item.browsing ? rec.item.browsing.browser : rec.item.browser, img, {
     onMeta: (u) => { if (document.activeElement !== url && u) url.value = u; },
   });
+  stream.fit(Math.min(window.innerWidth, 1400) * (window.devicePixelRatio || 1));
   stream.start();
   const send = (kind, extra) => stream.send(kind, 0, 0, 1, 1, extra);
   tools.addEventListener('click', (e) => {
     const b = e.target.closest('[data-b]');
-    if (b) send(b.dataset.b);
+    if (!b) return;
+    if (b.dataset.b === 'page') { // back to the page this card was showing
+      viewer.close();
+      backToPage(rec.item.id);
+      return;
+    }
+    send(b.dataset.b);
   });
   url.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && url.value.trim()) { send('nav', { url: url.value.trim() }); url.blur(); }
