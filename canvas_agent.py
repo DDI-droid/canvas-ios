@@ -105,7 +105,8 @@ def remember_attachment(sid: str) -> None:
     cur = data.get(cid)
     if isinstance(cur, dict) and cur.get("session") == sid and now - int(cur.get("ts", 0)) < 600:
         return
-    data[cid] = {"session": sid, "ts": now}
+    keep_mirror = isinstance(cur, dict) and cur.get("session") == sid and cur.get("mirror")
+    data[cid] = {"session": sid, "ts": now, **({"mirror": True} if keep_mirror else {})}
     data = {k: v for k, v in data.items() if isinstance(v, dict) and now - int(v.get("ts", 0)) < 30 * 86400}
     try:
         save_json(path, data)
@@ -120,8 +121,50 @@ def opener_for(origin: str):
     return urllib.request.build_opener()  # honours HTTPS_PROXY in sandboxes
 
 
+def is_local(origin: str) -> bool:
+    return (urllib.parse.urlsplit(origin).hostname or "") in ("127.0.0.1", "localhost", "::1")
+
+
+def follow(cfg: dict) -> bool:
+    """The canvas's public address changed (its tunnel restarted): read where it is now from the
+    secret gist the canvas publishes (address only, never the key) and switch to it. Saved, so
+    later commands use it too. True if it moved."""
+    reg = cfg.get("registry")
+    if not reg or is_local(cfg["origin"]):
+        return False
+    try:
+        req = urllib.request.Request(f"{reg}?t={int(time.time())}", headers={
+            "Accept": "application/vnd.github+json", "User-Agent": UA})
+        with urllib.request.build_opener().open(req, timeout=15) as r:
+            gist = json.loads(r.read().decode("utf-8"))
+        info = json.loads(gist["files"]["canvas-link.json"]["content"])
+        parts = urllib.parse.urlsplit(info["url"])
+        origin = f"{parts.scheme}://{parts.netloc}"
+    except Exception:
+        return False
+    if parts.scheme != "https" or origin == cfg["origin"]:
+        return False
+    cfg["origin"] = origin
+    if not os.environ.get("CANVAS_LINK"):
+        save_json(CONFIG, cfg)
+    print(f"(the canvas moved to {origin}; following it)", file=sys.stderr, flush=True)
+    return True
+
+
 def request(cfg: dict, sid: str | None, method: str, path: str, payload=None, timeout: float = 30,
             raw: bool = False):
+    try:
+        return _request(cfg, sid, method, path, payload, timeout, raw)
+    except (urllib.error.URLError, OSError) as e:
+        if isinstance(e, urllib.error.HTTPError) and e.code not in (502, 503, 504, 530):
+            raise
+        if follow(cfg):  # the address changed: try once more at the new one
+            return _request(cfg, sid, method, path, payload, timeout, raw)
+        raise
+
+
+def _request(cfg: dict, sid: str | None, method: str, path: str, payload=None, timeout: float = 30,
+             raw: bool = False):
     headers = {"X-Canvas-Key": cfg["key"], "User-Agent": UA, "Accept": "application/json"}
     if sid:
         headers["X-Canvas-Session"] = sid
@@ -165,11 +208,49 @@ def read_text(args) -> str:
 
 
 # --------------------------------------------------------------------------- commands
+def slug(text: str) -> str:
+    s = "".join(ch if ch.isalnum() else "-" for ch in (text or "").lower())
+    s = "-".join(p for p in s.split("-") if p)[:28].strip("-")
+    return s if s and s[0].isalnum() else ("board-" + s).strip("-")
+
+
+def pick_board(cfg: dict, wanted: str) -> str:
+    """A board for this Claude session: `wanted`, or wanted-2, -3… if another Claude session is
+    already listening on it (two listeners on one board would both answer every message)."""
+    mine = None
+    cid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if cid:
+        try:
+            with open(os.path.join(HOME, "attached.json"), "r", encoding="utf-8") as f:
+                mine = (json.load(f).get(cid) or {}).get("session")
+        except (OSError, ValueError, AttributeError):
+            mine = None
+    boards = {s["id"]: s for s in (call(cfg, None, "GET", "/api/sessions") or {}).get("sessions") or []}
+    base = slug(wanted)
+    for n in range(1, 50):
+        sid = base if n == 1 else f"{base[:26]}-{n}"
+        b = boards.get(sid)
+        if b is None or sid == mine or not b.get("agent"):
+            return sid
+    die("too many boards with that name are in use")
+
+
 def cmd_connect(args) -> None:
-    cfg = parse_link(args.link)
+    cfg = parse_link(args.link) if args.link else load_config()
     call(cfg, None, "GET", "/api/ping")
-    sess = call(cfg, None, "POST", "/api/sessions", {"title": args.title or args.session, "id": args.session})
-    save_json(CONFIG, cfg)
+    try:  # where the canvas publishes its address when it changes (see follow())
+        reg = (call(cfg, None, "GET", "/api/link") or {}).get("registry")
+        if reg:
+            cfg["registry"] = reg
+    except SystemExit:
+        pass
+    if args.auto:
+        args.session = pick_board(cfg, args.auto)
+    if not args.session:
+        die("give a board: -s NAME, or --auto NAME")
+    sess = call(cfg, None, "POST", "/api/sessions", {"title": args.title or args.auto or args.session, "id": args.session})
+    if not os.environ.get("CANVAS_LINK"):
+        save_json(CONFIG, cfg)
     sid = sess["id"]
     # start from "now": earlier messages in this session are history, not work
     res = call(cfg, sid, "GET", "/api/agent/next?wait=0", timeout=15)
@@ -332,6 +413,109 @@ def cmd_embed(args) -> None:
           f"width {res.get('width', 0):.0f} (double-tap it on the iPad to open full screen)")
 
 
+def cmd_setup(args) -> None:
+    """Can this machine reach a canvas? One line for the /canvas:connect skill:
+       CANVAS ok <origin>       a canvas is configured and answering
+       CANVAS down <origin>     configured, but not answering (the PC hosting it is off?)
+       CANVAS none              nothing configured: ask the user for their canvas link
+    With --host: start a canvas on this machine (server + tunnel, data in ~/.canvas) and use it."""
+    if args.host:
+        return host_here()
+    cfg = None
+    try:
+        with open(CONFIG, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if os.environ.get("CANVAS_LINK"):
+        cfg = parse_link(os.environ["CANVAS_LINK"])
+    if not cfg or not cfg.get("origin") or not cfg.get("key"):
+        print("CANVAS none")
+        return
+    try:
+        request(cfg, None, "GET", "/api/ping", timeout=10)
+        print(f"CANVAS ok {cfg['origin']}")
+    except Exception:
+        print(f"CANVAS down {cfg['origin']}")
+
+
+def host_here() -> None:
+    """Start a canvas on this machine with the supervisor that ships next to this file, data in
+    ~/.canvas (kept across plugin updates), and connect this machine to it."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    data = os.environ.get("CANVAS_DATA") or os.path.join(os.path.expanduser("~"), ".canvas")
+    os.makedirs(data, exist_ok=True)
+    env = dict(os.environ, CANVAS_DATA=data)
+    py = sys.executable
+    if os.name == "nt":
+        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+        py = pyw if os.path.isfile(pyw) else py
+        subprocess.Popen([py, os.path.join(here, "supervisor.py")], env=env, cwd=here,
+                         creationflags=0x00000008 | 0x00000200)  # detached, own process group
+    else:
+        subprocess.Popen([py, os.path.join(here, "supervisor.py")], env=env, cwd=here,
+                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    token = os.path.join(data, "token.txt")
+    for _ in range(60):
+        if os.path.isfile(token):
+            try:
+                cfg = {"origin": "http://127.0.0.1:8765", "key": open(token, encoding="utf-8").read().strip()}
+                _request(cfg, None, "GET", "/api/ping", timeout=3)
+                save_json(CONFIG, cfg)
+                print(f"CANVAS ok {cfg['origin']} (started here; data in {data})")
+                return
+            except Exception:
+                pass
+        time.sleep(1)
+    die("started the canvas, but it isn't answering yet: see ~/.canvas/supervisor.log")
+
+
+def cmd_link(args) -> None:
+    """The link to paste into a new iPad (Canvas › Server link…) or a Claude session on another
+    machine (/canvas:connect asks for it). It contains the canvas's secret key: share it only
+    with your own devices."""
+    cfg = load_config()
+    info = call(cfg, None, "GET", "/api/link") or {}
+    base = info.get("public") or cfg["origin"]
+    print(f"{base}/?k={urllib.parse.quote(cfg['key'], safe='')}")
+    if not info.get("public"):
+        print("(that's this machine's own address: it only works here. Start the supervisor for a public one.)")
+
+
+def cmd_mirror(args) -> None:
+    """Chat copying for this board: `on` / `off` (or no state: show it). While on, Claude copies
+    each prompt typed in Claude Code, and its answer, into the board's chat with `copy`."""
+    path = os.path.join(HOME, "attached.json")
+    cid = os.environ.get("CLAUDE_CODE_SESSION_ID") or "manual"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    if args.state is None:
+        on = any(isinstance(v, dict) and v.get("session") == args.session and v.get("mirror") for v in data.values())
+        print(f"chat copying is {'on' if on else 'off'} for board '{args.session}'")
+        return
+    data[cid] = {**(data.get(cid) or {}), "session": args.session, "ts": int(time.time()), "mirror": args.state == "on"}
+    save_json(path, data)
+    print(f"chat copying {'on' if args.state == 'on' else 'off'} for board '{args.session}'")
+
+
+def cmd_copy(args) -> None:
+    """Copy one exchange typed in Claude Code into the board's chat (only while copying is on):
+    the user's prompt, then the answer. Each from a file, so markdown and $math$ arrive intact."""
+    cfg = load_config()
+    for role, path in (("user", args.prompt_file), ("claude", args.answer_file)):
+        if not path:
+            continue
+        with open(path, "rb") as f:
+            text = f.read().decode("utf-8-sig").strip()
+        if text:
+            call(cfg, args.session, "POST", "/api/mirror", {"role": role, "text": text})
+    print("copied to the canvas chat")
+
+
 def cmd_sessions(args) -> None:
     cfg = load_config()
     for s in (call(cfg, None, "GET", "/api/sessions") or {}).get("sessions") or []:
@@ -353,10 +537,27 @@ def main() -> None:
         return p
 
     p = sub.add_parser("connect", help="save the canvas link and create/join a session")
-    p.add_argument("link", help="the canvas link: https://host/?k=<key>")
-    p.add_argument("-s", "--session", required=True, help="session id: lowercase letters, digits, dashes")
+    p.add_argument("link", nargs="?", help="the canvas link: https://host/?k=<key> (default: the saved one)")
+    p.add_argument("-s", "--session", help="session id: lowercase letters, digits, dashes")
+    p.add_argument("--auto", metavar="NAME", help="pick a free board named after NAME (adds -2, -3… if in use)")
     p.add_argument("--title", help="a short title shown in the canvas session switcher")
     p.set_defaults(fn=cmd_connect)
+
+    p = sub.add_parser("setup", help="is a canvas reachable from here? (--host: start one on this machine)")
+    p.add_argument("--host", action="store_true")
+    p.set_defaults(fn=cmd_setup)
+
+    p = sub.add_parser("link", help="print the link for a new iPad or another machine")
+    p.set_defaults(fn=cmd_link)
+
+    p = with_session(sub.add_parser("mirror", help="chat copying for this board: on / off (no state: show it)"))
+    p.add_argument("state", nargs="?", choices=["on", "off"])
+    p.set_defaults(fn=cmd_mirror)
+
+    p = with_session(sub.add_parser("copy", help="copy one Claude Code exchange into the board's chat"))
+    p.add_argument("--prompt-file", help="the user's prompt, as typed")
+    p.add_argument("--answer-file", help="your answer")
+    p.set_defaults(fn=cmd_copy)
 
     p = with_session(sub.add_parser("wait", help="block until the user's next message, then print it"))
     p.add_argument("--timeout", type=float, default=0, help="give up after this many seconds (default: never)")

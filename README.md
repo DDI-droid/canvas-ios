@@ -16,6 +16,43 @@ There are **two ways to use it**, and both use the same page and server:
    SideStore installs it, and you re-sign it every 7 days. The server offers the build at
    `/app/Canvas.ipa` and a SideStore source at `/app/source.json`.
 
+## The Claude Code plugin (one repo, two installs)
+
+This repo is also a Claude Code plugin. On every machine where you run Claude Code (this PC, another
+computer, a cloud server you log into), install it once:
+
+```
+/plugin install canvas --marketplace DDI-droid/canvas-ios
+```
+
+On older Claude Code versions, use the two-step form: `/plugin marketplace add DDI-droid/canvas-ios`,
+then `/plugin install canvas@ddi-canvas`. The repo is private, so the machine must be logged in to GitHub.
+
+Then, in any session:
+
+1. `/remote-control`, to follow the session from the Claude app too. Or turn it on for every
+   session once, in `/config`.
+2. `/canvas:connect [board name]`. Claude gives the session its own board, named after the project
+   folder (with `-2`, `-3`… if another session is already listening on it), and starts listening.
+   The iPad shows a "New board from Claude · Open" note.
+   - The first time on a machine that doesn't host the canvas, it asks for your canvas link. Get it with
+     `/canvas:link` on the PC that hosts it, or in the app under ☰ › App › Server link. After that the
+     machine remembers it, and follows the canvas when its address changes (the secret gist).
+   - On a machine that should host the canvas itself, Claude can start one there
+     (`canvas_agent.py setup --host`, with data in `~/.canvas`).
+3. `/canvas:link` prints the link for a new iPad, or for Claude on another machine.
+
+Claude answers where you write: canvas messages on the canvas (marked "📱 From the canvas" in the
+Claude Code chat), typed prompts in Claude Code. Ask it to "copy our chat to the canvas" to also
+see the Claude Code conversation on the board's chat.
+
+The plugin has no hooks, so it adds nothing to sessions that don't use it, beyond about 240 tokens of
+skill descriptions. (Starting a process can take seconds on some machines, and hooks would do that
+on every turn.)
+
+Sessions in the browser at claude.ai/code don't load plugins. Everywhere you run Claude Code
+yourself, the plugin works, as long as the PC hosting the canvas is on.
+
 **Several Claude sessions at once.** Each Claude Code session, whether on this PC, another machine
 or in the cloud, gets its own canvas *session*: a board, chat and voice talker of its own. Switch
 between them from the Claude panel's title. To attach a session, make a new session in that menu

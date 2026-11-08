@@ -1,0 +1,14 @@
+{
+  "name": "ddi-canvas",
+  "description": "The iPad canvas for Claude Code (this repo is both the plugin and its iPad app).",
+  "owner": {
+    "name": "DDI-droid"
+  },
+  "plugins": [
+    {
+      "name": "canvas",
+      "source": "./",
+      "description": "Your iPad canvas for Claude Code: a Pencil board, chat and hands-free voice. /canvas:connect gives this session its own board on the iPad."
+    }
+  ]
+}

@@ -40,7 +40,7 @@ from datetime import datetime
 
 CANVAS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(CANVAS)
-DATA = os.path.join(CANVAS, "data")
+DATA = os.environ.get("CANVAS_DATA") or os.path.join(CANVAS, "data")  # same rule as server.py
 LINK_FILE = os.path.join(DATA, "link.json")
 GIST_FILE = "canvas-link.json"
 TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")

@@ -1186,8 +1186,16 @@ function renderSessions() {
 function onSessions(list) {
   if (!Array.isArray(list)) return;
   let changed = false;
+  const firstRun = !Object.keys(seen).length; // a fresh install: every board is "new", say nothing
   for (const s of list) {
-    if (seen[s.id] === undefined) { seen[s.id] = s.last_reply || 0; changed = true; } // existing = read
+    if (seen[s.id] === undefined) {
+      seen[s.id] = s.last_reply || 0; // existing = read
+      changed = true;
+      // a Claude session just ran /canvas:connect: offer its board (one tap; no switching under you)
+      if (!firstRun && s.id !== SESSION && s.agent && Date.now() - (s.created || 0) < 10 * 60 * 1000) {
+        toast(`New board “${s.title || s.id}” from Claude.`, { action: 'Open', onAction: () => switchSession(s.id), ms: 15000 });
+      }
+    }
   }
   if (changed) store.set('sessionSeen', seen);
   sessionList = list;

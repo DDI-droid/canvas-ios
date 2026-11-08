@@ -39,7 +39,9 @@ except Exception:  # pragma: no cover
     talker_mod = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# boards, chats and the key live here; $CANVAS_DATA moves them out of the code's folder (a
+# server started by the Claude Code plugin keeps them in ~/.canvas, safe across plugin updates)
+DATA_DIR = os.environ.get("CANVAS_DATA") or os.path.join(BASE_DIR, "data")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 INBOX_DIR = os.path.join(DATA_DIR, "inbox")
 TOKEN_FILE = os.path.join(DATA_DIR, "token.txt")
@@ -1084,7 +1086,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.hub = sess.hub if sess else None
         self.voice = sess.voice if sess else None
 
-    GLOBAL_ROUTES = {"/api/ping", "/api/sessions", "/api/clientlog"}
+    GLOBAL_ROUTES = {"/api/ping", "/api/sessions", "/api/clientlog", "/api/link"}
 
     def _route_api(self, method: str, path: str):
         routes = {
@@ -1117,6 +1119,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("GET", "/api/ink"): self._api_ink_get,
             ("POST", "/api/ink"): self._api_ink_post,
             ("GET", "/api/conversation"): self._api_conversation,
+            ("GET", "/api/link"): self._api_link,
             ("POST", "/api/strokes"): self._api_strokes,
         }
         fn = routes.get(("GET" if method == "HEAD" else method, path))
@@ -1505,6 +1508,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload["strokes"] = st.strokes
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send(200, body, MIME[".json"])
+
+    def _api_link(self):
+        """Where this canvas can be reached: the public (tunnel) address, if the supervisor
+        published one, and the local one. `canvas_agent.py link` builds the iPad link from it."""
+        info = read_json_obj(os.path.join(DATA_DIR, "link.json"))
+        public = info.get("url") if isinstance(info.get("url"), str) else None
+        self._send_json(200, {"public": public, "local": f"http://{HOST}:{self.server.server_address[1]}",
+                              "registry": registry_url()})
 
     def _api_conversation(self):
         """Older chat entries, for scrolling up: ?before=<id>&limit=N (default 60)."""

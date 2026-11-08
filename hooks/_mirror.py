@@ -5,6 +5,8 @@ from the canvas reach Claude through `canvas_agent.py wait`, and Claude answers 
 canvas with `say`. These hooks cover the other way in: a prompt typed in Claude Code (terminal,
 VS Code, or the Claude app's view of the same session) and Claude's answer to it.
 
+  - Off unless the user turns it on for a board (`canvas_agent.py mirror -s BOARD on`): by
+    default Claude answers where the user wrote (the laptop, or the canvas).
   - Only a Claude Code session attached to a canvas session mirrors, and only into that session.
     `canvas_agent.py wait/connect` records "Claude session -> canvas session" in
     ~/.canvas_agent/attached.json (keyed by $CLAUDE_CODE_SESSION_ID, which the hooks get as
@@ -46,10 +48,14 @@ def _read_json(path: str) -> dict:
         return {}
 
 
-def attached_target(claude_id: str):
-    """(origin, key, canvas_session) for this Claude Code session, or None if not attached."""
+def attached_target(claude_id: str, need_mirror: bool = True):
+    """(origin, key, canvas_session) for this Claude Code session, or None if it isn't attached,
+    or (need_mirror) the user hasn't asked for chat copying on that board
+    (`canvas_agent.py mirror -s BOARD on`). Off by default: the user answers where they write."""
     entry = _read_json(ATTACHED).get(claude_id) if claude_id else None
     if not isinstance(entry, dict) or not entry.get("session"):
+        return None
+    if need_mirror and not entry.get("mirror"):
         return None
     link = os.environ.get("CANVAS_LINK")
     if link:
