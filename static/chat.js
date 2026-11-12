@@ -57,13 +57,40 @@ export class ChatPanel extends EventTarget {
       store.get('chat.geo', {}),
     );
     this._wire();
+    this._refit(this.geo.vw, this.geo.vh); // saved on another screen size (the other orientation)
+    this._vw = window.innerWidth;
+    this._vh = window.innerHeight;
     this._applyGeo();
   }
 
   // ------------------------------------------------------------------ geometry
 
   _saveGeo() {
+    this.geo.vw = window.innerWidth; // the screen it was placed on, for _refit
+    this.geo.vh = window.innerHeight;
     store.set('chat.geo', this.geo);
+  }
+
+  // The screen changed size (the iPad turned): a floating panel that was fully on screen stays
+  // fully on screen, on the side it was nearer to. One parked mostly off an edge on purpose stays
+  // parked (_applyGeo keeps 120 px of it showing).
+  _refit(oldVw, oldVh) {
+    const g = this.geo;
+    if (g.docked || g.left == null || g.top == null || !oldVw || !oldVh) return;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    if (vw === oldVw && vh === oldVh) return;
+    const oldH = g.height || 520;
+    const gapR = oldVw - (g.left + g.width), gapB = oldVh - (g.top + oldH);
+    if (g.left < 0 || gapR < 0) return;
+    const BOTTOM = 90; // the toolbar row, kept clear (as the docked panel does)
+    const w = clamp(g.width, MIN_W, Math.max(MIN_W, vw - 24));
+    const h = clamp(oldH, MIN_H, Math.max(MIN_H, vh - 8 - BOTTOM));
+    const left = gapR < g.left ? vw - w - gapR : g.left;
+    const top = gapB < g.top ? vh - h - Math.max(gapB, BOTTOM) : g.top;
+    g.width = w;
+    g.height = h;
+    g.left = clamp(left, 8, Math.max(8, vw - w - 8));
+    g.top = clamp(top, 8, Math.max(8, vh - h - BOTTOM));
   }
 
   get dockedWidth() {
@@ -136,7 +163,11 @@ export class ChatPanel extends EventTarget {
   }
 
   onViewportChange() {
+    this._refit(this._vw, this._vh);
+    this._vw = window.innerWidth;
+    this._vh = window.innerHeight;
     this._applyGeo();
+    if (!this.geo.docked) this._saveGeo();
   }
 
   _wire() {
@@ -163,18 +194,22 @@ export class ChatPanel extends EventTarget {
       }
     });
 
-    // drag by header; double-tap header to re-dock
+    // drag by the header, from anywhere on it: a press on one of its buttons that moves is a drag
+    // (and doesn't press the button); one that doesn't move is a tap. Double-tap to re-dock.
     let lastTap = 0;
     this.head.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('button, input, .pop')) return;
+      if (e.target.closest('input, .pop')) return;
+      const onButton = !!e.target.closest('button');
       const r = this.el.getBoundingClientRect();
       const start = { x: e.clientX, y: e.clientY, left: r.left, top: r.top, w: r.width, h: r.height };
       let dragging = false;
-      this.head.setPointerCapture(e.pointerId);
+      // captured only once it's a drag: before that the button must still get its tap
+      if (!onButton) this.head.setPointerCapture(e.pointerId);
       const move = (ev) => {
         const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
         if (!dragging && Math.hypot(dx, dy) > 6) {
           dragging = true;
+          try { this.head.setPointerCapture(e.pointerId); } catch { /* already released */ }
           this.geo.docked = false;
           this.geo.width = start.w;
           this.geo.height = start.h;
@@ -192,11 +227,17 @@ export class ChatPanel extends EventTarget {
         this.head.removeEventListener('pointercancel', up);
         this.el.classList.remove('dragging');
         if (dragging) {
+          if (onButton) {
+            // the drag started on a button: the tap the browser sends now isn't one
+            const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+            window.addEventListener('click', swallow, { capture: true, once: true });
+            setTimeout(() => window.removeEventListener('click', swallow, true), 400);
+          }
           const r2 = this.el.getBoundingClientRect();
           if (window.innerWidth - r2.right < 28 && r2.top < 40) this.geo.docked = true; // snap back
           this._applyGeo();
           this._saveGeo();
-        } else {
+        } else if (!onButton) {
           const now = performance.now();
           if (now - lastTap < 320) this.dock();
           lastTap = now;

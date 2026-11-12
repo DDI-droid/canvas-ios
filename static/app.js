@@ -1112,6 +1112,31 @@ document.addEventListener('touchmove', (e) => {
 }, { passive: false });
 document.addEventListener('dblclick', (e) => e.preventDefault());
 
+// The drawing toolbar is centred, but never over the mic and send buttons at the bottom left:
+// on a narrow screen (an iPad upright) it moves right, or up above them if there's no room beside.
+function placeToolbar() {
+  const root = document.documentElement.style;
+  const tb = $('#toolbar'), talk = $('#talk');
+  const vw = window.innerWidth;
+  let shift = 0, lift = 0;
+  if (tb && talk && vw > 560) { // phones: the toolbar sits at the right edge instead (app.css)
+    const w = tb.offsetWidth;
+    const clear = talk.getBoundingClientRect().right + 12;
+    const centred = (vw - w) / 2;
+    if (centred < clear) {
+      if (clear + w <= vw - 14) shift = clear - centred;
+      else lift = talk.offsetHeight + 10;
+    }
+  }
+  root.setProperty('--tb-shift', `${Math.round(shift)}px`);
+  root.setProperty('--tb-lift', `${Math.round(lift)}px`);
+}
+if (window.ResizeObserver) {
+  const ro = new ResizeObserver(() => placeToolbar());
+  ro.observe($('#toolbar'));
+  ro.observe($('#talk'));
+}
+
 let resizeTimer = 0;
 function onResize() {
   document.documentElement.classList.add('resizing');
@@ -1119,6 +1144,7 @@ function onResize() {
   resizeTimer = setTimeout(() => document.documentElement.classList.remove('resizing'), 260);
   board.resize();
   chat.onViewportChange();
+  placeToolbar();
   requestAnimationFrame(moveToolIndicator);
 }
 window.addEventListener('resize', onResize);

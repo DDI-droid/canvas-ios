@@ -440,13 +440,14 @@ select {
   position: fixed;
   z-index: 20;
   left: 50%;
-  bottom: calc(var(--sab) + var(--edge));
+  bottom: calc(var(--sab) + var(--edge) + var(--tb-lift, 0px));
   display: flex;
   align-items: center;
   gap: 2px;
   padding: 6px;
   border-radius: var(--r-full);
-  transform: translateX(-50%);
+  /* --tb-shift / --tb-lift (app.js placeToolbar): never over the mic and send buttons */
+  transform: translateX(calc(-50% + var(--tb-shift, 0px)));
   transition: opacity var(--d3) var(--ease), transform var(--d4) var(--soft-spring);
 }
 .tb-group { display: flex; align-items: center; }
@@ -1467,7 +1468,7 @@ textarea:focus { background: rgb(var(--glass-rgb) / .9); box-shadow: inset 0 0 0
   to { opacity: 1; transform: none; }
 }
 
-#app.booting .toolbar { opacity: 0; transform: translate(-50%, 16px); }
+#app.booting .toolbar { opacity: 0; transform: translate(calc(-50% + var(--tb-shift, 0px)), 16px); }
 #app.booting .talk, #app.booting .topbar { opacity: 0; transform: translateY(8px); }
 #app.booting .chat { opacity: 0; transform: translateX(14px); }
 .talk, .topbar { transition: opacity var(--d3) var(--ease), transform var(--d4) var(--soft-spring); }
