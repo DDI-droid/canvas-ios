@@ -885,15 +885,9 @@ function setLayerVisible(on) {
   savePrefs();
   layer.setVisible(prefs.layer);
   $('#optLayer').checked = prefs.layer;
-  const b = $('#btnLayer');
-  b.setAttribute('aria-pressed', String(prefs.layer));
-  b.innerHTML = icon(prefs.layer ? 'sparkle' : 'sparkleOff');
 }
+// (Showing and hiding Claude's drawings is in Settings; the double-star button opens the menu.)
 $('#optLayer').addEventListener('change', (e) => setLayerVisible(e.target.checked));
-$('#btnLayer').addEventListener('click', () => {
-  setLayerVisible(!prefs.layer);
-  hud(prefs.layer ? 'Claude’s drawings shown' : 'Claude’s drawings hidden', prefs.layer ? 'sparkle' : 'sparkleOff');
-});
 // Full screen (iPadOS Safari supports the Fullscreen API on elements; iPhone does not).
 //
 // Why swipes exit: in element full screen, WebKit adds its own one-finger swipe-down
@@ -1549,6 +1543,128 @@ $('#newSessionForm').addEventListener('submit', async (e) => {
   }
 });
 
+// ---- the menu ("home"): your boards, what's connected, and Continue. It opens when the app
+// starts (once per launch: sessionStorage survives a reload, not a relaunch) and from the
+// double-star button in the toolbar. Tapping a board opens it in place, behind the fade.
+const home = $('#home');
+const homeInfo = { plugin: '', rtt: null };
+function ago(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, (Date.now() - ts) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  const d = Math.round(s / 86400);
+  return d === 1 ? 'yesterday' : `${d} days ago`;
+}
+function renderHomeStatus() {
+  const conn = $('#conn');
+  const ok = conn.dataset.state === 'ok';
+  $('#homePcDot').dataset.state = ok ? 'ok' : 'wait';
+  $('#homePc').textContent = ok ? 'Connected' : (conn.title || 'Connecting…');
+  $('#homePcSub').textContent = ok && homeInfo.rtt != null ? `${Math.max(1, Math.round(homeInfo.rtt))} ms away` : '';
+  $('#homeVoice').textContent = prefs.voiceName || 'System voice';
+  $('#homeVoiceSub').textContent = live.on ? 'hands-free on' : 'hands-free off';
+  const appVersion = (navigator.userAgent.match(/CanvasApp\/([\d.]+)/) || [])[1];
+  $('#homeVersion').textContent = appVersion ? `app ${appVersion}` : 'web page';
+  $('#homeVersionSub').textContent = homeInfo.plugin ? `plugin ${homeInfo.plugin}` : '';
+}
+function renderHome() {
+  if (home.hidden) return;
+  // the board you're on first, then boards with Claude attached, then the rest; newest first
+  const rank = (x) => (x.id === SESSION ? 0 : x.agent ? 1 : 2);
+  const list = [...sessionList].sort((a, b) => rank(a) - rank(b) || (b.last_activity || 0) - (a.last_activity || 0));
+  $('#homeCount').textContent = list.length ? String(list.length) : '';
+  const box = $('#homeList');
+  box.textContent = '';
+  for (const s of list) {
+    const row = document.createElement('button');
+    row.className = 'home-row' + (s.id === SESSION ? ' on' : '');
+    row.dataset.board = s.id;
+    const dot = document.createElement('span');
+    dot.className = 'dot' + (s.agent ? ' attached' : ''); // green: a Claude session is attached
+    const text = document.createElement('span');
+    const t = document.createElement('span');
+    t.className = 't';
+    t.textContent = s.title || s.id;
+    if (s.id !== SESSION && (s.last_reply || 0) > (seen[s.id] || 0)) {
+      const n = document.createElement('span');
+      n.className = 'newreply';
+      n.textContent = 'New reply';
+      t.append(n);
+    }
+    const sub = document.createElement('span');
+    sub.className = 's';
+    const replied = ago(s.last_reply);
+    sub.textContent = s.agent ? (replied ? `Last reply ${replied}` : 'Claude attached')
+      : ['No Claude attached', ago(s.last_activity)].filter(Boolean).join(' · ');
+    text.append(t, sub);
+    const end = document.createElement('span');
+    end.className = s.id === SESSION ? 'open' : 'chev';
+    end.textContent = s.id === SESSION ? 'Open →' : '›';
+    row.append(dot, text, end);
+    box.append(row);
+  }
+  const cur = sessionList.find((x) => x.id === SESSION);
+  $('#homeCurrent').textContent = cur ? cur.title : SESSION;
+  renderHomeStatus();
+}
+function openHome() {
+  if (home.classList.contains('shown')) return;
+  home.hidden = false;
+  renderHome();
+  requestAnimationFrame(() => requestAnimationFrame(() => home.classList.add('shown')));
+  const t0 = performance.now();
+  api.get('/api/ping').then((r) => {
+    homeInfo.rtt = performance.now() - t0;
+    if (r && r.plugin) homeInfo.plugin = String(r.plugin);
+    if (!home.hidden) renderHomeStatus();
+  }).catch(() => {});
+}
+function closeHome() {
+  if (home.hidden) return;
+  home.classList.remove('shown');
+  $('#homeNewForm').hidden = true;
+  $('#homeNew').hidden = false;
+  setTimeout(() => { if (!home.classList.contains('shown')) home.hidden = true; }, 320);
+}
+$('#btnLayer').addEventListener('click', openHome);
+$('#homeContinue').addEventListener('click', closeHome);
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !home.hidden) closeHome(); });
+$('#homeList').addEventListener('click', (e) => {
+  const row = e.target.closest('[data-board]');
+  if (!row) return;
+  const id = row.dataset.board;
+  closeHome();
+  if (id !== SESSION) openBoard(id);
+});
+$('#homeNew').addEventListener('click', () => {
+  $('#homeNew').hidden = true;
+  $('#homeNewForm').hidden = false;
+  $('#homeNewName').focus();
+});
+$('#homeNewForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = $('#homeNewName');
+  const title = input.value.trim();
+  if (!title) return;
+  try {
+    const s = await api.post('/api/sessions', { title });
+    input.value = '';
+    sessionList = [...sessionList.filter((x) => x.id !== s.id), s];
+    markSeen(s.id, Date.now());
+    closeHome();
+    await openBoard(s.id);
+    // as from the board list: how to attach a Claude session to it
+    sessionPopover.open();
+    await showConnect(s.id);
+  } catch (err) {
+    toast(`Couldn’t create the board: ${err.message}`, { tone: 'error' });
+  }
+});
+events.addEventListener('sessions', () => renderHome());
+events.addEventListener('state', () => { if (!home.hidden) renderHomeStatus(); });
+
 // ---- inside the iPad app (canvas/ios). It injects window.__canvasNative and runs speech on
 // Apple's native engines (every installed voice, including Premium ones Safari hides).
 const native = window.__canvasNative || null;
@@ -1758,6 +1874,15 @@ async function boot() {
   };
   requestAnimationFrame(() => requestAnimationFrame(showUi));
   setTimeout(showUi, 400);
+  // the menu comes first when the app starts (not on a reload: sessionStorage outlives that)
+  if (KEY) {
+    let first = true;
+    try {
+      first = !sessionStorage.getItem('homeShown');
+      sessionStorage.setItem('homeShown', '1');
+    } catch { /* no storage: show it */ }
+    if (first) openHome();
+  }
   const inkReady = ink.start(); // the board at once from this device's copy, if it has one
   inkReady.then(() => { t.ink = performance.now(); });
   try {

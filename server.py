@@ -109,6 +109,21 @@ ASSET_ATTR_RE = re.compile(r"""(\b(?:src|href)=")((?![a-z]+:|//)[^"?#]+\.(?:m?js
 _build = {"t": 0.0, "v": ""}
 
 
+_plugin = {"mtime": None, "v": ""}
+
+
+def plugin_version() -> str:
+    """The Claude Code plugin's version in this repo (.claude-plugin/plugin.json), for the menu."""
+    path = os.path.join(BASE_DIR, ".claude-plugin", "plugin.json")
+    try:
+        mtime = os.stat(path).st_mtime_ns
+        if mtime != _plugin["mtime"]:
+            _plugin.update(mtime=mtime, v=str(read_json_obj(path).get("version") or ""))
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return _plugin["v"]
+
+
 def build_version() -> str:
     now = time.monotonic()
     if _build["v"] and now - _build["t"] < 1.0:
@@ -1651,7 +1666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ---- API: reads
     def _api_ping(self):
         clients = sum(x.hub.count() for x in self.sessions.all())
-        self._send_json(200, {"ok": True, "time": now_ms(), "clients": clients})
+        self._send_json(200, {"ok": True, "time": now_ms(), "clients": clients, "plugin": plugin_version()})
 
     def _api_state(self):
         # the event cursor is read *before* the snapshot, so the page's event stream resumes from
