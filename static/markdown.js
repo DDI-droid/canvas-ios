@@ -67,6 +67,26 @@ const inlineMath = {
 const marked = new Marked({ gfm: true, breaks: true });
 marked.use({ extensions: [blockMath, inlineMath] });
 
+// Tables in a narrow chat: each cell remembers its column's heading (data-label), so app.css can
+// show a row as a small card ("Heading: value" lines) when the chat is too narrow for columns.
+// The table also gets a wrapper that scrolls sideways when it's wide but doesn't fit.
+function prepareTables(html) {
+  if (!html.includes('<table')) return html;
+  const t = document.createElement('template');
+  t.innerHTML = html;
+  for (const table of t.content.querySelectorAll('table')) {
+    const heads = [...table.querySelectorAll('thead th')].map((th) => th.textContent.trim());
+    for (const tr of table.querySelectorAll('tbody tr')) {
+      [...tr.children].forEach((td, i) => { if (heads[i]) td.setAttribute('data-label', heads[i]); });
+    }
+    const wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    table.replaceWith(wrap);
+    wrap.append(table);
+  }
+  return t.innerHTML;
+}
+
 export function renderMarkdown(md) {
   let html;
   try {
@@ -74,5 +94,10 @@ export function renderMarkdown(md) {
   } catch {
     html = String(md ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
   }
-  return purifier.sanitize(html, { ADD_ATTR: ['target'], FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select'] });
+  html = purifier.sanitize(html, { ADD_ATTR: ['target'], FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select'] });
+  try {
+    return prepareTables(html); // only rearranges what DOMPurify already let through
+  } catch {
+    return html;
+  }
 }

@@ -964,9 +964,26 @@ input[type="range"]::-moz-range-thumb { width: 24px; height: 24px; border: 0; bo
   -webkit-overflow-scrolling: touch;
 }
 .md pre code { padding: 0; background: none; font-size: .84em; line-height: 1.55; }
-.md table { border-collapse: collapse; margin: 0 0 .7em; font-size: .93em; display: block; overflow-x: auto; font-variant-numeric: tabular-nums; }
-.md th, .md td { padding: .36em .7em; border-bottom: .5px solid var(--line-2); text-align: left; }
+/* Tables. The bubble lets text break anywhere (long links), but inside a table that lets the
+   browser squeeze every column to one letter wide: cells break only where a word truly can't fit.
+   A table wider than the chat scrolls sideways in its wrapper; in a narrow chat each row becomes
+   a small card instead (markdown.js puts each column's heading on its cells as data-label). */
+.md .table-wrap { margin: 0 0 .7em; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.md table { border-collapse: collapse; font-size: .93em; font-variant-numeric: tabular-nums; }
+.md th, .md td { padding: .36em .7em; border-bottom: .5px solid var(--line-2); text-align: left; vertical-align: top;
+  overflow-wrap: break-word; word-break: normal; min-width: 5.5em; }
 .md th { font-weight: 600; color: var(--fg-2); }
+#messages { container: chat / inline-size; }
+@container chat (max-width: 560px) {
+  .md .table-wrap { overflow: visible; }
+  .md table, .md tbody, .md tr, .md td { display: block; width: auto; }
+  .md thead { display: none; }
+  .md tr { padding: .55em .8em .6em; margin: 0 0 .5em; border-radius: 12px; background: var(--fill-2); border: .5px solid var(--line-2); }
+  .md td { padding: .12em 0; border: 0; min-width: 0; }
+  .md td:first-child { font-weight: 650; padding-bottom: .25em; }
+  .md td[data-label]:not(:first-child)::before { content: attr(data-label); display: block; font-size: .78em; font-weight: 600;
+    color: var(--fg-3); letter-spacing: .01em; margin-top: .25em; }
+}
 .md img { max-width: 100%; border-radius: var(--r-sm); }
 .md .katex { font-size: 1.08em; }
 .md .math-block { margin: .2em 0 .75em; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; padding: 2px 0; }
