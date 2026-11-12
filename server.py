@@ -18,6 +18,7 @@ import http.server
 import json
 import math
 import os
+import posixpath
 import queue
 import re
 import secrets
@@ -141,6 +142,38 @@ def version_imports(body: bytes, ver: str) -> bytes:
     text = body.decode("utf-8")
     text = IMPORT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}?v={ver}{m.group(2)}", text)
     return text.encode("utf-8")
+
+
+_preloads = {"v": None, "links": ""}
+MODULEPRELOAD_RE = re.compile(r'[ \t]*<link rel="modulepreload"[^>]*>\r?\n?')
+
+
+def module_preloads(ver: str) -> str:
+    """A <link rel="modulepreload"> for every module the page imports (app.js and everything it
+    reaches, libraries included), at the URLs the imports ask for. The device then fetches them
+    all at once, right after the page, instead of finding them a level at a time (app.js, then
+    what it imports, then what those import...): each level is a round trip, and from the iPad
+    through the tunnel one is 0.1-3 s."""
+    if _preloads["v"] == ver:
+        return _preloads["links"]
+    found, todo = [], ["app.js"]
+    while todo:
+        rel = todo.pop(0)
+        try:
+            with open(os.path.join(STATIC_DIR, *rel.split("/")), "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in IMPORT_RE.finditer(text):
+            dep = posixpath.normpath(posixpath.join(posixpath.dirname(rel), m.group(3)))
+            if dep.startswith("..") or dep in found or dep == "app.js":
+                continue
+            if os.path.isfile(os.path.join(STATIC_DIR, *dep.split("/"))):
+                found.append(dep)
+                todo.append(dep)
+    links = "".join(f'<link rel="modulepreload" href="{dep}?v={ver}">\n' for dep in found)
+    _preloads.update(v=ver, links=links)
+    return links
 
 
 def version_page_assets(html: str, ver: str) -> str:
@@ -1467,7 +1500,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except FileNotFoundError:
             raise HttpError(500, "static/index.html missing")
         html = html.replace("%%K%%", urllib.parse.quote(self.token, safe=""))
-        html = version_page_assets(html, build_version())
+        ver = build_version()
+        html = version_page_assets(html, ver)
+        # every module up front, in one wave (module_preloads), where the hand-written two were
+        html = MODULEPRELOAD_RE.sub("", html)
+        html = html.replace('<script src="guard.js', module_preloads(ver) + '<script src="guard.js', 1)
         secure = (self.headers.get("X-Forwarded-Proto") or "").lower() == "https"
         cookie = (
             f"{COOKIE_NAME}={self.token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"
