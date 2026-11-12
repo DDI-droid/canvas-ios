@@ -916,7 +916,11 @@ def build_timeline_text(tl: dict, mode: str, text: str) -> str:
 CLAIMS_ROUTING = re.compile(
     r"\b(already (working|on it|in progress|doing|handling|started|being)"
     r"|i'?ll (pass|send|forward) (it|that|this|your|them)|i'?ll tell (it|them|the main agent)"
-    r"|passing (it|that|this|your \w+) on|i'?ve (passed|sent|forwarded|asked|handed|given) (it|that|this|your|the main agent))",
+    r"|passing (it|that|this|your \w+) on|i'?ve (passed|sent|forwarded|asked|handed|given) (it|that|this|your|the main agent)"
+    # it says it's checking / asking, or waiting on an answer (real cases, 2026-11-12 17:14)
+    r"|checking (with|on) (it|the main agent|that)|let me (check|ask) (with )?(it|the main agent)"
+    r"|i'?(ll| will) (ask|check with) (it|the main agent)|(?<!should )(?<!what )\bi (did )?ask(ed)? (it|the main agent)"
+    r"|i'?ll (tell|let) you (know )?(when|as soon as|once) (it|the main agent)|still waiting (on|for) (it|that|the main agent))",
     re.I)
 
 
@@ -2667,9 +2671,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.hub.broadcast("draw", item)
         log(f"voice note [{self.session.id}] {text[:60]!r}")
 
-    def _recent_chat(self, n: int = 4, chars: int = 300) -> str:
-        """The talker's view of the chat: the last few messages, oldest first, each shortened; the
-        main agent's latest one is marked (new) the first time the talker is shown it."""
+    def _recent_chat(self, n: int = 4, chars: int = 600, newest_chars: int = 5000) -> str:
+        """The talker's view of the chat: the last few messages, oldest first, each shortened, except
+        the newest one, which is whole (it's what the talker is asked about and reads out: cut at
+        300 characters, the talker told the user a reply "got cut off"). The main agent's latest
+        message is marked (new) the first time the talker is shown it."""
         new_text = self._unseen_main_message()  # marks it seen
         st = self.store
         with st.lock:
@@ -2683,7 +2689,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 continue
             who = "user" if e.get("role") == "user" else "main agent"
             new = " (new)" if who == "main agent" and new_text and e is entries[-1] else ""
-            lines.append(f"- {who}{new}: {text[:chars]}{'…' if len(text) > chars else ''}")
+            cap = newest_chars if e is entries[-1] else chars
+            lines.append(f"- {who}{new}: {text[:cap]}{'… (read_chat has the rest)' if len(text) > cap else ''}")
         return "[recent chat]\n" + "\n".join(lines) if lines else ""
 
     def _unseen_main_message(self) -> str:

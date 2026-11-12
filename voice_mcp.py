@@ -183,7 +183,7 @@ def _read_chat(count) -> list:
         who = "user" if e.get("role") == "user" else "main agent"
         text = " ".join(str(e.get("text") or "").split())
         if text:
-            lines.append(f"{who}: {text[:900]}")
+            lines.append(f"{who}: {text[:8000]}")  # whole messages: a cut one reads as "the reply got cut off"
     lines = lines[-n:]
     if not lines:
         return [{"type": "text", "text": "The chat is empty."}]
