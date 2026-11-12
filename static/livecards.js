@@ -289,11 +289,26 @@ export class BrowserStream {
     this.avg = 0;           // recent picture size (bytes)
     this.changed = 0;
     this.lastMeta = '';
+    this.ctrl = null;       // cancels the requests waiting for pictures when it stops
+    this.resume = false;    // it was running when the app went to the background
+    // In the background nobody sees it: stop fetching (the board's own check can't run then:
+    // a hidden page gets no animation frames), and pick up again on coming back.
+    this._onVis = () => {
+      if (document.hidden) {
+        if (this.on) { this.resume = true; this.stop(); }
+      } else if (this.resume) {
+        this.resume = false;
+        this.start();
+      }
+    };
+    document.addEventListener('visibilitychange', this._onVis);
   }
 
   start() {
     if (this.on) return;
+    if (document.hidden) { this.resume = true; return; }
     this.on = true;
+    this.ctrl = new AbortController();
     const gen = ++this.gen;
     this._lane(gen, 0);
     this._lane(gen, 1);
@@ -302,6 +317,8 @@ export class BrowserStream {
   stop() {
     this.on = false;
     this.gen++;
+    if (this.ctrl) this.ctrl.abort(); // a picture already on its way isn't downloaded for nothing
+    this.ctrl = null;
   }
 
   // the card's on-screen width in device pixels: no point fetching bigger pictures than that
@@ -318,7 +335,7 @@ export class BrowserStream {
       try {
         const res = await fetch(withKey(`/api/browser/${encodeURIComponent(this.bid)}/frame?after=${this.shown}`
           + `&v=${this.viewer}&w=${this.width}&q=${STEP_Q[this.qi]}`), {
-          headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': SESSION }, cache: 'no-store' });
+          headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': SESSION }, cache: 'no-store', signal: this.ctrl && this.ctrl.signal });
         if (gen !== this.gen) return;
         if (!res.ok) throw new Error(res.status);
         if ((res.headers.get('Content-Type') || '').startsWith('image/')) {
@@ -330,6 +347,7 @@ export class BrowserStream {
           if (seq > this.shown) this._show(seq, blob, res.headers);
         } else await res.json();
       } catch {
+        if (gen !== this.gen) return; // stopped
         await new Promise((r) => setTimeout(r, 1500)); // the PC or its Chrome is restarting
       }
       const wait = 90 - (performance.now() - t0); // two lanes: at most ~20 pictures a second
@@ -386,6 +404,8 @@ export class BrowserStream {
 
   destroy() {
     this.stop();
+    this.resume = false;
+    document.removeEventListener('visibilitychange', this._onVis);
     if (this.url) URL.revokeObjectURL(this.url);
   }
 }

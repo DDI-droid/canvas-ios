@@ -99,6 +99,12 @@ class Tab:
         self.cursors: dict[str, int] = {}     # viewer -> the last picture handed to it
         self.cast = (55, 960)                 # the screencast's (quality, max width) now
         self.cast_at = 0.0
+        # Chrome makes pictures only while someone looks: a card on screen asking for them, or a
+        # request waiting for the next one. Otherwise the screencast pauses (an animated page
+        # would cost the PC most of a core for nobody) and picks up on the next request.
+        self.casting = True
+        self.watched_at = time.monotonic()    # when a viewer last asked for pictures
+        self.waiting = 0                      # requests waiting for the next picture now
         self.alive = True
         self.ws = ws_connect(target["webSocketDebuggerUrl"], max_size=64 * 1024 * 1024, open_timeout=10)
         self.send_lock = threading.Lock()
@@ -112,6 +118,7 @@ class Tab:
         self.call("Emulation.setDeviceMetricsOverride", width=VIEW_W, height=VIEW_H, deviceScaleFactor=1, mobile=False)
         self.call("Emulation.setTouchEmulationEnabled", enabled=True, maxTouchPoints=1)
         self._start_cast()
+        threading.Thread(target=self._pause_when_unwatched, daemon=True, name=f"tab-idle-{bid}").start()
         if url:
             self.pending_url = url
             self.call("Page.navigate", url=url)
@@ -149,16 +156,33 @@ class Tab:
         now = time.monotonic()
         with self.cond:
             self.viewers[viewer] = (width, quality, now)
+            self.watched_at = now
             for v, (_, _, seen) in list(self.viewers.items()):
                 if now - seen > 15:
                     self.viewers.pop(v, None)
                     self.cursors.pop(v, None)
             best = (max(x[1] for x in self.viewers.values()), max(x[0] for x in self.viewers.values()))
-            if best == self.cast or now - self.cast_at < 1.0:
+            if self.casting and (best == self.cast or now - self.cast_at < 1.0):
                 return
+            restart = self.casting
             self.cast, self.cast_at = best, now
-        self.call("Page.stopScreencast")
+            self.casting = True
+        if restart:
+            self.call("Page.stopScreencast")
         self._start_cast()
+
+    UNWATCHED_S = 6.0
+
+    def _pause_when_unwatched(self) -> None:
+        while self.alive:
+            time.sleep(2.0)
+            with self.cond:
+                pause = (self.casting and not self.waiting
+                         and time.monotonic() - self.watched_at > self.UNWATCHED_S)
+                if pause:
+                    self.casting = False
+            if pause:
+                self.call("Page.stopScreencast")
 
     def _ask_title(self) -> None:
         self.title_asks.add(self.call("Runtime.evaluate", expression="[document.title, location.href]", returnByValue=True))
@@ -219,18 +243,28 @@ class Tab:
         With a viewer, each picture goes to one of its requests only (it keeps two in flight)."""
         deadline = time.monotonic() + wait
         with self.cond:
-            if viewer:
-                after = max(after, self.cursors.get(viewer, 0))
-            while self.alive and self.seq <= after:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
-                self.cond.wait(left)
+            resume = not self.casting  # paused while nobody looked: someone is looking now
+            self.casting = True
+        if resume:
+            self._start_cast()
+        with self.cond:
+            self.waiting += 1
+            try:
                 if viewer:
                     after = max(after, self.cursors.get(viewer, 0))
-            if viewer and self.seq > self.cursors.get(viewer, 0):
-                self.cursors[viewer] = self.seq
-            return self.seq, self.frame
+                while self.alive and self.seq <= after:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    self.cond.wait(left)
+                    if viewer:
+                        after = max(after, self.cursors.get(viewer, 0))
+                if viewer and self.seq > self.cursors.get(viewer, 0):
+                    self.cursors[viewer] = self.seq
+                return self.seq, self.frame
+            finally:
+                self.waiting -= 1
+                self.watched_at = time.monotonic()
 
     def input(self, ev: dict) -> None:
         self.last_input = time.monotonic()
@@ -431,8 +465,12 @@ class BrowserManager:
             self._chrome()
             bid = bid or "br-" + secrets.token_hex(4)
             old = self.tabs.pop(bid, None)
-            if old:
+            if old:  # its Chrome tab too, not just our connection to it (or it stays open for good)
                 old.close()
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/close/{old.target}", timeout=5).read()
+                except Exception:
+                    pass
             # a blank tab first (it's made normal Chrome before the page's first request), in its own
             # window: tabs sharing a window would hide each other (no input, no new pictures)
             target = self._new_window()

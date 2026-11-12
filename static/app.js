@@ -290,7 +290,11 @@ const updateLiveCards = () => {
 };
 board.addEventListener('settle', updateLiveCards);
 layer.addEventListener('change', updateLiveCards);
-document.addEventListener('visibilitychange', updateLiveCards);
+// (hidden: right away, since a hidden page gets no animation frames to run the check in)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) layer.updateVisibility(board.viewRect());
+  else updateLiveCards();
+});
 board.addEventListener('change', (e) => {
   if (e.detail.local) {
     ink.local(); // send just what changed
