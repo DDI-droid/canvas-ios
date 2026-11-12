@@ -139,10 +139,9 @@
     <header class="chat-head" id="chatHead">
       <div class="chat-title">
         <button class="icon-btn sm" id="btnMenu" data-icon="menu" aria-label="Menu" aria-haspopup="true" aria-expanded="false" title="Menu"></button>
-        <span class="claude-mark" data-icon="claude"></span>
-        <button class="session-btn" id="btnSession" aria-haspopup="true" aria-expanded="false" title="Sessions">
-          <span class="name">Claude</span><span class="session-name" id="sessionName"></span><span class="session-unread-dot" id="sessionUnread" hidden></span><span class="session-chev" aria-hidden="true">▾</span>
-        </button>
+        <span class="session-btn" id="btnSession" title="This board (switch boards from the menu: the double-star button)">
+          <span class="name">Claude</span><span class="session-name" id="sessionName"></span>
+        </span>
         <span class="conn" id="conn" data-state="wait" role="status" aria-label="Connecting"></span>
         <span class="conn-label" id="connLabel"></span>
       </div>
@@ -186,15 +185,6 @@
           <button class="menu-row" id="btnServerLink" hidden>Server link…</button>
           <button class="menu-row" id="btnOpenApp" hidden>Open in Canvas app</button>
         </div>
-      </div>
-      <div class="pop menu-pop glass session-pop" id="sessionPop" hidden role="dialog" aria-label="Sessions">
-        <div class="menu-label">Sessions</div>
-        <div class="session-list" id="sessionList" data-scroll></div>
-        <form class="new-session" id="newSessionForm" autocomplete="off">
-          <input id="newSessionName" type="text" maxlength="40" placeholder="New session name, e.g. quantization" autocapitalize="off" autocorrect="off" spellcheck="false">
-          <button class="menu-row" type="submit">Create</button>
-        </form>
-        <div class="session-help" id="sessionHelp" hidden></div>
       </div>
     </header>
     <div class="chat-scroll" id="chatScroll" data-scroll>

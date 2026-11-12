@@ -1370,10 +1370,9 @@ function newerVersion(a, b) {
 }
 
 // ---- sessions: one board + chat per Claude session (on this PC, another machine, or in the cloud).
-// The switcher is in the panel title. A Claude session attaches with canvas_agent.py; the
-// instructions it needs are served at /agent. Unread dots compare each session's last reply
-// with when you last saw it; the green dot means a Claude session is attached and listening.
-const sessionPopover = popover($('#sessionPop'), $('#btnSession'), { onOpen: () => renderSessions() });
+// Boards are switched and made in the menu (below: "home"); the panel title just names this one.
+// A Claude session attaches with canvas_agent.py; the instructions it needs are served at /agent.
+// "New reply" compares each session's last reply with when you last saw it.
 let sessionList = [];
 const seen = store.get('sessionSeen', {});
 function markSeen(id, ts) {
@@ -1387,40 +1386,6 @@ const connectText = (id) => `Connect to my canvas as session "${id}". Follow the
 function updateSessionTitle() {
   const cur = sessionList.find((x) => x.id === SESSION);
   $('#sessionName').textContent = cur ? cur.title : SESSION;
-  $('#sessionUnread').hidden = !sessionList.some((x) => x.id !== SESSION && (x.last_reply || 0) > (seen[x.id] || 0));
-}
-
-function renderSessions() {
-  const box = $('#sessionList');
-  box.textContent = '';
-  for (const s of sessionList) {
-    const row = document.createElement('div');
-    row.className = 'session-row' + (s.id === SESSION ? ' on' : '');
-    const pick = document.createElement('button');
-    pick.className = 'session-pick';
-    pick.dataset.session = s.id;
-    const dot = document.createElement('span');
-    dot.className = 'session-agent' + (s.agent ? ' attached' : ''); // not 'live': .live styles the ink canvas
-    dot.title = s.agent ? 'A Claude session is attached' : 'No Claude session attached';
-    const title = document.createElement('span');
-    title.className = 'session-title';
-    title.textContent = s.title;
-    pick.append(dot, title);
-    if (s.id !== SESSION && (s.last_reply || 0) > (seen[s.id] || 0)) {
-      const u = document.createElement('span');
-      u.className = 'session-unread';
-      pick.append(u);
-    }
-    row.append(pick);
-    if (!s.agent) {
-      const copy = document.createElement('button');
-      copy.className = 'session-copy';
-      copy.dataset.copy = s.id;
-      copy.textContent = 'Connect';
-      row.append(copy);
-    }
-    box.append(row);
-  }
 }
 
 function onSessions(list) {
@@ -1440,46 +1405,19 @@ function onSessions(list) {
   if (changed) store.set('sessionSeen', seen);
   sessionList = list;
   updateSessionTitle();
-  if (!$('#sessionPop').hidden) renderSessions();
 }
 events.addEventListener('sessions', (e) => onSessions(e.detail));
 api.get('/api/sessions').then((r) => onSessions(r && r.sessions)).catch(() => {});
 
-async function showConnect(id, { open = false } = {}) {
-  const text = connectText(id);
-  let copied = false;
+// How to attach a Claude session to a board: the text to paste into Claude Code, copied.
+async function copyConnect(id) {
   try {
-    await navigator.clipboard.writeText(text);
-    copied = true;
-  } catch { /* clipboard not allowed here: the text is shown to copy by hand */ }
-  const help = $('#sessionHelp');
-  help.hidden = false;
-  help.textContent = '';
-  const p = document.createElement('p');
-  p.textContent = (copied ? 'Copied. ' : '') +
-    'Paste this into any Claude Code session (on this PC, another machine, or in the cloud) to attach it to this board:';
-  const cmd = document.createElement('div');
-  cmd.className = 'session-cmd';
-  cmd.textContent = text;
-  help.append(p, cmd);
-  if (open && id !== SESSION) {
-    const go = document.createElement('button');
-    go.className = 'menu-row';
-    go.textContent = 'Open this session';
-    go.addEventListener('click', () => openBoard(id));
-    help.append(go);
+    await navigator.clipboard.writeText(connectText(id));
+    toast('Copied. Paste it into any Claude Code session to attach it to this board.');
+  } catch {
+    toast(`Couldn’t copy. In Claude Code, run /canvas:connect ${id}`, { ms: 8000 });
   }
 }
-
-$('#sessionList').addEventListener('click', (e) => {
-  const copy = e.target.closest('[data-copy]');
-  if (copy) {
-    showConnect(copy.dataset.copy, { open: true });
-    return;
-  }
-  const pick = e.target.closest('[data-session]');
-  if (pick && pick.dataset.session !== SESSION) openBoard(pick.dataset.session);
-});
 
 // Another board, in place: no reload, so nothing goes blank. The toolbar and chat stay; the
 // board fades out, what was drawn on it is sent (or kept on this device for it), and the new
@@ -1491,7 +1429,6 @@ async function openBoard(id) {
   const el = $('#board');
   const t0 = performance.now();
   try {
-    sessionPopover.close();
     if (viewer.isOpen) viewer.close();
     el.classList.remove('board-in');
     el.classList.add('board-out');
@@ -1551,23 +1488,6 @@ async function openBoard(id) {
     opening = null;
   }
 }
-
-$('#newSessionForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const input = $('#newSessionName');
-  const title = input.value.trim();
-  if (!title) return;
-  try {
-    const s = await api.post('/api/sessions', { title });
-    input.value = '';
-    sessionList = [...sessionList.filter((x) => x.id !== s.id), s];
-    markSeen(s.id, Date.now());
-    renderSessions();
-    await showConnect(s.id, { open: true });
-  } catch (err) {
-    toast(`Couldn’t create the session: ${err.message}`, { tone: 'error' });
-  }
-});
 
 // ---- the menu ("home"): your boards, what's connected, and Continue. It opens when the app
 // starts (once per launch: sessionStorage survives a reload, not a relaunch) and from the
@@ -1684,9 +1604,9 @@ $('#homeNewForm').addEventListener('submit', async (e) => {
     markSeen(s.id, Date.now());
     closeHome();
     await openBoard(s.id);
-    // as from the board list: how to attach a Claude session to it
-    sessionPopover.open();
-    await showConnect(s.id);
+    // no Claude on it yet: how to attach one
+    toast(`Board “${s.title || s.id}” is ready. To attach Claude, run /canvas:connect ${s.id} in Claude Code.`,
+      { action: 'Copy', onAction: () => copyConnect(s.id), ms: 15000 });
   } catch (err) {
     toast(`Couldn’t create the board: ${err.message}`, { tone: 'error' });
   }

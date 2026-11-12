@@ -1766,8 +1766,7 @@ html.is-fs #chatScroll { touch-action: none; }
   border-radius: 10px;
   color: var(--fg);
 }
-.session-btn:hover, .session-btn.active { background: var(--fill-2); }
-.session-btn .name { display: none; } /* the Claude mark is right there; show the session */
+.session-btn .name { display: none; } /* the panel title names the board; boards are switched in the menu */
 .session-name {
   overflow: hidden;
   text-overflow: ellipsis;
