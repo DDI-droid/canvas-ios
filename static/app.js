@@ -1605,7 +1605,10 @@ function renderHome() {
     row.append(dot, text, end);
     box.append(row);
   }
+  // Continue: back to the board you were on, only while it's online (a Claude session attached);
+  // otherwise there's nothing to continue, so no button: pick a board from the list
   const cur = sessionList.find((x) => x.id === SESSION);
+  $('#homeContinue').hidden = !(cur && cur.agent);
   $('#homeCurrent').textContent = cur ? cur.title : SESSION;
   renderHomeStatus();
 }
