@@ -20,6 +20,9 @@ import { api } from './api.js';
 const PAUSE_MS = 700;             // a pause this long sends the draft
 const PAUSE_AFTER_PUNCT_MS = 500; // ...shorter when the recogniser closed the sentence (. ? !)
 const HOLD_MS = 12000;            // an unanswered draft is kept this long in case you go on
+const HOLD_LONG_MS = 5000;        // ...a long one (LONG_WORDS+) only this long: you've likely finished
+const LONG_WORDS = 30;
+const FINISH_MIN_WORDS = 8;       // when the hold runs out, a draft this long gets an answer, not the bin
 const KEEP_WARM_MS = 240000;      // ping Haiku after 4 idle minutes so its prompt cache stays warm
 const ECHO_GRACE_MS = 1200;       // just after the voice stops, words it said are still echo
 const BARGE_IN_WORDS = 3;
@@ -426,6 +429,7 @@ export class Live extends EventTarget {
     const n = words(text).length;
     if (n > this.heardWords) {
       this.grewAt = now();
+      this.finishing = false;
       // You went on after a pause: an answer to the shorter draft would be stale.
       if (this.sent && n > this.sent.words) this.wentOn();
     }
@@ -437,7 +441,12 @@ export class Live extends EventTarget {
   wentOn() {
     this.heldAt = 0;
     const t = this.turn;
-    if (t && t.kind === 'utterance' && !t.answered) this.cancelTurn();
+    if (t && t.kind === 'utterance' && !t.answered) {
+      this.cancelTurn();
+      // its answer is gone, so the draft must go again at the next pause, even if the recogniser
+      // then rewrites your words into no more of them than before
+      this.resend = true;
+    }
   }
 
   // ---- the beat
@@ -450,12 +459,29 @@ export class Live extends EventTarget {
     }
     const text = this.ears.text;
     if (text && !this.mouth.speaking) {
-      if (!this.sent || words(text).length > this.sent.words) {
+      const n = words(text).length;
+      if (!this.sent || n > this.sent.words || (this.resend && !this.busy())) {
         const wait = /[.?!]$/.test(text) ? PAUSE_AFTER_PUNCT_MS : PAUSE_MS;
-        if (t - this.grewAt >= wait) this.sendDraft(text, false);
-      } else if (this.heldAt && t - this.heldAt > HOLD_MS) {
-        this.clearDraft(true); // nobody followed up on it
-        this.set('listening');
+        if (t - this.grewAt >= wait) {
+          this.resend = false;
+          this.sendDraft(text, false);
+        }
+      } else if (this.heldAt && t - this.heldAt > (n >= LONG_WORDS ? HOLD_LONG_MS : HOLD_MS)) {
+        if (n >= FINISH_MIN_WORDS && !this.finishing) {
+          // Haiku waited for more and you've gone quiet: you've finished, so it answers now.
+          // (Only a few words, like "I want to", are dropped as before.)
+          this.finishing = true;
+          this.heldAt = 0;
+          const clean = this.stripEcho(text);
+          if (clean) {
+            this.sent = { text: clean, words: n };
+            this.lastHeard = clean;
+            this.askWithScreen({ kind: 'utterance', text: clean, continued: true, done: true, quiet: true, interrupted: this.cutoff });
+          }
+        } else {
+          this.clearDraft(true); // nobody followed up on it
+          this.set('listening');
+        }
       }
     } else if (!text && !this.mouth.speaking && !this.busy() && this.pendingMain.length) {
       this.ask({ kind: 'main_reply', text: this.pendingMain.shift() });
@@ -576,6 +602,8 @@ export class Live extends EventTarget {
   clearDraft(resetEars) {
     this.sent = null;
     this.heldAt = 0;
+    this.resend = false;
+    this.finishing = false;
     this.heardWords = 0;
     this.echoInDraft = false;
     this.userFrom = 0;

@@ -2514,7 +2514,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             heard = body.get("text")
             if not isinstance(heard, str) or not heard.strip():
                 raise HttpError(400, "text is required")
-            heard = heard.strip()[:2000]
+            heard = heard.strip()
+            if len(heard) > 6000:
+                # a very long dictation: keep how it began and, above all, the newest words (cutting
+                # the end made it look unfinished, so the talker kept waiting and never answered)
+                heard = heard[:1500].rstrip() + " … " + heard[-4400:].lstrip()
             view = body.get("view")
             if isinstance(view, list) and len(view) == 4 and all(isinstance(n, (int, float)) for n in view):
                 with self.voice.lock:
@@ -2527,7 +2531,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if body.get("continued") and self.voice.fragment_seen:
                 parts.append("[continued] the user kept talking; this is the whole thing so far")
             parts.append(f'heard: "{heard}"')
-            if body.get("done"):
+            if body.get("done") and body.get("quiet"):
+                parts.append("[done] they stopped talking a while ago: they've finished, so answer now "
+                             "(hand off anything that needs work)")
+            elif body.get("done"):
                 parts.append("[done] they tapped the orb: they've finished, so answer now")
             cut = body.get("interrupted")
             if isinstance(cut, str) and cut.strip():
@@ -2625,6 +2632,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # it saw these words; unless it answered or dismissed them, they're still pending
                 self.voice.fragment_seen = res["mode"] in ("silent", "look")
             push({"done": True, **{k: v for k, v in res.items() if k != "notes"}})
+            res["finish"] = "quiet" if body.get("quiet") else ("tap" if body.get("done") else "")
             log(f"talk {turn_id} {kind} -> {res['mode']} first={res['first_ms']}ms total={res['ms']}ms")
             self._log_voice(kind, heard, res, test=not body.get("log", True))
 
@@ -2699,7 +2707,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _log_voice(self, kind: str, heard: str, res: dict, test: bool = False) -> None:
         """Voice turns go to data/voice.log, not the chat: the chat panel is the main agent's."""
         rec = {"ts": datetime.now().isoformat(timespec="seconds"), "kind": kind, "heard": heard, "test": test,
-               **{k: res.get(k) for k in ("mode", "via", "task", "text", "looked", "notes", "first_ms", "ms")}}
+               **{k: res.get(k) for k in ("mode", "via", "finish", "task", "text", "looked", "notes", "first_ms", "ms")}}
         with open(os.path.join(DATA_DIR, "voice.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
