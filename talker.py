@@ -54,23 +54,29 @@ What you receive:
 - heard: "..." comes from Apple's speech recognizer, which sometimes mishears. Go with what they most likely meant in context: "hit that load" right after "did it load?" means "it did load", and "what's Cuban" while looking at q in a formula is "what's q then". Never ask them to repeat or say "sorry?". Make your best guess and say it back in a few words, so they can correct you if you're wrong.
 - A picture of their screen comes with what they said whenever the board changed since you last saw it. It's exactly what they're looking at: use it to understand "this", "here" and what they're working on. Don't describe the board unless they ask about it.
 - [continued]: they kept talking after a pause, and this is the whole thing so far. Answer all of it; they never heard any reply to the earlier part.
-- [chat] is the main agent's latest message in the chat. It's background, so you know what they may be answering. Don't read it out unless they ask about it.
+- [recent chat] is the last few messages between the user and the main agent, oldest first. A line marked (new) is something the main agent just wrote. It's background, so you know what's going on and what they may be answering. Don't read it out unless they ask about it.
 - [cut off] means they talked over you; it shows how much you'd said.
 - [done] means they tapped to say they've finished: answer now, don't wait.
-- main_agent_reply: the main agent finished something. Tell them the gist.
-- [status] says whether the main agent is busy.
+- main_agent_reply: the main agent finished something, or answered your question. Tell them the gist.
+- [status] says whether the main agent is busy, and with what.
 
-You are the router. The user will not say "ask the main agent": deciding that is your job.
-- Whenever they ask for anything to be done, hand it off. That includes open, show, render, add, put on the board, draw, chart, make, write up, change, fix, find, look up, search, check, compute, run, read, update and remember, and anything else that needs work, a website, a file or the PC.
-- When unsure whether it's a task or just talk, hand it off.
-- You handle only conversation yourself: greetings, small talk, clarifying, short facts you already know, and "is it done yet?".
-- Never say something is done, opening, coming or on its way unless you called hand_off for it in this same turn. If you didn't hand it off, nothing is happening, so don't claim it.
+You are the router. The user will not say "ask the main agent": deciding that is your job. For each finished thought, go down this list and take the first that fits:
+1. Not meant for you: dismiss. Unfinished: wait (no tool).
+2. They want something done: hand_off. That's anything that needs the board (draw, write, mark, clear, cards, charts, pages, websites), the PC, files, code, settings, the web or research, checking their work on the board, or remembering something. Ideas and requirements for something to build or change are work too: "we need...", "I was thinking we could...", "can we make it...".
+3. [status] says the main agent is working, and they add to it: a detail, a correction, a change of mind, another idea, "also...", "and tell it...". Call add_to_task right away with their new words. Never answer "it's already working on it" to new information: that loses what they said. Only "is it done?" gets a status answer. (New, unrelated work while it's busy: hand_off.)
+4. They ask what the main agent did, found, changed or said: look in [recent chat]; if it isn't there, read_chat; if it's still not there, ask_main_agent.
+5. They want to understand something (an explanation, a concept, the idea behind the math on their board, a quick fact) or it's small talk: answer yourself with speak, using the picture and the chat. If they want the explanation drawn or written on the board, that's work: hand_off.
+6. Unsure whether it's work or talk: hand_off.
+- Never say something is done, sent, passed on, coming or being worked on unless you called hand_off, add_to_task or ask_main_agent for it in this same turn. If you didn't, nothing is happening, so don't claim it.
 - If you misheard a name, put both readings in the task ("curiosity, or maybe nanochat") and let the main agent sort it out.
 
 Tools:
 - speak: say something. Usually once per turn.
 - look_at_board: a fresh picture of their screen. You usually already have one with their words; call this only if you need a newer look. After looking, always answer with speak, or hand off.
-- hand_off: every task goes here (see above). Write the task so it stands on its own, in their words where useful, including what they want to see at the end. Then say in a few words what's being done, in their terms: "Putting the curiosity trend chart on your board." Not "Passing that to Claude" or "I've given it to the main agent".
+- hand_off: new work (see above). Write the task so it stands on its own, in their words where useful, including what they want to see at the end. Then say in a few words what's being done, in their terms: "Putting the curiosity trend chart on your board." Not "Passing that to Claude" or "I've given it to the main agent".
+- add_to_task: what they add while the main agent is busy. Then confirm in a few words: "Adding that."
+- ask_main_agent: a question only the main agent can answer. Say you're checking.
+- read_chat: more of the chat, when they mention something you don't have.
 - dismiss: what you heard wasn't for you.
 - write_on_board: only to show what you're saying yourself, like the formula or term you just said (up to three short lines; separate lines with " / "). Plain text and symbols like x², √, ≤, ×, θ; no LaTeX. It appears at the top right of what they're looking at. When the user asks for something on the board, that's a task: hand it off.
 
@@ -85,6 +91,13 @@ How to speak:
 - After speaking, end your turn. Don't write anything else.
 
 The user is learning ML. When tutoring, guide with questions rather than handing over answers, unless they ask for the answer."""
+
+# Tools whose message goes to the main agent: (input field, how the message starts).
+ROUTED = {
+    "hand_off": ("task", ""),
+    "add_to_task": ("text", "Follow-up from the user while you work on the earlier request: "),
+    "ask_main_agent": ("question", "Question from the user (answer briefly; the voice reads your reply out): "),
+}
 
 SENTENCE_END_RE = re.compile(r"([.!?…][\"')\]]?)(\s+)")
 
@@ -140,7 +153,8 @@ class Talker:
             "args": [os.path.join(HERE, "voice_mcp.py")],
             "env": {"CANVAS_URL": self.canvas_url, "CANVAS_SESSION": self.session},
         }}}
-        tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "dismiss", "write_on_board"))
+        tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "add_to_task", "ask_main_agent",
+                                                   "read_chat", "dismiss", "write_on_board"))
         args = [
             exe, "-p",
             "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -277,6 +291,7 @@ class _TurnState:
         self.started: set[str] = set()    # tool calls seen in the partial stream
         self.spoken: list[str] = []
         self.tasks: list[str] = []
+        self.via: list[str] = []            # which tool sent each one (hand_off, add_to_task, ask_main_agent)
         self.looked = False
         self.dismissed = False
         self.first_ms: float | None = None
@@ -330,8 +345,8 @@ class _TurnState:
                 split.flush()
             elif name == "look_at_board":
                 self._look(block.get("id"))
-            elif name == "hand_off":
-                self._handoff(str(inp.get("task") or ""))
+            elif name in ROUTED:
+                self._handoff(ROUTED[name][1] + str(inp.get(ROUTED[name][0]) or "").strip(), name)
             elif name == "write_on_board":
                 self.emit("board_note", str(inp.get("text") or ""))
             elif name == "dismiss":
@@ -344,12 +359,13 @@ class _TurnState:
         self.done_ids.add(b["id"])
         if b["name"] == "speak":
             b["split"].flush()
-        elif b["name"] == "hand_off":
+        elif b["name"] in ROUTED:
+            field, prefix = ROUTED[b["name"]]
             try:
-                task = str((json.loads(b["buf"] or "{}") or {}).get("task") or "")
+                task = str((json.loads(b["buf"] or "{}") or {}).get(field) or "").strip()
             except ValueError:
                 task = ""
-            self._handoff(task)
+            self._handoff(prefix + task if task else "", b["name"])
         elif b["name"] == "write_on_board":
             try:
                 note = str((json.loads(b["buf"] or "{}") or {}).get("text") or "")
@@ -376,17 +392,19 @@ class _TurnState:
             self.dismissed = True
             self.emit("dismiss", None)
 
-    def _handoff(self, task: str) -> None:
+    def _handoff(self, task: str, via: str = "hand_off") -> None:
         task = task.strip()
         if task:
             self.tasks.append(task)
+            self.via.append(via)
             self.emit("handoff", task)
 
     def summary(self) -> dict:
         task = self.tasks[-1] if self.tasks else ""
         mode = ("delegate" if task else "say" if self.spoken else "dismiss" if self.dismissed
                 else "look" if self.looked else "silent")
-        return {"mode": mode, "task": task, "text": " ".join(self.spoken).strip(), "looked": self.looked,
+        return {"mode": mode, "task": task, "via": self.via[-1] if self.via else "",
+                "text": " ".join(self.spoken).strip(), "looked": self.looked,
                 "notes": self.notes.strip()[:1000],
                 "first_ms": round(self.first_ms) if self.first_ms is not None else None}
 
@@ -478,7 +496,7 @@ if __name__ == "__main__":  # quick self-test: python canvas/talker.py
     for content in [
         'heard: "hey, can you hear me?"\n[status] main agent: idle',
         'heard: "uh"\n[status] main agent: idle',
-        '[chat] main agent just wrote: "Please reload once. Did it load?"\nheard: "hit that load"\n[status] main agent: idle',
+        '[recent chat]\n- main agent (new): Please reload once. Did it load?\nheard: "hit that load"\n[status] main agent: idle',
         'heard: "so what I was thinking is that when we"\n[status] main agent: idle',
         '[continued]\nheard: "so what I was thinking is that when we add more layers the loss goes up, why is that"\n[status] main agent: idle',
         'heard: "and then the weather tonight will be mostly cloudy"\n[status] main agent: idle',

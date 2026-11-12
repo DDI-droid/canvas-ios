@@ -24,6 +24,9 @@ The user has an iPad canvas: an infinite board they draw on with Apple Pencil, a
   - While it's on, end each such turn by writing their prompt and your answer to two **new** files and running `canvas_agent.py copy -s <board> --prompt-file p.md --answer-file a.md`.
   - There are no hooks for this: hooks would run on every turn of every session, and starting a process costs seconds on some machines.
 - Messages that start with 🎙 were spoken. The canvas's voice assistant passes them on, and `(heard: "…")` shows the user's own words. While voice mode is on, the gist of your reply is read out, so put it in the first sentence.
+  - The voice answers explanations and small talk itself, and passes on everything that needs work.
+  - `🎙 Follow-up from the user while you work on the earlier request: …` changes or adds to the task you're on: fold it in. Don't treat it as a separate job.
+  - `🎙 Question from the user …` wants a short answer (what you did, found or changed). The voice reads your reply out.
 
 ## Use the board, not just the chat
 

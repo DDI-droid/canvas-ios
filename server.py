@@ -910,6 +910,16 @@ def build_timeline_text(tl: dict, mode: str, text: str) -> str:
 # --------------------------------------------------------------------------- HTTP
 
 
+# What the talker says when it claims the work is in hand or on its way (the safety net in
+# _api_talk checks that a turn saying this really sent something to the main agent).
+# (Not "still working on X": that's an honest status answer.)
+CLAIMS_ROUTING = re.compile(
+    r"\b(already (working|on it|in progress|doing|handling|started|being)"
+    r"|i'?ll (pass|send|forward) (it|that|this|your|them)|i'?ll tell (it|them|the main agent)"
+    r"|passing (it|that|this|your \w+) on|i'?ve (passed|sent|forwarded|asked|handed|given) (it|that|this|your|the main agent))",
+    re.I)
+
+
 class VoiceState:
     """What the talker should know about the main agent: idle, or working on a handed-off task."""
 
@@ -2511,9 +2521,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if self.voice.view != view:
                         self.voice.notes_in_view = 0
                     self.voice.view = [float(n) for n in view]
-            chat = self._unseen_main_message()
+            chat = self._recent_chat()
             if chat:
-                parts.append(f'[chat] the main agent\'s latest message: "{chat}"')
+                parts.append(chat)
             if body.get("continued") and self.voice.fragment_seen:
                 parts.append("[continued] the user kept talking; this is the whole thing so far")
             parts.append(f'heard: "{heard}"')
@@ -2592,6 +2602,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         "waiting for them to finish, do nothing.]", on_event)
                     again["ms"] = res["ms"] + again["ms"]
                     res = again
+                # Safety net (here, outside the model): it said the work is in hand or will be passed
+                # on, but sent nothing. Then their words go to the main agent anyway, as a follow-up.
+                if (kind == "utterance" and res and res["mode"] == "say" and not self.voice.is_cancelled(turn_id)
+                        and len(heard.split()) >= 8 and CLAIMS_ROUTING.search(res.get("text") or "")):
+                    log(f"talk {turn_id}: said it was passed on but sent nothing; forwarding the user's words")
+                    task = ("Follow-up from the user (the voice said it was being handled but didn't pass it on): "
+                            + heard)
+                    on_event("handoff", task)
+                    res.update(mode="delegate", task=task, via="safety_net")
             except Exception as exc:
                 err = str(exc)
                 log(f"talker error: {exc}")
@@ -2642,6 +2661,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.hub.broadcast("draw", item)
         log(f"voice note [{self.session.id}] {text[:60]!r}")
 
+    def _recent_chat(self, n: int = 4, chars: int = 300) -> str:
+        """The talker's view of the chat: the last few messages, oldest first, each shortened; the
+        main agent's latest one is marked (new) the first time the talker is shown it."""
+        new_text = self._unseen_main_message()  # marks it seen
+        st = self.store
+        with st.lock:
+            entries = [e for e in st.conversation
+                       if isinstance(e, dict) and e.get("role") in ("user", "claude")
+                       and e.get("kind") != "progress" and e.get("source") != "talker"][-n:]
+        lines = []
+        for e in entries:
+            text = re.sub(r"\s+", " ", str(e.get("text") or "")).strip()
+            if not text:
+                continue
+            who = "user" if e.get("role") == "user" else "main agent"
+            new = " (new)" if who == "main agent" and new_text and e is entries[-1] else ""
+            lines.append(f"- {who}{new}: {text[:chars]}{'…' if len(text) > chars else ''}")
+        return "[recent chat]\n" + "\n".join(lines) if lines else ""
+
     def _unseen_main_message(self) -> str:
         """The main agent's latest chat message, if the talker hasn't been shown it yet."""
         st = self.store
@@ -2661,7 +2699,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _log_voice(self, kind: str, heard: str, res: dict, test: bool = False) -> None:
         """Voice turns go to data/voice.log, not the chat: the chat panel is the main agent's."""
         rec = {"ts": datetime.now().isoformat(timespec="seconds"), "kind": kind, "heard": heard, "test": test,
-               **{k: res.get(k) for k in ("mode", "task", "text", "looked", "notes", "first_ms", "ms")}}
+               **{k: res.get(k) for k in ("mode", "via", "task", "text", "looked", "notes", "first_ms", "ms")}}
         with open(os.path.join(DATA_DIR, "voice.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 

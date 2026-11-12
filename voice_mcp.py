@@ -4,12 +4,16 @@ The talker's plain text is private: the user only hears what it passes to `speak
     speak(text)       say words out loud on the iPad
     look_at_board()   get a picture of the user's current board view
     hand_off(task)    give real work to the main Claude Code agent
+    add_to_task(text) the main agent is busy and the user added to it: send it on now
+    ask_main_agent(q) a question only the main agent can answer
+    read_chat(count)  more of the chat than the few lines each turn shows
     dismiss()         what it heard wasn't meant for it: the page erases the user's words
 
-The canvas server (server.py) watches the talker's output stream and acts on `speak` and
-`hand_off` as the tool input streams in, so speech starts before this process is even
-called. Here those two only acknowledge. `look_at_board` fetches the snapshot the page
-uploaded (GET /api/talk/board, which waits for it).
+The canvas server (server.py) watches the talker's output stream and acts on `speak`,
+`hand_off`, `add_to_task` and `ask_main_agent` as the tool input streams in, so speech starts
+before this process is even called. Here those only acknowledge. `look_at_board` fetches the
+snapshot the page uploaded (GET /api/talk/board, which waits for it); `read_chat` reads
+GET /api/conversation.
 """
 from __future__ import annotations
 
@@ -58,6 +62,44 @@ TOOLS = [
             "type": "object",
             "properties": {"task": {"type": "string", "description": "A self-contained task, in the user's words where useful."}},
             "required": ["task"],
+        },
+    },
+    {
+        "name": "add_to_task",
+        "description": (
+            "The main agent is already working on something and the user adds to it: a detail, a "
+            "correction, a change of mind, another idea, \"also...\". Sends their new words to the "
+            "main agent right away as a follow-up. Use this instead of telling them it's already "
+            "being worked on; that would lose what they just said."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "What they added, self-contained, in their words where useful."}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "ask_main_agent",
+        "description": (
+            "Ask the main agent a question only it can answer: what it did, found, changed or "
+            "decided, a result, a file's contents. Check the recent chat first (and read_chat). "
+            "Its answer comes back to you as main_agent_reply."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"question": {"type": "string", "description": "The question, self-contained."}},
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "read_chat",
+        "description": (
+            "Read more of the chat between the user and the main agent (you're shown only the last "
+            "few lines). Use it when they refer to something said earlier that you don't have."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"count": {"type": "integer", "description": "How many recent messages (default 10, at most 30)."}},
         },
     },
     {
@@ -122,11 +164,43 @@ def _look() -> list:
     ]
 
 
+def _read_chat(count) -> list:
+    try:
+        n = max(1, min(30, int(count or 10)))
+    except (TypeError, ValueError):
+        n = 10
+    req = urllib.request.Request(CANVAS_URL + f"/api/conversation?limit={n * 3}",
+                                 headers={"X-Canvas-Key": _token(), "X-Canvas-Session": CANVAS_SESSION})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as res:
+            conv = json.loads(res.read().decode("utf-8")).get("conversation") or []
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return [{"type": "text", "text": f"The chat didn't load ({exc}). Go on without it."}]
+    lines = []
+    for e in conv:
+        if not isinstance(e, dict) or e.get("kind") == "progress" or e.get("source") == "talker":
+            continue
+        who = "user" if e.get("role") == "user" else "main agent"
+        text = " ".join(str(e.get("text") or "").split())
+        if text:
+            lines.append(f"{who}: {text[:900]}")
+    lines = lines[-n:]
+    if not lines:
+        return [{"type": "text", "text": "The chat is empty."}]
+    return [{"type": "text", "text": "The chat, oldest first:\n" + "\n".join(lines)}]
+
+
 def _call(name: str, args: dict) -> tuple[list, bool]:
     if name == "speak":
         return [{"type": "text", "text": "Said. Don't repeat it. End your turn unless you need another tool."}], False
     if name == "hand_off":
         return [{"type": "text", "text": "Handed to the main agent. Its answer will come to you as main_agent_reply."}], False
+    if name == "add_to_task":
+        return [{"type": "text", "text": "Sent to the main agent as a follow-up. Tell them in a few words, then end your turn."}], False
+    if name == "ask_main_agent":
+        return [{"type": "text", "text": "Asked. The answer will come to you as main_agent_reply."}], False
+    if name == "read_chat":
+        return _read_chat(args.get("count")), False
     if name == "look_at_board":
         return _look(), False
     if name == "write_on_board":
