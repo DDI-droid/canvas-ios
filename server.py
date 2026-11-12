@@ -403,6 +403,18 @@ def browser_manager():
     return _browsers
 
 
+_pageshots = None
+
+
+def page_shots():
+    """Pictures of live pages for board pictures (pageshot.py), created on first use."""
+    global _pageshots
+    if _pageshots is None:
+        import pageshot
+        _pageshots = pageshot.PageShots(DATA_DIR, log)
+    return _pageshots
+
+
 def tab_of(item: dict):
     """The browser tab behind a card: a browser card's, or a page card's that's browsing a link."""
     return item.get("browser") or (item.get("browsing") or {}).get("browser")
@@ -2364,6 +2376,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.hub.broadcast("card_data", {"page": token, "data": data, "mode": mode})
         self._send_json(200, {"ok": True})
 
+    def _serve_page_shot(self, token: str):
+        """/live/<token>/shot.png?w=&h=: a picture of the page at the card's size (pageshot.py),
+        for board pictures. Made in the background when missing or older than the page, its data
+        or the asked size; until then the previous picture is served, or 404."""
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            w, h = int(q.get("w", ["1280"])[0]), int(q.get("h", ["800"])[0])
+        except ValueError:
+            raise HttpError(400, "w and h are whole numbers")
+        w, h = max(64, min(w, 2400)), max(64, min(h, 2400))
+        d = pages_dir(self.session)
+        out = os.path.join(d, f"{token}.png")
+        newest = 0.0
+        for src in (f"{token}.json", f"{token}.html"):
+            try:
+                newest = max(newest, os.stat(os.path.join(d, src)).st_mtime)
+            except OSError:
+                pass
+        try:
+            made = os.stat(out).st_mtime
+        except OSError:
+            made = None
+        import pageshot
+        if made is None or made < newest or pageshot.png_size(out) != (w, h):
+            page_shots().request(f"http://127.0.0.1:{SERVER_PORT}/live/{token}/", out, w, h)
+        if made is None:
+            raise HttpError(404, "the picture is being made")
+        with open(out, "rb") as f:
+            png = f.read()
+        etag = f'"{int(made * 1000):x}-{len(png):x}"'
+        same = self.headers.get("If-None-Match") == etag
+        self.send_response(304 if same else 200)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
+        if same:
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(png)))
+        self._security_headers()
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(png)
+
     def _serve_live(self, path: str):
         """/live/<token>/ (the page) and /live/<token>/media/<file> (its session's media)."""
         m = re.match(r"^/live/([A-Za-z0-9_-]{16,64})/(.*)$", path)
@@ -2376,6 +2433,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.session, self.store, self.hub = sess, sess.store, sess.hub
         if rest.startswith("media/"):
             return self._api_media_get(rest[len("media/"):])
+        if rest == "shot.png":
+            return self._serve_page_shot(token)
         if rest not in ("", "index.html"):
             raise HttpError(404, "not found")
         meta = load_page(sess, token)

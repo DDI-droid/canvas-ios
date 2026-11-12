@@ -5,6 +5,25 @@ import { rectsIntersect, unionRect } from './util.js';
 import { withKey } from './api.js';
 import { BAR, LIVE_KINDS, makeLiveCard } from './livecards.js';
 
+// A live page runs in a sandboxed frame, so a board picture can't draw it from here: the server
+// keeps a picture of it, made in headless Chrome at the card's size (pageshot.py). Asking for it
+// also gets it made or remade when it's missing or older than the page.
+const pageShotUrl = (rec) => (rec.kind === 'page' && rec.item && rec.item.src && !rec.item.browsing
+  ? `${rec.item.src}shot.png?w=${Math.round(rec.w)}&h=${Math.round(rec.h - BAR)}` : null);
+async function loadPageShot(rec) {
+  const url = pageShotUrl(rec);
+  if (!url) return null;
+  const img = new Image();
+  img.decoding = 'async';
+  img.src = url;
+  try {
+    await Promise.race([img.decode(), new Promise((_, no) => setTimeout(() => no(new Error('slow')), 1500))]);
+    return img;
+  } catch {
+    return null; // not made yet: the card shows as a plain frame this time
+  }
+}
+
 const CARD_STYLE =
   ':host{all:initial;display:block;position:absolute;contain:layout style}' +
   '.card{position:absolute;inset:0;border-radius:14px;overflow:hidden;background:#fff;' +
@@ -321,6 +340,8 @@ export class ClaudeLayer extends EventTarget {
     host.style.height = `${h}px`;
     rec = { item, host, kind: item.type, w, h, live: null };
     rec.live = makeLiveCard(rec, host.shadowRoot, this.liveOpts || {});
+    const shot = pageShotUrl(rec);
+    if (shot) fetch(shot).catch(() => {}); // so its picture is ready for the next board picture
     if (animate) host.classList.add('enter');
     this.records.set(item.id, rec);
     this._changed();
@@ -444,7 +465,8 @@ export class ClaudeLayer extends EventTarget {
         ctx.fillStyle = '#3a3a3c';
         ctx.font = '600 14px -apple-system, system-ui, sans-serif';
         ctx.fillText(`${{ video: 'Video', page: 'Live page', browser: 'Browser' }[rec.kind]}: ${rec.live.titleEl.textContent || ''}`.slice(0, 80), r[0] + 10, r[1] + 20);
-        const pic = rec.live.stream ? rec.live.stream.img : rec.kind === 'video' ? rec.live.media : null;
+        let pic = rec.live.stream ? rec.live.stream.img : rec.kind === 'video' ? rec.live.media : null;
+        if (!pic && rec.kind === 'page') pic = await loadPageShot(rec);
         try { if (pic && (pic.naturalWidth || pic.videoWidth)) ctx.drawImage(pic, r[0], r[1] + BAR, rec.w, rec.h - BAR); } catch { /* not drawable */ }
         ctx.globalAlpha = 1;
         n++;
