@@ -19,6 +19,7 @@ export class ChatPanel extends EventTarget {
     this.empty = $('#chatEmpty');
     this.typing = $('#typing');
     this.typingText = $('#typingText');
+    this.typingBand = $('#typingBand'); // the shimmer's bright copy of the text (app.css .sh-band)
     this.jump = $('#jumpNew');
     this.pill = $('#chatPill');
     this.badge = $('#pillBadge');
@@ -668,7 +669,10 @@ export class ChatPanel extends EventTarget {
     else text = v;
     this.status = text ? low : 'idle';
     const on = !!text;
-    if (on) this.typingText.textContent = text;
+    if (on) {
+      this.typingText.textContent = text;
+      this.typingBand.dataset.text = text;
+    }
     this.typing.classList.toggle('show', on);
     this.pillStatus.classList.toggle('show', on);
     this.el.classList.toggle('busy', on);

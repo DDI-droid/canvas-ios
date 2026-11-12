@@ -1019,14 +1019,43 @@ input[type="range"]::-moz-range-thumb { width: 24px; height: 24px; border: 0; bo
 .typing-dots i:nth-child(3) { animation-delay: .32s; }
 @keyframes dot { 0%, 70%, 100% { opacity: .25; transform: none; } 35% { opacity: 1; transform: translateY(-3px); } }
 .shimmer {
-  color: transparent;
-  background: linear-gradient(100deg, var(--fg-3) 0%, var(--fg-3) 40%, var(--fg) 50%, var(--fg-3) 60%, var(--fg-3) 100%);
-  background-size: 240% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
+  /* A bright band sweeping across dim text, done with transforms only, so the graphics chip
+     animates it and the page does no work per frame (moving a gradient through the text instead,
+     background-position, cost ~250 ms of main-thread time a second while shown). The text is dim;
+     .sh-band is 240% as wide, carries a soft band in its mask, and slides across; its ::after is
+     the same text, bright, sliding back by the same amount so it stays exactly on the dim text. */
+  position: relative;
+  display: inline-block;
+  overflow: hidden;
+  vertical-align: bottom;
+  white-space: nowrap;
+  color: var(--fg-3);
 }
-.typing.show .shimmer { animation: shimmer 2.2s linear infinite; }
-@keyframes shimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+.sh-band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 240%;
+  pointer-events: none;
+  -webkit-mask-image: linear-gradient(100deg, transparent 40%, #000 50%, transparent 60%);
+  mask-image: linear-gradient(100deg, transparent 40%, #000 50%, transparent 60%);
+  transform: translateX(-70%);
+}
+.sh-band::after {
+  content: attr(data-text);
+  position: absolute;
+  top: 0;
+  left: 0;
+  color: var(--fg);
+  white-space: nowrap;
+  transform: translateX(168%);
+}
+.typing.show .sh-band { will-change: transform; animation: sh-band 2.2s linear infinite; }
+.typing.show .sh-band::after { will-change: transform; animation: sh-text 2.2s linear infinite; }
+/* the band's centre goes from 0.48 widths left of the text to 2.88 right of it, as before */
+@keyframes sh-band { from { transform: translateX(-70%); } to { transform: translateX(70%); } }
+@keyframes sh-text { from { transform: translateX(168%); } to { transform: translateX(-168%); } }
 
 .jump-new {
   position: absolute;
