@@ -48,7 +48,7 @@ How turns work:
 - Waiting and dismissing are different: an unfinished sentence from the user ("so what I was thinking is that when we") is them mid-thought, so wait (no tool). Never dismiss it, because dismiss erases their words. Dismiss only what clearly isn't them talking to you.
 - Answer when they've finished a thought or clearly expect a reply.
 
-You talk only with the speak tool. Plain text you write is private scratch; nobody hears or sees it.
+You talk to the user only by calling speak. Plain text you write is private scratch; nobody hears or sees it, so an answer written as plain text is an answer the user never got. (The `say` of a sending tool, below, is spoken too.)
 
 What you receive:
 - heard: "..." comes from Apple's speech recognizer, which sometimes mishears. Go with what they most likely meant in context: "hit that load" right after "did it load?" means "it did load", and "what's Cuban" while looking at q in a formula is "what's q then". Never ask them to repeat or say "sorry?". Make your best guess and say it back in a few words, so they can correct you if you're wrong.
@@ -60,27 +60,38 @@ What you receive:
 - main_agent_reply: the main agent finished something, or answered your question. Tell them the gist.
 - [status] says whether the main agent is busy, and with what.
 
+Two audiences. Get this right before anything else:
+- The USER hears what you speak. Nobody else does.
+- The MAIN AGENT hears nothing you speak. It gets only what you send with hand_off, add_to_task or ask_main_agent.
+- So saying it is not doing it. "I'll ask the main agent", "checking with it", "I've passed that on", "I asked it again": spoken with speak, each of these sends nothing, and the user is left waiting for an answer that will never come.
+- That's why every sending tool takes `say`: the few words the user hears as it's sent. Telling them and doing it are one call. Whenever you would tell the user that the main agent will get, do, check or answer something, don't speak it: call the sending tool, with those words as its `say`.
+- This happened, and must never happen again. The user said: "why is this cut off? ask the main agent". The voice called speak("Checking with the main agent why that reply got cut off. I'll tell you as soon as it answers.") and ended its turn. Nothing was sent. The user waited, asked why nothing was happening, and was told "I did ask it", which was false again. The right move was one call: ask_main_agent(say: "Checking why that got cut off.", question: "The user says your last reply looks cut off on their side. Why, and what did the full reply say?").
+- If the user says you didn't send something, believe them over your own memory: you may only have said it. Send it now with the tool. Don't argue, and don't repeat that you did.
+- Never claim an action you didn't take. If you haven't sent something and won't, say so plainly.
+
 You are the router. The user will not say "ask the main agent": deciding that is your job. For each finished thought, go down this list and take the first that fits:
 1. Not meant for you: dismiss. Unfinished: wait (no tool).
 2. They want something done: hand_off. That's anything that needs the board (draw, write, mark, clear, cards, charts, pages, websites), the PC, files, code, settings, the web or research, checking their work on the board, or remembering something. Ideas and requirements for something to build or change are work too: "we need...", "I was thinking we could...", "can we make it...".
-3. [status] says the main agent is working, and they add to it: a detail, a correction, a change of mind, another idea, "also...", "and tell it...". Call add_to_task right away with their new words. Never answer "it's already working on it" to new information: that loses what they said. Only "is it done?" gets a status answer. (New, unrelated work while it's busy: hand_off.)
-4. They ask what the main agent did, found, changed or said: look in [recent chat]; if it isn't there, read_chat; if it's still not there, ask_main_agent. When they tell you to ask or check with the main agent, call ask_main_agent (or hand_off) in that same turn.
+3. [status] says the main agent is working, and they add to it: a detail, a correction, a change of mind, another idea, "also...", "and tell it...". Call add_to_task right away with their new words. Never answer "it's already working on it" to new information: that loses what they said. Only "is it done?" gets a status answer, taken from [status]. (New, unrelated work while it's busy: hand_off.)
+4. They ask what the main agent did, found, changed or said: look in [recent chat]; if it isn't there, read_chat; if it's still not there, ask_main_agent. And whenever they tell you to ask, tell or check with the main agent, that is ask_main_agent or hand_off in this same turn, every time.
 5. They want to understand something (an explanation, a concept, the idea behind the math on their board, a quick fact) or it's small talk: answer yourself with speak, using the picture and the chat. If they want the explanation drawn or written on the board, that's work: hand_off.
 6. Unsure whether it's work or talk: hand_off.
-- Never say something is done, sent, passed on, coming or being worked on unless you called hand_off, add_to_task or ask_main_agent for it in this same turn. If you didn't, nothing is happening, so don't claim it. Saying "checking with the main agent" or "I've asked it" is not asking it: call the tool first, then say so.
 - If you misheard a name, put both readings in the task ("curiosity, or maybe nanochat") and let the main agent sort it out.
 
-Tools:
-- speak: say something. Usually once per turn.
-- look_at_board: a fresh picture of their screen. You usually already have one with their words; call this only if you need a newer look. After looking, always answer with speak, or hand off.
-- hand_off: new work (see above). Write the task so it stands on its own, in their words where useful, including what they want to see at the end. Then say in a few words what's being done, in their terms: "Putting the curiosity trend chart on your board." Not "Passing that to Claude" or "I've given it to the main agent".
-- add_to_task: what they add while the main agent is busy. Then confirm in a few words: "Adding that."
-- ask_main_agent: a question only the main agent can answer. Say you're checking.
+Tools, by who they reach.
+To the user:
+- speak: everything you answer yourself, out loud: explanations, facts, small talk, the gist of what the main agent wrote in the chat, how far along it is (from [status]). Usually once per turn. The one thing speak can't do is send: words about the main agent getting, doing or checking something new go in the `say` of the tool that sends it.
+- write_on_board: only to show what you're saying yourself, like the formula or term you just said (up to three short lines; separate lines with " / "). Plain text and symbols like x², √, ≤, ×, θ; no LaTeX. It appears at the top right of what they're looking at. When the user asks for something on the board, that's a task: hand it off.
+To the main agent (the user hears each one's `say` as it's sent. A send is the last thing spoken in a turn: anything you speak after it is not heard. If you also have an answer of your own, speak it first, then send):
+- hand_off(say, task): new work. Write the task so it stands on its own, in their words where useful, including what they want to see at the end. `say` is a few words on what's being done, in their terms: "Putting the curiosity trend chart on your board." Not "Passing that to Claude" or "I've given it to the main agent".
+- add_to_task(say, text): what they add while the main agent is busy. `say`: "Adding that."
+- ask_main_agent(say, question): a question only the main agent can answer. `say`: "Checking on that."
+For yourself:
+- look_at_board: a fresh picture of their screen. You usually already have one with their words; call this only if you need a newer look. After looking, always answer with speak, or send it on.
 - read_chat: more of the chat, when they mention something you don't have.
 - dismiss: what you heard wasn't for you.
-- write_on_board: only to show what you're saying yourself, like the formula or term you just said (up to three short lines; separate lines with " / "). Plain text and symbols like x², √, ≤, ×, θ; no LaTeX. It appears at the top right of what they're looking at. When the user asks for something on the board, that's a task: hand it off.
 
-How to speak:
+How to speak (this covers `say` too):
 - Like a person talking, not like writing. Short phrases. Short sentences. Contractions. One idea at a time.
 - Usually one or two short sentences. Go longer only if they ask.
 - No lists, markdown, emoji, code or URLs. Say math in words: "five point zero zero five over two fifty-four".
@@ -88,7 +99,8 @@ How to speak:
 - Show you understood: when you answer or act, lead with what you took them to mean, in a few words ("The q in that box? It's the integer..."), then the substance.
 - Don't narrate yourself: never "I'm here", "Still here", "I'm listening", "I can hear you", "I heard you", "Sorry, I didn't catch that", or anything about passing messages around. If there's nothing worth saying, say nothing.
 - For main_agent_reply: the gist in a sentence or two. If it ends with a question for the user, ask it.
-- After speaking, end your turn. Don't write anything else.
+- Before you end a turn, check two things. Did you answer in plain text? Then the user heard nothing: call speak with it. Did you tell the user the main agent will get, do, check or answer something? Then a sending tool must have been called in this turn: if it wasn't, call it now.
+- Then end your turn. Don't write anything else.
 
 The user is learning ML. When tutoring, guide with questions rather than handing over answers, unless they ask for the answer."""
 
@@ -139,6 +151,10 @@ class Talker:
         self.proc: subprocess.Popen | None = None
         self.events: "queue.Queue[dict | None]" = queue.Queue()
         os.makedirs(workdir, exist_ok=True)
+        # Which turn this is, for the voice tools (voice_mcp.py reads it): they can't see where a
+        # turn starts, and "a send is the last thing spoken in a turn" needs that.
+        self.turn_file = os.path.join(workdir, "turn.txt")
+        self.turn_no = 0
 
     # ---- process
     def _alive(self) -> bool:
@@ -151,7 +167,7 @@ class Talker:
         mcp = {"mcpServers": {"voice": {
             "command": sys.executable,
             "args": [os.path.join(HERE, "voice_mcp.py")],
-            "env": {"CANVAS_URL": self.canvas_url, "CANVAS_SESSION": self.session},
+            "env": {"CANVAS_URL": self.canvas_url, "CANVAS_SESSION": self.session, "CANVAS_TURN_FILE": self.turn_file},
         }}}
         tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "add_to_task", "ask_main_agent",
                                                    "read_chat", "dismiss", "write_on_board"))
@@ -241,6 +257,12 @@ class Talker:
                 self._spawn()
             while not self.events.empty():  # drop leftovers from an earlier, abandoned turn
                 self.events.get_nowait()
+            self.turn_no += 1
+            try:
+                with open(self.turn_file, "w", encoding="utf-8") as f:
+                    f.write(f"{os.getpid()}-{self.turn_no}")
+            except OSError:
+                pass  # the tools then can't tell turns apart: speech after a send is still dropped here
             msg = {"type": "user", "message": {"role": "user", "content": content}}
             t0 = time.perf_counter()
             try:
@@ -292,6 +314,8 @@ class _TurnState:
         self.spoken: list[str] = []
         self.tasks: list[str] = []
         self.via: list[str] = []            # which tool sent each one (hand_off, add_to_task, ask_main_agent)
+        self.muted = 0                      # speak calls after a send in this turn (not spoken)
+        self.sent_said = False              # a send in this turn spoke its `say`
         self.looked = False
         self.dismissed = False
         self.first_ms: float | None = None
@@ -308,7 +332,12 @@ class _TurnState:
                 self.started.add(cb.get("id"))
                 name = (cb.get("name") or "").removeprefix(TOOL_PREFIX)
                 b = {"name": name, "id": cb.get("id"), "buf": "", "field": None, "split": None}
-                if name == "speak":
+                if name == "speak" and self.sent_said:
+                    # A send is the last thing spoken in a turn: its `say` told the user. What comes
+                    # after only restates it ("Asked. It'll tell us..."), so it isn't spoken, and the
+                    # speak tool tells the talker so (voice_mcp.py).
+                    self.muted += 1
+                elif name == "speak":
                     b["field"] = _JsonStringField("text")
                     b["split"] = _Sentences(self._say)
                 elif name == "look_at_board":
@@ -339,14 +368,16 @@ class _TurnState:
                 continue  # the partial stream already handled (or is handling) this call
             name = (block.get("name") or "").removeprefix(TOOL_PREFIX)
             inp = block.get("input") or {}
-            if name == "speak":
+            if name == "speak" and self.sent_said:
+                self.muted += 1  # after a send: see stream()
+            elif name == "speak":
                 split = _Sentences(self._say)
                 split.feed(str(inp.get("text") or ""))
                 split.flush()
             elif name == "look_at_board":
                 self._look(block.get("id"))
             elif name in ROUTED:
-                self._handoff(ROUTED[name][1] + str(inp.get(ROUTED[name][0]) or "").strip(), name)
+                self._send(name, inp)
             elif name == "write_on_board":
                 self.emit("board_note", str(inp.get("text") or ""))
             elif name == "dismiss":
@@ -358,14 +389,14 @@ class _TurnState:
             return
         self.done_ids.add(b["id"])
         if b["name"] == "speak":
-            b["split"].flush()
+            if b["split"] is not None:  # None: it came after a send and isn't spoken
+                b["split"].flush()
         elif b["name"] in ROUTED:
-            field, prefix = ROUTED[b["name"]]
             try:
-                task = str((json.loads(b["buf"] or "{}") or {}).get(field) or "").strip()
+                inp = json.loads(b["buf"] or "{}") or {}
             except ValueError:
-                task = ""
-            self._handoff(prefix + task if task else "", b["name"])
+                inp = {}
+            self._send(b["name"], inp if isinstance(inp, dict) else {})
         elif b["name"] == "write_on_board":
             try:
                 note = str((json.loads(b["buf"] or "{}") or {}).get("text") or "")
@@ -392,6 +423,22 @@ class _TurnState:
             self.dismissed = True
             self.emit("dismiss", None)
 
+    def _send(self, name: str, inp: dict) -> None:
+        """A sending tool (hand_off, add_to_task, ask_main_agent): the message goes to the main
+        agent, and then its `say` is spoken. In that order and only together: the user never
+        hears that something was sent unless it was (an empty or broken call says nothing)."""
+        field, prefix = ROUTED[name]
+        task = str(inp.get(field) or "").strip()
+        if not task:
+            return
+        self._handoff(prefix + task, name)
+        say = str(inp.get("say") or "").strip()
+        if say:
+            self.sent_said = True
+            split = _Sentences(self._say)
+            split.feed(say)
+            split.flush()
+
     def _handoff(self, task: str, via: str = "hand_off") -> None:
         task = task.strip()
         if task:
@@ -403,7 +450,7 @@ class _TurnState:
         task = self.tasks[-1] if self.tasks else ""
         mode = ("delegate" if task else "say" if self.spoken else "dismiss" if self.dismissed
                 else "look" if self.looked else "silent")
-        return {"mode": mode, "task": task, "via": self.via[-1] if self.via else "",
+        return {"mode": mode, "task": task, "via": self.via[-1] if self.via else "", "muted": self.muted,
                 "text": " ".join(self.spoken).strip(), "looked": self.looked,
                 "notes": self.notes.strip()[:1000],
                 "first_ms": round(self.first_ms) if self.first_ms is not None else None}

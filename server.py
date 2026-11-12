@@ -910,20 +910,6 @@ def build_timeline_text(tl: dict, mode: str, text: str) -> str:
 # --------------------------------------------------------------------------- HTTP
 
 
-# What the talker says when it claims the work is in hand or on its way (the safety net in
-# _api_talk checks that a turn saying this really sent something to the main agent).
-# (Not "still working on X": that's an honest status answer.)
-CLAIMS_ROUTING = re.compile(
-    r"\b(already (working|on it|in progress|doing|handling|started|being)"
-    r"|i'?ll (pass|send|forward) (it|that|this|your|them)|i'?ll tell (it|them|the main agent)"
-    r"|passing (it|that|this|your \w+) on|i'?ve (passed|sent|forwarded|asked|handed|given) (it|that|this|your|the main agent)"
-    # it says it's checking / asking, or waiting on an answer (real cases, 2026-11-12 17:14)
-    r"|checking (with|on) (it|the main agent|that)|let me (check|ask) (with )?(it|the main agent)"
-    r"|i'?(ll| will) (ask|check with) (it|the main agent)|(?<!should )(?<!what )\bi (did )?ask(ed)? (it|the main agent)"
-    r"|i'?ll (tell|let) you (know )?(when|as soon as|once) (it|the main agent)|still waiting (on|for) (it|that|the main agent))",
-    re.I)
-
-
 class VoiceState:
     """What the talker should know about the main agent: idle, or working on a handed-off task."""
 
@@ -2550,7 +2536,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             raise HttpError(400, "unknown kind")
         parts.append(self.voice.status_line())
-        parts.append("(Answer only by calling speak; text you write is never heard. Or wait, or dismiss.)")
+        # Both halves matter, every turn. Without the first it writes answers as text nobody hears;
+        # without the second it speaks "I'll ask the main agent" and sends nothing (2026-11-12).
+        parts.append("(Answer the user only by calling speak: text you write is never heard. Reach the main agent "
+                     "only by calling hand_off, add_to_task or ask_main_agent: speaking about it sends nothing. "
+                     "Or wait, or dismiss.)")
         content = "\n".join(parts)
         image = body.get("image") if kind == "utterance" else None
         m = re.match(r"^data:(image/(?:png|jpeg));base64,(.+)$", image or "", re.S)
@@ -2611,15 +2601,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         "waiting for them to finish, do nothing.]", on_event)
                     again["ms"] = res["ms"] + again["ms"]
                     res = again
-                # Safety net (here, outside the model): it said the work is in hand or will be passed
-                # on, but sent nothing. Then their words go to the main agent anyway, as a follow-up.
-                if (kind == "utterance" and res and res["mode"] == "say" and not self.voice.is_cancelled(turn_id)
-                        and len(heard.split()) >= 8 and CLAIMS_ROUTING.search(res.get("text") or "")):
-                    log(f"talk {turn_id}: said it was passed on but sent nothing; forwarding the user's words")
-                    task = ("Follow-up from the user (the voice said it was being handled but didn't pass it on): "
-                            + heard)
-                    on_event("handoff", task)
-                    res.update(mode="delegate", task=task, via="safety_net")
             except Exception as exc:
                 err = str(exc)
                 log(f"talker error: {exc}")
@@ -2712,7 +2693,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _log_voice(self, kind: str, heard: str, res: dict, test: bool = False) -> None:
         """Voice turns go to data/voice.log, not the chat: the chat panel is the main agent's."""
         rec = {"ts": datetime.now().isoformat(timespec="seconds"), "kind": kind, "heard": heard, "test": test,
-               **{k: res.get(k) for k in ("mode", "via", "finish", "task", "text", "looked", "notes", "first_ms", "ms")}}
+               **{k: res.get(k) for k in ("mode", "via", "finish", "muted", "task", "text", "looked", "notes", "first_ms", "ms")}}
         with open(os.path.join(DATA_DIR, "voice.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 

@@ -1,13 +1,15 @@
 """Tools for the voice talker (a tiny stdio MCP server, started by Claude Code itself).
 
-The talker's plain text is private: the user only hears what it passes to `speak`.
-    speak(text)       say words out loud on the iPad
-    look_at_board()   get a picture of the user's current board view
-    hand_off(task)    give real work to the main Claude Code agent
-    add_to_task(text) the main agent is busy and the user added to it: send it on now
-    ask_main_agent(q) a question only the main agent can answer
-    read_chat(count)  more of the chat than the few lines each turn shows
-    dismiss()         what it heard wasn't meant for it: the page erases the user's words
+The talker has two audiences, and each tool reaches one of them:
+  the user        speak(text)                    say words out loud on the iPad
+  the main agent  hand_off(say, task)            give real work to the main Claude Code agent
+                  add_to_task(say, text)         the main agent is busy and the user added to it
+                  ask_main_agent(say, question)  a question only the main agent can answer
+  the talker      look_at_board(), read_chat(count), dismiss()
+Each tool that sends to the main agent also carries `say`: the words the user hears while it's
+sent. Telling the user and doing it are one call, so the talker can't say "I've asked it" by
+speaking alone (it did, 2026-11-12: it spoke "Checking with the main agent..." and sent nothing).
+The talker's plain text is private: nobody hears or sees it.
 
 The canvas server (server.py) watches the talker's output stream and acts on `speak`,
 `hand_off`, `add_to_task` and `ask_main_agent` as the tool input streams in, so speech starts
@@ -31,9 +33,12 @@ TOOLS = [
     {
         "name": "speak",
         "description": (
-            "Say something out loud to the user through the iPad speaker. This is the ONLY way "
-            "the user hears you; anything you write outside this tool is private and never heard. "
-            "Talk like a person: short phrases, short sentences, contractions, no lists, no markdown."
+            "Say something out loud to the USER through the iPad speaker. This is the ONLY way the "
+            "user hears an answer from you; anything you write outside this tool is private and never "
+            "heard. Only the user hears it: the main agent never does, so speaking that you'll ask it, "
+            "check with it or pass something on sends nothing (for that, call hand_off, add_to_task or "
+            "ask_main_agent; each one says its `say` to the user for you). Talk like a person: short "
+            "phrases, short sentences, contractions, no lists, no markdown."
         ),
         "inputSchema": {
             "type": "object",
@@ -52,43 +57,46 @@ TOOLS = [
     {
         "name": "hand_off",
         "description": (
-            "Give a task to the main agent: a slower, fully capable Claude Code session on the "
+            "SENDS a task to the MAIN AGENT: a slower, fully capable Claude Code session on the "
             "user's PC that sees the whole board, draws on it, opens websites and charts on it, runs "
             "code, edits files and does research. Every request to do something goes here, even when "
-            "the user doesn't mention the main agent. Its answer comes back to you later as "
-            "main_agent_reply."
+            "the user doesn't mention the main agent. The user hears your `say` as it's sent, so don't "
+            "call speak as well. Its answer comes back to you later as main_agent_reply."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"task": {"type": "string", "description": "A self-contained task, in the user's words where useful."}},
-            "required": ["task"],
+            "properties": {"say": {"type": "string", "description": "A few words the user hears out loud while this is sent, in their terms: what is being done. One short sentence, and all they need to hear about it: you won't speak about it again this turn."}, "task": {"type": "string", "description": "A self-contained task, in the user's words where useful."}},
+            "required": ["say", "task"],
         },
     },
     {
         "name": "add_to_task",
         "description": (
             "The main agent is already working on something and the user adds to it: a detail, a "
-            "correction, a change of mind, another idea, \"also...\". Sends their new words to the "
-            "main agent right away as a follow-up. Use this instead of telling them it's already "
-            "being worked on; that would lose what they just said."
+            "correction, a change of mind, another idea, \"also...\". SENDS their new words to the "
+            "MAIN AGENT right away as a follow-up. Use this instead of telling them it's already "
+            "being worked on; that would lose what they just said. The user hears your `say` as it's "
+            "sent, so don't call speak as well."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"text": {"type": "string", "description": "What they added, self-contained, in their words where useful."}},
-            "required": ["text"],
+            "properties": {"say": {"type": "string", "description": "A few words the user hears out loud while this is sent, in their terms: what is being done. One short sentence, and all they need to hear about it: you won't speak about it again this turn."}, "text": {"type": "string", "description": "What they added, self-contained, in their words where useful."}},
+            "required": ["say", "text"],
         },
     },
     {
         "name": "ask_main_agent",
         "description": (
-            "Ask the main agent a question only it can answer: what it did, found, changed or "
-            "decided, a result, a file's contents. Check the recent chat first (and read_chat). "
-            "Its answer comes back to you as main_agent_reply."
+            "SENDS a question to the MAIN AGENT, one only it can answer: what it did, found, changed "
+            "or decided, a result, a file's contents. Check the recent chat first (and read_chat). "
+            "This call is the only way to ask it: telling the user you're checking does not ask. The "
+            "user hears your `say` as it's sent, so don't call speak as well. Its answer comes back to "
+            "you as main_agent_reply."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"question": {"type": "string", "description": "The question, self-contained."}},
-            "required": ["question"],
+            "properties": {"say": {"type": "string", "description": "A few words the user hears out loud while this is sent, in their terms: what is being done. One short sentence, and all they need to hear about it: you won't speak about it again this turn."}, "question": {"type": "string", "description": "The question, self-contained."}},
+            "required": ["say", "question"],
         },
     },
     {
@@ -190,15 +198,41 @@ def _read_chat(count) -> list:
     return [{"type": "text", "text": "The chat, oldest first:\n" + "\n".join(lines)}]
 
 
+_said_with_send = ""  # the turn in which a send spoke its `say` (talker.py writes the turn to a file)
+
+
+def _turn() -> str:
+    try:
+        with open(os.environ.get("CANVAS_TURN_FILE") or "", "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _call(name: str, args: dict) -> tuple[list, bool]:
+    global _said_with_send
     if name == "speak":
-        return [{"type": "text", "text": "Said. Don't repeat it. End your turn unless you need another tool."}], False
+        if _said_with_send and _said_with_send == _turn():
+            # the same rule as talker.py (_TurnState.stream): a send is the last thing spoken in a turn
+            return [{"type": "text", "text": "Not spoken. In this turn the user already heard your `say` when you sent to the "
+                                             "main agent, and a send is the last thing spoken in a turn. End your turn."}], False
+        return [{"type": "text", "text": "Said to the user. Don't repeat it."}], False
+    main_field = {"hand_off": "task", "add_to_task": "text", "ask_main_agent": "question"}.get(name)
+    if main_field and not str(args.get(main_field) or "").strip():
+        # talker.py sends (and speaks `say`) only when there's something to send
+        return [{"type": "text", "text": f"Nothing was sent and the user heard nothing: `{main_field}` was empty. Call {name} again with it filled in."}], True
+    say = " ".join(str(args.get("say") or "").split())
+    if main_field and say:
+        _said_with_send = _turn()
+    # after a send the turn is done: a second speak would only repeat what they just heard
+    done = (f'The user already heard your `say` ("{say}"). That is all they need to hear about it: end your turn now '
+            "without calling speak." if say else "The user heard nothing (`say` was empty): tell them in a few words with speak.")
     if name == "hand_off":
-        return [{"type": "text", "text": "Handed to the main agent. Its answer will come to you as main_agent_reply."}], False
+        return [{"type": "text", "text": f"Sent to the main agent. {done} Its answer will come to you later as main_agent_reply."}], False
     if name == "add_to_task":
-        return [{"type": "text", "text": "Sent to the main agent as a follow-up. Tell them in a few words, then end your turn."}], False
+        return [{"type": "text", "text": f"Sent to the main agent as a follow-up. {done}"}], False
     if name == "ask_main_agent":
-        return [{"type": "text", "text": "Asked. The answer will come to you as main_agent_reply."}], False
+        return [{"type": "text", "text": f"Asked the main agent. {done} Its answer will come to you as main_agent_reply: don't guess it."}], False
     if name == "read_chat":
         return _read_chat(args.get("count")), False
     if name == "look_at_board":
