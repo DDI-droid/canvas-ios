@@ -65,7 +65,7 @@ TOOLS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"say": {"type": "string", "description": "A few words the user hears out loud while this is sent, in their terms: what is being done. One short sentence, and all they need to hear about it: you won't speak about it again this turn."}, "task": {"type": "string", "description": "A self-contained task, in the user's words where useful."}},
+            "properties": {"say": {"type": "string", "description": "Your spoken reply to the user for this turn, heard as this is sent. Talk like you always do: show you got what they meant, then what's happening to it, in their terms. Usually one or two short sentences. Never mention the main agent, passing, sending or forwarding: they know where it goes. It's the last thing they hear from you this turn."}, "task": {"type": "string", "description": "A self-contained task, in the user's words where useful."}},
             "required": ["say", "task"],
         },
     },
@@ -80,7 +80,7 @@ TOOLS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"say": {"type": "string", "description": "A few words the user hears out loud while this is sent, in their terms: what is being done. One short sentence, and all they need to hear about it: you won't speak about it again this turn."}, "text": {"type": "string", "description": "What they added, self-contained, in their words where useful."}},
+            "properties": {"say": {"type": "string", "description": "Your spoken reply to the user for this turn, heard as this is sent. Talk like you always do: show you got what they meant, then what's happening to it, in their terms. Usually one or two short sentences. Never mention the main agent, passing, sending or forwarding: they know where it goes. It's the last thing they hear from you this turn."}, "text": {"type": "string", "description": "What they added, self-contained, in their words where useful."}},
             "required": ["say", "text"],
         },
     },
@@ -95,7 +95,7 @@ TOOLS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"say": {"type": "string", "description": "A few words the user hears out loud while this is sent, in their terms: what is being done. One short sentence, and all they need to hear about it: you won't speak about it again this turn."}, "question": {"type": "string", "description": "The question, self-contained."}},
+            "properties": {"say": {"type": "string", "description": "Your spoken reply to the user for this turn, heard as this is sent. Talk like you always do: show you got what they meant, then what's happening to it, in their terms. Usually one or two short sentences. Never mention the main agent, passing, sending or forwarding: they know where it goes. It's the last thing they hear from you this turn."}, "question": {"type": "string", "description": "The question, self-contained."}},
             "required": ["say", "question"],
         },
     },
