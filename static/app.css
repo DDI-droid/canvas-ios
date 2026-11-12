@@ -1441,6 +1441,15 @@ textarea:focus { background: rgb(var(--glass-rgb) / .9); box-shadow: inset 0 0 0
 
 /* ------------------------------------------------------------------ entrance */
 
+/* opening another board in place (app.js openBoard): the toolbar and chat stay put, the board
+   fades out, and the new one fades in with a slight settle */
+.board.board-out { opacity: 0; transition: opacity 160ms cubic-bezier(.4, 0, 1, 1); }
+.board.board-in { animation: board-in 360ms cubic-bezier(.2, .8, .2, 1) both; }
+@keyframes board-in {
+  from { opacity: 0; transform: scale(.985); }
+  to { opacity: 1; transform: none; }
+}
+
 #app.booting .toolbar { opacity: 0; transform: translate(-50%, 16px); }
 #app.booting .talk, #app.booting .topbar { opacity: 0; transform: translateY(8px); }
 #app.booting .chat { opacity: 0; transform: translateX(14px); }

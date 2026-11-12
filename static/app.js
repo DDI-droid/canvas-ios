@@ -9,12 +9,14 @@ import { Cards } from './cards.js';
 import { InkSync } from './inksync.js';
 import { BAR, BrowserStream, PageLink, pageFrame } from './livecards.js';
 import { buildSnapshot, buildTimeline, makeThumb } from './snapshot.js';
-import { api, EventStream, KEY, SESSION, sessionKey, switchSession, withKey } from './api.js';
+import { api, EventStream, KEY, SESSION, sessionKey, setSession, switchSession, withKey } from './api.js';
 import { COLORS, inkColor } from './palette.js';
 import { hydrateIcons, icon } from './icons.js';
 import { confirmSheet, hud, lightbox, popover, toast } from './ui.js';
 import { $, $$, debounce, rectsIntersect, store, uid } from './util.js';
+import { cacheStats } from './inkcache.js';
 
+const T_CODE = performance.now(); // every module has loaded and run: the start-up report's "code"
 const CLIENT_ID = uid('c');
 const THEME_COLOR = { light: '#f8f6f1', dark: '#1a1a1c' };
 
@@ -1164,7 +1166,14 @@ chat.addEventListener('loadEarlier', async (e) => {
   }
 });
 async function resync() {
+  const session = SESSION;
   const st = await api.get(`/api/state?conv=${CHAT_PAGE}&strokes=0`);
+  // another board was opened while this was on its way: it isn't this board's state
+  if (session !== SESSION) throw Object.assign(new Error('another board is open now'), { stale: true });
+  applyState(st);
+  return st;
+}
+function applyState(st) {
   chat.setConversation(st.conversation || [], { more: !!st.conversation_more });
   layer.setAll(st.claude_layer || []);
   chat.setStatus(st.status || 'idle');
@@ -1175,7 +1184,6 @@ async function resync() {
   }
   updateInkChip();
   updateSendReady();
-  return st;
 }
 
 events.addEventListener('state', (e) => {
@@ -1344,7 +1352,7 @@ function newerVersion(a, b) {
 // The switcher is in the panel title. A Claude session attaches with canvas_agent.py; the
 // instructions it needs are served at /agent. Unread dots compare each session's last reply
 // with when you last saw it; the green dot means a Claude session is attached and listening.
-popover($('#sessionPop'), $('#btnSession'), { onOpen: () => renderSessions() });
+const sessionPopover = popover($('#sessionPop'), $('#btnSession'), { onOpen: () => renderSessions() });
 let sessionList = [];
 const seen = store.get('sessionSeen', {});
 function markSeen(id, ts) {
@@ -1404,7 +1412,7 @@ function onSessions(list) {
       changed = true;
       // a Claude session just ran /canvas:connect: offer its board (one tap; no switching under you)
       if (!firstRun && s.id !== SESSION && s.agent && Date.now() - (s.created || 0) < 10 * 60 * 1000) {
-        toast(`New board “${s.title || s.id}” from Claude.`, { action: 'Open', onAction: () => switchSession(s.id), ms: 15000 });
+        toast(`New board “${s.title || s.id}” from Claude.`, { action: 'Open', onAction: () => openBoard(s.id), ms: 15000 });
       }
     }
   }
@@ -1437,7 +1445,7 @@ async function showConnect(id, { open = false } = {}) {
     const go = document.createElement('button');
     go.className = 'menu-row';
     go.textContent = 'Open this session';
-    go.addEventListener('click', () => switchSession(id));
+    go.addEventListener('click', () => openBoard(id));
     help.append(go);
   }
 }
@@ -1449,8 +1457,79 @@ $('#sessionList').addEventListener('click', (e) => {
     return;
   }
   const pick = e.target.closest('[data-session]');
-  if (pick && pick.dataset.session !== SESSION) switchSession(pick.dataset.session);
+  if (pick && pick.dataset.session !== SESSION) openBoard(pick.dataset.session);
 });
+
+// Another board, in place: no reload, so nothing goes blank. The toolbar and chat stay; the
+// board fades out, what was drawn on it is sent (or kept on this device for it), and the new
+// board fades in from this device's copy and the server.
+let opening = null;
+async function openBoard(id) {
+  if (!id || id === SESSION || opening) return;
+  opening = id;
+  const el = $('#board');
+  const t0 = performance.now();
+  try {
+    sessionPopover.close();
+    if (viewer.isOpen) viewer.close();
+    el.classList.remove('board-in');
+    el.classList.add('board-out');
+    const faded = new Promise((r) => setTimeout(r, 170));
+    saveCam.flush(); // this board's view, under this board
+    await ink.switchTo(id);
+    setSession(id);
+    events.reset();
+    const stateP = api.get(`/api/state?conv=${CHAT_PAGE}&strokes=0`);
+    stateP.catch(() => {});
+    // this board's own things on this device
+    outbox.clear();
+    for (const [k, v] of Object.entries(store.get(sessionKey('outbox'), {}) || {})) outbox.set(k, v);
+    lastSendAt = store.get(sessionKey('lastSendAt'), 0) || 0;
+    markSeen(id, Date.now());
+    updateSessionTitle();
+    await faded;
+    // behind the fade: the new board's view, ink and drawings (the chat swaps when its
+    // messages are here, so it never shows empty in between)
+    board.load([]);
+    layer.setAll([]);
+    const cam = store.get(sessionKey('cam'), null);
+    if (cam && Number.isFinite(cam.x) && Number.isFinite(cam.z)) board.setCamera(cam.x, cam.y, cam.z);
+    else board.setCamera(0, 0, 1);
+    const inkReady = ink.start();
+    let st = null;
+    const stateReady = stateP.then((s) => {
+      if (SESSION !== id) return;
+      st = s;
+      chat.reset();
+      applyState(s);
+    }).catch(() => { if (SESSION === id) chat.reset(); });
+    await Promise.race([Promise.all([inkReady, stateReady]), new Promise((r) => setTimeout(r, 1200))]);
+    if (SESSION !== id) return;
+    el.classList.remove('board-out');
+    el.classList.add('board-in');
+    setTimeout(() => el.classList.remove('board-in'), 420);
+    const shown = performance.now();
+    await stateReady;
+    if (SESSION !== id) return;
+    if (st) events.resume(st.events);
+    else {
+      toast('Can’t reach the Canvas server — retrying…', { tone: 'error' });
+      setTimeout(() => resync().then((s) => { events.resume(s.events); events.kick(); }).catch(() => {}), 3000);
+    }
+    events.connect();
+    resendOutbox();
+    if (!board.strokes.length && !layer.count && !((st && st.conversation) || []).length) showHint();
+    else hideHint();
+    if (live.on) api.post('/api/talk', { kind: 'warmup' }, { timeout: 15000 }).catch(() => {});
+    api.post('/api/clientlog', { kind: 'boardswitch', ua: navigator.userAgent,
+      msg: `to ${id} · shown ${Math.round(shown - t0)} ms · state ${st ? 'ok' : 'failed'} · ink ${board.strokes.length} strokes · ${Math.round(performance.now() - t0)} ms` }).catch(() => {});
+  } catch (err) {
+    console.warn('switching boards failed', err);
+    switchSession(id); // the old way still works: a reload
+  } finally {
+    opening = null;
+  }
+}
 
 $('#newSessionForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -1638,7 +1717,26 @@ function restorePrefs() {
   $('#zoomLabel').textContent = `${zoomPct}%`;
 }
 
+// One line per page load in data/client.log: where the start-up time went, measured on the
+// device itself (ms since the page started loading).
+function reportBoot(t) {
+  try {
+    const ms = (x) => (Number.isFinite(x) ? Math.round(x) : '-');
+    const nav = performance.getEntriesByType('navigation')[0];
+    const files = performance.getEntriesByType('resource').filter((r) => /\.(js|css)(\?|$)/.test(r.name));
+    const sized = files.some((r) => typeof r.transferSize === 'number');
+    const cached = sized ? files.filter((r) => r.transferSize === 0).length : '?';
+    const slow = files.slice().sort((a, b) => b.duration - a.duration)[0];
+    const msg = `board ${SESSION} · page ${ms(nav && nav.responseEnd)} · code ${ms(T_CODE)}` +
+      ` (${files.length} files, ${cached} cached${slow ? `, slowest ${slow.name.split('?')[0].split('/').pop()} ${ms(slow.duration)}` : ''})` +
+      ` · ui ${ms(t.ui)} · state ${ms(t.state)} · storage ${cacheStats.result || '-'} ${cacheStats.ms}` +
+      ` · ink ${ms(t.ink)} · ready ${ms(t.ready)}`;
+    api.post('/api/clientlog', { kind: 'boottime', msg, ua: navigator.userAgent }).catch(() => {});
+  } catch { /* best effort */ }
+}
+
 async function boot() {
+  const t = {};
   applyTheme(initialTheme());
   restorePrefs();
   refreshToolbar();
@@ -1648,9 +1746,22 @@ async function boot() {
     $('#lockedMsg').textContent = 'Open the link that includes ?k=<key> (printed by server.py).';
     $('#locked').hidden = false;
   }
+  // Show the canvas right away: the ink, chat and drawings fill in as they arrive. (A timer
+  // backs up the frames, which don't run while the page is hidden.)
+  const showUi = () => {
+    if (t.ui) return;
+    t.ui = performance.now();
+    app.classList.remove('booting');
+    moveToolIndicator();
+    if (window.__canvasBooted) window.__canvasBooted();
+  };
+  requestAnimationFrame(() => requestAnimationFrame(showUi));
+  setTimeout(showUi, 400);
   const inkReady = ink.start(); // the board at once from this device's copy, if it has one
+  inkReady.then(() => { t.ink = performance.now(); });
   try {
     const st = await resync();
+    t.state = performance.now();
     events.resume(st.events); // live updates pick up exactly where this snapshot ends
     await sendLegacyBackup();
     await inkReady;    // the board, then anything drawn here that never reached the server
@@ -1658,7 +1769,9 @@ async function boot() {
     resendOutbox();    // and any message that never reached it
     if (!board.strokes.length && !layer.count && !(st.conversation || []).length) showHint();
   } catch (err) {
-    if (err.status === 404 && SESSION !== 'main') {
+    if (err.stale) {
+      // another board was opened while this one was loading: openBoard took over
+    } else if (err.status === 404 && SESSION !== 'main') {
       switchSession('main'); // that session no longer exists
       return;
     }
@@ -1672,10 +1785,8 @@ async function boot() {
     }
   }
   events.connect();
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    app.classList.remove('booting');
-    moveToolIndicator();
-  }));
+  t.ready = performance.now();
+  reportBoot(t);
 }
 
 if (window.__canvas) Object.assign(window.__canvas, { resync, events, chat }); // tests (?debug)

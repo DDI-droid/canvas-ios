@@ -7,33 +7,74 @@
 //   place: no reload of the whole board, and their undo history stays. A page that missed some
 //   batches (asleep, reconnecting, the server restarted) asks for just those, or for the whole
 //   board if it fell too far behind, and then puts its own unsent changes back on top.
-import { api, sessionKey } from './api.js';
+import { api, SESSION, sessionKey } from './api.js';
 import { store } from './util.js';
 import { loadInk, saveInk } from './inkcache.js';
 
 const opId = (o) => (o.op === 'del' ? o.id : o.s && o.s.id);
+
+// Merge ops into what's stored for a board (later changes to a stroke win), or take some out.
+function keepFor(key, ops) {
+  const saved = store.get(key, null);
+  const byId = new Map((Array.isArray(saved) ? saved : []).filter((o) => o && opId(o)).map((o) => [opId(o), o]));
+  for (const o of ops) byId.set(opId(o), o);
+  if (byId.size) store.set(key, [...byId.values()]);
+}
+function forgetFor(key, ops) {
+  const saved = store.get(key, null);
+  if (!Array.isArray(saved)) return;
+  const sent = new Set(ops.map((o) => JSON.stringify(o)));
+  const left = saved.filter((o) => !sent.has(JSON.stringify(o)));
+  if (left.length) store.set(key, left);
+  else store.remove(key);
+}
 
 export class InkSync extends EventTarget {
   constructor({ board, clientId }) {
     super();
     this.board = board;
     this.client = clientId;
-    this.rev = -1;          // the server revision this page's board matches (-1: not loaded yet)
-    this.inkId = '';        // which board that revision belongs to (the server's id for it)
-    this.key = sessionKey('pendingInk');
-    this.copyKey = sessionKey('ink'); // this device's copy of the board (inkcache.js)
+    this.gen = 0;           // bumped when the page moves to another board: older replies are ignored
     this.copyTimer = 0;
     this.lastInput = 0;
     for (const t of ['pointerdown', 'pointermove']) window.addEventListener(t, () => { this.lastInput = Date.now(); }, { capture: true, passive: true });
     window.addEventListener('pagehide', () => this.saveCopy(true));
+    this.timer = 0;
+    this._bind(SESSION);
+  }
+
+  // Everything that belongs to one board.
+  _bind(session) {
+    this.session = session;
+    this.rev = -1;          // the server revision this page's board matches (-1: not loaded yet)
+    this.inkId = '';        // which board that revision belongs to (the server's id for it)
+    this.key = sessionKey('pendingInk', session);
+    this.copyKey = sessionKey('ink', session); // this device's copy of the board (inkcache.js)
     this.pending = [];      // changes not yet sent
     this.sending = null;    // the batch on its way
     this.failures = 0;
-    this.timer = 0;
     this.catching = false;
     this.catchAgain = false;
+    this.missedWhileLoading = false;
+    this.started = null;
     const saved = store.get(this.key, null);
     if (Array.isArray(saved)) this.pending = saved.filter((o) => o && opId(o));
+  }
+
+  // Leave this board for another (app.js openBoard). What was drawn here is sent to this board
+  // (waiting up to `wait` ms) and otherwise kept on this device for it; its copy is saved. Then
+  // nothing of this board touches the page any more. Call start() for the new one.
+  async switchTo(session, { wait = 1500 } = {}) {
+    if (this.board.changed.size) this._queue(this.board.takeOps());
+    this.saveCopy(true);
+    if (this.pending.length && !this.sending && this.rev >= 0) {
+      await Promise.race([this.flush(), new Promise((r) => setTimeout(r, wait))]).catch(() => {});
+    }
+    this._persist(); // whatever is still unsent (or on its way) stays stored under this board
+    clearTimeout(this.timer);
+    clearTimeout(this.copyTimer);
+    this.gen++;
+    this._bind(session);
   }
 
   // ---- outgoing
@@ -92,10 +133,12 @@ export class InkSync extends EventTarget {
     if (this.board.changed.size) this._queue(this.board.takeOps());
     if (this.sending || !this.pending.length || this.rev < 0) return;
     const batch = this.pending;
+    const { gen, session, key } = this; // the board this batch is for, even if the page moves on
     this.pending = [];
     this.sending = batch;
     try {
-      const res = await api.post('/api/ink', { client: this.client, ops: batch }, { timeout: 30000 });
+      const res = await api.post('/api/ink', { client: this.client, ops: batch }, { timeout: 30000, session });
+      if (gen !== this.gen) return forgetFor(key, batch); // that board has it: not kept for it any more
       this.sending = null;
       if (res.rev === this.rev + 1) this.rev = res.rev; // else: others' batches are on their way first
       if (this.failures >= 2) this._emit('recovered');
@@ -103,6 +146,7 @@ export class InkSync extends EventTarget {
       this._persist();
       if (this.pending.length) this._schedule(0);
     } catch (err) {
+      if (gen !== this.gen) return keepFor(key, batch); // the page moved on: kept for that board
       this.sending = null;
       if (err.status === 400 || err.status === 404 || err.status === 413) {
         // the server will never take this batch (or the session is gone): don't loop forever
@@ -154,7 +198,9 @@ export class InkSync extends EventTarget {
   }
 
   async _start() {
+    const gen = this.gen;
     const copy = await loadInk(this.copyKey);
+    if (gen !== this.gen) return; // another board was opened meanwhile
     if (copy && Array.isArray(copy.strokes) && this.rev < 0) {
       this.board.load(copy.strokes);
       const mine = (this.sending || []).concat(this.pending);
@@ -176,11 +222,14 @@ export class InkSync extends EventTarget {
       return;
     }
     this.catching = true;
+    const { gen, session } = this;
     try {
       // hold remote changes while a stroke / move is in progress: apply them right after
       while (this.board.busy) await new Promise((r) => setTimeout(r, 120));
+      if (gen !== this.gen) return;
       const since = full || this.rev < 0 ? -1 : this.rev;
-      const res = await api.get(`/api/ink?since=${since}&id=${encodeURIComponent(this.inkId)}`, { timeout: 45000 });
+      const res = await api.get(`/api/ink?since=${since}&id=${encodeURIComponent(this.inkId)}`, { timeout: 45000, session });
+      if (gen !== this.gen) return; // another board was opened meanwhile: this one's ink isn't wanted
       if (Array.isArray(res.strokes)) this._loadAll(res);
       else {
         for (const b of res.batches || []) {
@@ -193,19 +242,26 @@ export class InkSync extends EventTarget {
       this._schedule(0);
       this._copySoon();
     } catch (err) {
-      if (this.rev < 0) this._emit('offline'); // couldn't load at all: the app shows what it has
-      setTimeout(() => this.catchUp(full), 4000);
+      if (gen === this.gen) {
+        if (this.rev < 0) this._emit('offline'); // couldn't load at all: the app shows what it has
+        setTimeout(() => { if (gen === this.gen) this.catchUp(full); }, 4000);
+      }
     } finally {
-      this.catching = false;
-      if (this.missedWhileLoading && this.rev >= 0) {
-        this.missedWhileLoading = false;
-        this.catchAgain = this.catchAgain || true;
-      }
-      if (this.catchAgain) {
-        const again = this.catchAgain;
-        this.catchAgain = false;
-        this.catchUp(again === 'full');
-      }
+      // (a catch-up for a board the page has left changes nothing: _bind reset all of this)
+      if (gen === this.gen) this._afterCatchUp();
+    }
+  }
+
+  _afterCatchUp() {
+    this.catching = false;
+    if (this.missedWhileLoading && this.rev >= 0) {
+      this.missedWhileLoading = false;
+      this.catchAgain = this.catchAgain || true;
+    }
+    if (this.catchAgain) {
+      const again = this.catchAgain;
+      this.catchAgain = false;
+      this.catchUp(again === 'full');
     }
   }
 

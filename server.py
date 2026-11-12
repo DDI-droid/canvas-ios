@@ -1461,6 +1461,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HttpError(404, "not found")
         ext = os.path.splitext(full)[1].lower()
         ctype = MIME.get(ext, "application/octet-stream")
+        # ?v= is the build version (a hash of every top-level static file), so a file asked for
+        # with the current one can't change under that URL: the device keeps it and a reload or
+        # board switch loads the code with no round trips. Anything else is checked every time.
+        cache = ("private, max-age=31536000, immutable"
+                 if len(parts) == 1 and self.query.get("v", [""])[0] == build_version() else "no-cache")
         st = os.stat(full)
         body = None
         if ext in (".js", ".mjs"):
@@ -1475,14 +1480,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.headers.get("If-None-Match") == etag:
             self.send_response(304)
             self.send_header("ETag", etag)
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", cache)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
         if body is None:
             with open(full, "rb") as f:
                 body = f.read()
-        self._send(200, body, ctype, headers, cache="no-cache")
+        self._send(200, body, ctype, headers, cache=cache)
 
     # ---- the iPad app (canvas/ios), built by GitHub Actions and installed with SideStore
     def _serve_app(self, path: str):

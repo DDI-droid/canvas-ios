@@ -30,11 +30,23 @@ function resolveSession() {
   return SESSION_RE.test(saved) ? saved : 'main';
 }
 
-export const SESSION = resolveSession();
+// A live binding: app.js changes it in place when you open another board (setSession), and every
+// module that imports it sees the new one.
+export let SESSION = resolveSession();
 
 // localStorage keys that belong to one board (camera, offline strokes, ...)
-export const sessionKey = (k) => (SESSION === 'main' ? k : `${k}:${SESSION}`);
+export const sessionKey = (k, s = SESSION) => (s === 'main' ? k : `${k}:${s}`);
 
+// Open another board without reloading the page (app.js openBoard does the rest).
+export function setSession(id) {
+  SESSION = id;
+  store.set('session', id);
+  const u = new URL(location.href);
+  u.searchParams.set('s', id);
+  history.replaceState(history.state, '', u.toString());
+}
+
+// The old way, a full reload: only when this page can't go on (its board is gone).
 export function switchSession(id) {
   store.set('session', id);
   const u = new URL(location.href);
@@ -49,10 +61,11 @@ export function withKey(url) {
   return url + sep + 'k=' + encodeURIComponent(KEY) + s;
 }
 
-async function request(method, path, body, { timeout = 30000, type } = {}) {
+// `session`: the board this call is for, when it must not follow a board switch (ink sync).
+async function request(method, path, body, { timeout = 30000, type, session } = {}) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeout);
-  const opts = { method, headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': SESSION }, cache: 'no-store', signal: ctl.signal };
+  const opts = { method, headers: { 'X-Canvas-Key': KEY, 'X-Canvas-Session': session || SESSION }, cache: 'no-store', signal: ctl.signal };
   if (body instanceof Blob) { // a file as it is (images): no base64, no JSON
     opts.headers['Content-Type'] = type || body.type || 'application/octet-stream';
     opts.body = body;
@@ -130,6 +143,16 @@ export class EventStream extends EventTarget {
     if (this.ctl) this.ctl.abort();
     this.backoff = 1000;
     this.connect();
+  }
+
+  // Another board: stop, and forget this one's place in the stream. Nothing from the old board
+  // is dispatched after this (the loop checks gen); app.js resumes from the new board's state.
+  reset() {
+    this.gen++;
+    if (this.ctl) this.ctl.abort();
+    this.epoch = '';
+    this.since = -1;
+    this.backoff = 1000;
   }
 
   async _loop(gen) {

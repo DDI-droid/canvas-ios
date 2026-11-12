@@ -345,6 +345,15 @@ export class ChatPanel extends EventTarget {
     if (near && fresh.length) requestAnimationFrame(() => this._scrollToBottom(false));
   }
 
+  // Another board: forget this one's messages, unsent ones included (each board keeps its own
+  // outbox; app.js shows the new board's). setConversation then builds the new board's chat.
+  reset() {
+    this.byCid.clear();
+    this.loadingEarlier = false;
+    this.moreEl.classList.remove('loading');
+    this._rebuild([], false);
+  }
+
   _rebuild(list, more) {
     const local = [...this.byCid.values()].filter((r) => r.msg.local && !r.msg.id);
     this.list.replaceChildren();
