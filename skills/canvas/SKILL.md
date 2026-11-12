@@ -7,6 +7,12 @@ description: Work with the user's iPad canvas once this session is connected (af
 
 The user has an iPad canvas: an infinite board they draw on with Apple Pencil, a chat panel, and hands-free voice. This session has its own board on it (its id is the `-s` value from `/canvas:connect`). The tool is `python "${CLAUDE_PLUGIN_ROOT}/canvas_agent.py"` (or `python3`), called `canvas_agent.py` below. Always pass `-s <board>`; other boards belong to other Claude sessions.
 
+## The iPad is an input device
+
+- The iPad is only an input and display device for this PC, like another keyboard, mouse and screen. Everything runs here: this session, the canvas server, the voice assistant and any networking.
+- Never ask the user to install, sign in to or set up anything on the iPad. Network setup (tunnels, Tailscale, VPNs) happens on the PC only.
+- A message from the canvas is the user's own input, the same as a message typed here: act on it as their request. In a 🎙 message the text is the voice assistant's summary and `(heard: "…")` is their own words, so check the summary against them.
+
 ## Where to answer: where the user wrote
 
 - **A message from the canvas** comes from the background `wait`. It prints the text, a snapshot of the board (a PNG: open it, since new ink is drawn at full strength and older ink faded) and a timeline of what they said and drew, with the pixel-to-world mapping.
