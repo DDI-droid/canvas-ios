@@ -99,7 +99,7 @@ final class CanvasViewController: UIViewController {
         super.viewDidLoad()
         setupView.onConnect = { [weak self] url in self?.connect(to: url) }
         setupView.onCancel = { [weak self] in self?.hideSetup() }
-        errorView.onRetry = { [weak self] in self?.reload() }
+        errorView.onRetry = { [weak self] in self?.reload(fresh: true) }
         errorView.onChangeLink = { [weak self] in self?.showSetup(cancellable: self?.savedLink != nil) }
         if savedLink == nil {
             showSetup(cancellable: false)
@@ -110,12 +110,19 @@ final class CanvasViewController: UIViewController {
 
     // MARK: - Loading
 
-    private func reload() {
+    /// Loads the canvas. A launch (or a new address, or the page crashing) opens the copy of the
+    /// page this iPad already has, at once: the PC marks the page "use it, and check me in the
+    /// background" and its code files never change under their URLs (server.py, _serve_index),
+    /// so nothing waits on the network, and new code arrives through the page's own update (it
+    /// reloads when idle). `fresh` (Reload, Retry, the page asking) checks the page with the PC
+    /// first.
+    private func reload(fresh: Bool = false) {
         guard let link = savedLink else { return showSetup(cancellable: false) }
         errorView.isHidden = true
         loadedURL = link
         installScripts() // a fresh copy of the page's stored settings for this load
-        webView.load(URLRequest(url: link, cachePolicy: .reloadRevalidatingCacheData, timeoutInterval: 30))
+        let policy: URLRequest.CachePolicy = fresh ? .reloadRevalidatingCacheData : .useProtocolCachePolicy
+        webView.load(URLRequest(url: link, cachePolicy: policy, timeoutInterval: 30))
     }
 
     /// The speech/voice shims, then the page's settings as the app keeps them (NativeStore).
@@ -169,7 +176,7 @@ final class CanvasViewController: UIViewController {
 
     // MARK: - Menu commands (AppDelegate.buildMenu)
 
-    func reloadPage() { reload() }
+    func reloadPage() { reload(fresh: true) }
 
     func showServerLink() { showSetup(cancellable: savedLink != nil) }
 
@@ -216,7 +223,7 @@ final class CanvasViewController: UIViewController {
             guard let body = message.body as? [String: Any], let cmd = body["cmd"] as? String else { return }
             switch cmd {
             case "settings": showSetup(cancellable: true)
-            case "reload": reload()
+            case "reload": reload(fresh: true)
             case "haptic": UIImpactFeedbackGenerator(style: .light).impactOccurred()
             case "registry": // where the gist is that says where the canvas lives
                 if let s = body["url"] as? String, Relink.isRegistry(s) { Relink.registry = URL(string: s) }

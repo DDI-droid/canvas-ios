@@ -100,14 +100,38 @@ AGENT_CLIENT = os.path.join(BASE_DIR, "canvas_agent.py")
 STATIC_ROOT = os.path.normcase(os.path.realpath(STATIC_DIR))
 
 # ---- asset versioning
-# Safari keeps ES modules in its memory cache and does not always revalidate them on a
-# reload, so a fresh app.js could run against a stale board.js (seen on the iPad:
-# "board.setPaper is not a function" -> blank canvas). Every local script/style URL in the
-# page, and every relative import inside the scripts, gets ?v=<build>. <build> changes
-# whenever any top-level static file changes, so old and new files can never mix.
+# Every local script and style the page loads is asked for as <file>?v=<hash of that file's
+# content>, and served with that URL as "immutable": the device keeps it until the file itself
+# changes, so a launch or reload needs no round trip for code, and a change re-downloads only the
+# files it touched. Imports inside the modules stay plain ("./board.js"): the page's import map
+# (<script type="importmap">) points each one at its current versioned URL. So old and new code
+# can never mix within one page (Safari keeps modules in its memory cache and once ran a fresh
+# app.js against a stale board.js: "board.setPaper is not a function" -> blank canvas), and a
+# module that changes doesn't change the URL of every module that imports it.
 IMPORT_RE = re.compile(r"""((?:\bfrom|\bimport)\s*\(?\s*)(['"])(\.{1,2}/[^'"?#]+?\.m?js)\2""")
 ASSET_ATTR_RE = re.compile(r"""(\b(?:src|href)=")((?![a-z]+:|//)[^"?#]+\.(?:m?js|css))(\?[^"]*)?(")""")
-_build = {"t": 0.0, "v": ""}
+_file_v: dict = {}
+SMALL_FILE_PAD = 4200  # see _serve_static
+_build = {"t": 0.0, "v": "", "graph": None}
+
+
+def file_version(rel: str) -> str:
+    """A short hash of a static file's content ("" if it doesn't exist), cached until it changes."""
+    full = os.path.join(STATIC_DIR, *rel.split("/"))
+    try:
+        st = os.stat(full)
+    except OSError:
+        return ""
+    sig = (st.st_mtime_ns, st.st_size)
+    hit = _file_v.get(full)
+    if hit and hit[0] == sig:
+        return hit[1]
+    h = hashlib.sha1()
+    with open(full, "rb") as f:
+        h.update(f.read())
+    v = h.hexdigest()[:12]
+    _file_v[full] = (sig, v)
+    return v
 
 
 _plugin = {"mtime": None, "v": ""}
@@ -125,38 +149,13 @@ def plugin_version() -> str:
     return _plugin["v"]
 
 
-def build_version() -> str:
-    now = time.monotonic()
-    if _build["v"] and now - _build["t"] < 1.0:
-        return _build["v"]
-    h = hashlib.sha1()
-    for e in sorted(os.scandir(STATIC_DIR), key=lambda e: e.name):
-        if e.is_file():
-            st = e.stat()
-            h.update(f"{e.name}:{st.st_mtime_ns}:{st.st_size};".encode())
-    _build.update(t=now, v=h.hexdigest()[:10])
-    return _build["v"]
-
-
-def version_imports(body: bytes, ver: str) -> bytes:
-    text = body.decode("utf-8")
-    text = IMPORT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}?v={ver}{m.group(2)}", text)
-    return text.encode("utf-8")
-
-
-_preloads = {"v": None, "links": ""}
-MODULEPRELOAD_RE = re.compile(r'[ \t]*<link rel="modulepreload"[^>]*>\r?\n?')
-
-
-def module_preloads(ver: str) -> str:
-    """A <link rel="modulepreload"> for every module the page imports (app.js and everything it
-    reaches, libraries included), at the URLs the imports ask for. The device then fetches them
-    all at once, right after the page, instead of finding them a level at a time (app.js, then
-    what it imports, then what those import...): each level is a round trip, and from the iPad
-    through the tunnel one is 0.1-3 s."""
-    if _preloads["v"] == ver:
-        return _preloads["links"]
-    found, todo = [], ["app.js"]
+def module_graph() -> list:
+    """Every module the page imports, app.js first and then everything it reaches (libraries
+    included), as paths under static/. Re-read only when one of them changes."""
+    sig = tuple((rel, file_version(rel)) for rel in (_build["graph"] or []))
+    if _build["graph"] is not None and _build.get("graph_sig") == sig:
+        return _build["graph"]
+    found, todo = ["app.js"], ["app.js"]
     while todo:
         rel = todo.pop(0)
         try:
@@ -166,22 +165,74 @@ def module_preloads(ver: str) -> str:
             continue
         for m in IMPORT_RE.finditer(text):
             dep = posixpath.normpath(posixpath.join(posixpath.dirname(rel), m.group(3)))
-            if dep.startswith("..") or dep in found or dep == "app.js":
+            if dep.startswith("..") or dep in found:
                 continue
             if os.path.isfile(os.path.join(STATIC_DIR, *dep.split("/"))):
                 found.append(dep)
                 todo.append(dep)
-    links = "".join(f'<link rel="modulepreload" href="{dep}?v={ver}">\n' for dep in found)
-    _preloads.update(v=ver, links=links)
-    return links
+    _build["graph"] = found
+    _build["graph_sig"] = tuple((rel, file_version(rel)) for rel in found)
+    return found
 
 
-def version_page_assets(html: str, ver: str) -> str:
+def page_files() -> list:
+    """Everything the page itself loads from static/: its modules, plus the scripts and styles
+    named in index.html (guard.js, app.css, KaTeX's css)."""
+    files = list(module_graph())
+    try:
+        with open(os.path.join(STATIC_DIR, "index.html"), "r", encoding="utf-8") as f:
+            html = f.read()
+    except OSError:
+        html = ""
+    for m in ASSET_ATTR_RE.finditer(html):
+        rel = posixpath.normpath(m.group(2).lstrip("/"))
+        if rel not in files and not rel.startswith(".."):
+            files.append(rel)
+    return files
+
+
+def build_version() -> str:
+    """One hash for the code the page runs (index.html and every file it loads). The page
+    compares it with its own to know the code on the PC changed (the poll reports it)."""
+    now = time.monotonic()
+    if _build["v"] and now - _build["t"] < 1.0:
+        return _build["v"]
+    h = hashlib.sha1()
+    for rel in ["index.html"] + page_files():
+        h.update(f"{rel}:{file_version(rel)};".encode())
+    _build.update(t=now, v=h.hexdigest()[:10])
+    return _build["v"]
+
+
+MODULEPRELOAD_RE = re.compile(r'[ \t]*<link rel="modulepreload"[^>]*>\r?\n?')
+
+
+def page_head(build: str) -> tuple:
+    """What goes in the page's <head> before its first script: the build, the import map (each
+    module's plain path -> its versioned URL) and a modulepreload for every module. The device
+    then fetches all the modules at once, right after the page, instead of finding them a level
+    at a time (app.js, then what it imports...): each level is a round trip, and from the iPad
+    through the tunnel one is 0.1-3 s. Modules already on the device aren't fetched at all."""
+    graph = module_graph()
+    imports = {f"/{rel}": f"/{rel}?v={file_version(rel)}" for rel in graph if rel != "app.js"}
+    imap = json.dumps({"imports": imports}, separators=(",", ":"))
+    links = "".join(f'<link rel="modulepreload" href="{imports[f"/{rel}"]}">\n'
+                    for rel in graph if rel != "app.js")
+    head = (f'<meta name="canvas-build" content="{build}">\n'
+            f'<script type="importmap">{imap}</script>\n' + links)
+    return head, imap
+
+
+def version_page_assets(html: str) -> str:
     def sub(m):
+        v = file_version(posixpath.normpath(m.group(2).lstrip("/")))
+        if not v:
+            return m.group(0)
         q = m.group(3) or ""
-        q = (q + "&" if q else "?") + "v=" + ver
+        q = (q + "&" if q else "?") + "v=" + v
         return f"{m.group(1)}{m.group(2)}{q}{m.group(4)}"
     return ASSET_ATTR_RE.sub(sub, html)
+
 
 HOST = "127.0.0.1"
 MAX_BODY = 25 * 1024 * 1024
@@ -1239,6 +1290,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             parts = urllib.parse.urlsplit(self.path)
             self.query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
             path = urllib.parse.unquote(parts.path) or "/"
+            self._csp = None  # the page's own policy (_serve_index); a connection serves many requests
             self._public = path.startswith(PUBLIC_PREFIXES) or path in PUBLIC_FILES
             if self._public:  # live pages and the code they load: no key (see PUBLIC_PREFIXES)
                 if self.command not in ("GET", "HEAD", "OPTIONS"):
@@ -1421,7 +1473,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         if html:
-            self.send_header("Content-Security-Policy", CSP)
+            self.send_header("Content-Security-Policy", getattr(self, "_csp", None) or CSP)
             self.send_header("X-Frame-Options", "DENY")
 
     def _send(self, code: int, body: bytes, ctype: str, headers: dict | None = None,
@@ -1500,17 +1552,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except FileNotFoundError:
             raise HttpError(500, "static/index.html missing")
         html = html.replace("%%K%%", urllib.parse.quote(self.token, safe=""))
-        ver = build_version()
-        html = version_page_assets(html, ver)
-        # every module up front, in one wave (module_preloads), where the hand-written two were
+        html = version_page_assets(html)
+        # the build, the import map and every module up front (page_head), where the
+        # hand-written preloads were
+        head, imap = page_head(build_version())
         html = MODULEPRELOAD_RE.sub("", html)
-        html = html.replace('<script src="guard.js', module_preloads(ver) + '<script src="guard.js', 1)
-        secure = (self.headers.get("X-Forwarded-Proto") or "").lower() == "https"
-        cookie = (
-            f"{COOKIE_NAME}={self.token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"
-            + ("; Secure" if secure else "")
-        )
-        self._send(200, html.encode("utf-8"), MIME[".html"], {"Set-Cookie": cookie})
+        html = html.replace('<script src="guard.js', head + '<script src="guard.js', 1)
+        body = html.encode("utf-8")
+        etag = '"' + hashlib.sha1(body).hexdigest()[:20] + '"'
+        # The import map is the page's one inline script: allowed by its hash, nothing else is.
+        digest = base64.b64encode(hashlib.sha256(imap.encode("utf-8")).digest()).decode("ascii")
+        self._csp = CSP.replace("script-src 'self'", f"script-src 'self' 'sha256-{digest}'", 1)
+        # A launch opens the copy of this page the device already has, at once, and asks for this
+        # one in the background (stale-while-revalidate); the poll's "build" then brings in new
+        # code if there is any (app.js: updateWhenIdle). Its scripts are versioned and immutable,
+        # so with the page on the device a launch needs nothing from the PC to start.
+        cache = "private, max-age=0, stale-while-revalidate=2592000"
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        headers = {"ETag": etag}
+        if not self._has_key_cookie():
+            secure = (self.headers.get("X-Forwarded-Proto") or "").lower() == "https"
+            headers["Set-Cookie"] = (
+                f"{COOKIE_NAME}={self.token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"
+                + ("; Secure" if secure else "")
+            )
+        self._send(200, body, MIME[".html"], headers, cache=cache)
+
+    def _has_key_cookie(self) -> bool:
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return False
+        try:
+            c = SimpleCookie()
+            c.load(raw)
+        except CookieError:
+            return False
+        return COOKIE_NAME in c and hmac.compare_digest(
+            c[COOKIE_NAME].value.encode("utf-8"), self.token.encode("utf-8"))
 
     def _serve_static(self, path: str):
         rel = path.lstrip("/")
@@ -1525,26 +1609,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise HttpError(404, "not found")
         ext = os.path.splitext(full)[1].lower()
         ctype = MIME.get(ext, "application/octet-stream")
-        # ?v= is the build version (a hash of every top-level static file), so a file asked for
-        # with the current one can't change under that URL: the device keeps it and a reload or
-        # board switch loads the code with no round trips. Anything else is checked every time.
+        # ?v= is the hash of this file's content (file_version), so a file asked for with the
+        # current one can't change under that URL: the device keeps it, and a launch, reload or
+        # board switch loads it with no round trip. Anything else is checked every time.
+        ver = file_version("/".join(parts))
         cache = ("private, max-age=31536000, immutable"
-                 if len(parts) == 1 and self.query.get("v", [""])[0] == build_version() else "no-cache")
+                 if ver and self.query.get("v", [""])[0] == ver else "no-cache")
         if parts[0] == "vendor" and cache == "no-cache":
             # third-party libraries (three.js, Chart.js, KaTeX, ...) that page cards load by plain
             # path: they change only when one is upgraded, so a day without re-checking is safe
             cache = "private, max-age=86400"
         st = os.stat(full)
         body = None
-        if ext in (".js", ".mjs"):
-            # Imports carry the build version, so the ETag must follow the rewritten body.
-            with open(full, "rb") as f:
-                body = version_imports(f.read(), build_version())
-            etag = '"' + hashlib.sha1(body).hexdigest()[:20] + '"'
-            headers = {"ETag": etag}
-        else:
-            etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
-            headers = {"ETag": etag, "Last-Modified": formatdate(st.st_mtime, usegmt=True)}
+        etag = f'"{ver}"'
+        headers = {"ETag": etag, "Last-Modified": formatdate(st.st_mtime, usegmt=True)}
         if self.headers.get("If-None-Match") == etag:
             self.send_response(304)
             self.send_header("ETag", etag)
@@ -1555,6 +1633,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if body is None:
             with open(full, "rb") as f:
                 body = f.read()
+        if cache.endswith("immutable") and ext in (".js", ".mjs", ".css") and len(body) < SMALL_FILE_PAD:
+            # Measured in WebKit (the iPad's engine): a cached file under 4 KB is checked with the
+            # PC on every launch even when marked immutable (a round trip the whole page waits
+            # for); 4 KB and up comes straight from the cache. So small ones go out a little longer.
+            body += b"\n/*" + b" " * (SMALL_FILE_PAD - len(body)) + b"*/\n"
         self._send(200, body, ctype, headers, cache=cache)
 
     # ---- the iPad app (canvas/ios), built by GitHub Actions and installed with SideStore

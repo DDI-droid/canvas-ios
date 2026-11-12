@@ -1292,14 +1292,14 @@ $('#voiceOpts').addEventListener('click', (e) => {
 });
 
 // ---- updates: a code change on the PC reaches this page by itself.
-// Each poll reports the server's build. When it differs from the build this page loaded (the
-// ?v= on its own script URL), the page reloads the moment you're idle: not drawing, moving a
+// Each poll reports the server's build. When it differs from the build this page loaded (its
+// <meta name="canvas-build">), the page reloads the moment you're idle: not drawing, moving a
 // card, typing, talking (Live), sending, or looking at something full screen; at once if the
 // app is in the background. It carries over what a reload would lose (undo / redo history,
 // the draft, the camera), so it feels like nothing happened but "Canvas updated". If a reload
 // somehow still runs old code, it doesn't loop: it offers a Reload button instead.
 // (The iPad app's own native code is the one part that needs an install: see appVersion below.)
-const PAGE_BUILD = new URL(import.meta.url).searchParams.get('v');
+const PAGE_BUILD = document.querySelector('meta[name="canvas-build"]')?.content || null;
 const CARRY = 'canvas.carry';
 let updateTo = null;
 let lastInput = Date.now();
@@ -1794,11 +1794,21 @@ function reportBoot(t) {
     const ms = (x) => (Number.isFinite(x) ? Math.round(x) : '-');
     const nav = performance.getEntriesByType('navigation')[0];
     const files = performance.getEntriesByType('resource').filter((r) => /\.(js|css)(\?|$)/.test(r.name));
-    const sized = files.some((r) => typeof r.transferSize === 'number');
-    const cached = sized ? files.filter((r) => r.transferSize === 0).length : '?';
+    const name = (r) => r.name.split('?')[0].split('/').pop();
+    // where each file came from: the device's cache (no network at all), checked with the PC
+    // and unchanged (a round trip, no download), or downloaded
+    // (a check answered "unchanged" moves only headers: no body (WebKit), or fewer bytes than it)
+    const from = (r) => (typeof r.transferSize !== 'number' ? '?'
+      : r.transferSize === 0 ? 'cache'
+        : r.encodedBodySize === 0 || r.transferSize < r.encodedBodySize ? 'checked' : 'downloaded');
+    const n = { cache: 0, checked: 0, downloaded: 0, '?': 0 };
+    for (const r of files) n[from(r)]++;
+    const got = files.filter((r) => from(r) === 'downloaded').map(name);
     const slow = files.slice().sort((a, b) => b.duration - a.duration)[0];
-    const msg = `board ${SESSION} · page ${ms(nav && nav.responseEnd)} · code ${ms(T_CODE)}` +
-      ` (${files.length} files, ${cached} cached${slow ? `, slowest ${slow.name.split('?')[0].split('/').pop()} ${ms(slow.duration)}` : ''})` +
+    const msg = `board ${SESSION} · page ${ms(nav && nav.responseEnd)} (${nav ? from(nav) : '?'})` +
+      ` · code ${ms(T_CODE)} (${files.length} files: ${n.cache} cache, ${n.checked} checked, ${n.downloaded} downloaded` +
+      `${slow ? `; slowest ${name(slow)} ${ms(slow.duration)}` : ''})` +
+      (got.length ? ` · downloaded ${got.slice(0, 8).join(' ')}${got.length > 8 ? ' …' : ''}` : '') +
       ` · ui ${ms(t.ui)} · state ${ms(t.state)} · storage ${cacheStats.result || '-'} ${cacheStats.ms}` +
       ` · ink ${ms(t.ink)} · ready ${ms(t.ready)}`;
     api.post('/api/clientlog', { kind: 'boottime', msg, ua: navigator.userAgent }).catch(() => {});
