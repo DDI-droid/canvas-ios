@@ -105,6 +105,8 @@ class PageShots:
         if not exe:
             raise RuntimeError("Chrome isn't installed")
         os.makedirs(self.profile, exist_ok=True)
+        from boardrender import end_orphans
+        end_orphans(self.profile, self.log)  # one a stopped server left running on this profile
         port_file = os.path.join(self.profile, "DevToolsActivePort")
         try:
             os.remove(port_file)

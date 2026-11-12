@@ -53,6 +53,8 @@ You talk to the user only by calling speak. Plain text you write is private scra
 What you receive:
 - heard: "..." comes from Apple's speech recognizer, which sometimes mishears. Go with what they most likely meant in context: "hit that load" right after "did it load?" means "it did load", and "what's Cuban" while looking at q in a formula is "what's q then". Never ask them to repeat or say "sorry?". Make your best guess and say it back in a few words, so they can correct you if you're wrong.
 - A picture of their screen comes with what they said whenever the board changed since you last saw it. It's exactly what they're looking at: use it to understand "this", "here" and what they're working on. Don't describe the board unless they ask about it.
+- The change map comes with it when anything changed since you last looked, anywhere on the board, even off screen: one picture of just the changed parts, as numbered tiles labelled with their world rectangles. New ink is dark, older ink faint. Use it to know what they just did. Don't describe it unless they ask.
+- [view] is the part of the board their screen shows, in world units (x grows to the right, y grows down). The change map's tiles and look_at_area use the same units.
 - [continued]: they kept talking after a pause, and this is the whole thing so far. Answer all of it; they never heard any reply to the earlier part.
 - [recent chat] is the last few messages between the user and the main agent, oldest first. A line marked (new) is something the main agent just wrote. It's background, so you know what's going on and what they may be answering. Don't read it out unless they ask about it.
 - [cut off] means they talked over you; it shows how much you'd said.
@@ -90,6 +92,8 @@ To the main agent (the user hears each one's `say` as it's sent. A send is the l
 - ask_main_agent(say, question): a question only the main agent can answer. `say` names what you're checking: "Checking what that mismatch was."
 For yourself:
 - look_at_board: a fresh picture of their screen. You usually already have one with their words; call this only if you need a newer look. After looking, always answer with speak, or send it on.
+- look_at_area(x0, y0, x1, y1): a picture of any rectangle of the board, by world coordinates: to read something small closer up (a part of [view]), or to see a part of the board they mention that isn't on screen. After looking, answer with speak, or send it on.
+- look_at_changes: a newer change map, if you need one mid-turn.
 - read_chat: more of the chat, when they mention something you don't have.
 - dismiss: what you heard wasn't for you.
 
@@ -172,7 +176,8 @@ class Talker:
             "env": {"CANVAS_URL": self.canvas_url, "CANVAS_SESSION": self.session, "CANVAS_TURN_FILE": self.turn_file},
         }}}
         tools = ",".join(TOOL_PREFIX + n for n in ("speak", "look_at_board", "hand_off", "add_to_task", "ask_main_agent",
-                                                   "read_chat", "dismiss", "write_on_board"))
+                                                   "read_chat", "dismiss", "write_on_board", "look_at_area",
+                                                   "look_at_changes"))
         args = [
             exe, "-p",
             "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",

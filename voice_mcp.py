@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +52,29 @@ TOOLS = [
         "description": (
             "See the user's canvas: returns a picture of what is on their screen right now. Use it "
             "when they refer to the board (\"this\", \"here\", \"what I drew\", \"is that right\")."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "look_at_area",
+        "description": (
+            "See any rectangle of the board, on screen or not, by its world coordinates (the same "
+            "units as [view] and the change map's tiles): x0, y0 is its top left, x1, y1 its bottom "
+            "right. Use it to look closer at something, or at a part of the board they aren't "
+            "looking at. Drawn on the PC from what it stores, so it works even when the iPad is busy."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {k: {"type": "number"} for k in ("x0", "y0", "x1", "y1")},
+            "required": ["x0", "y0", "x1", "y1"],
+        },
+    },
+    {
+        "name": "look_at_changes",
+        "description": (
+            "See what changed anywhere on the board since you last looked: one picture of just the "
+            "changed parts, as tiles labelled with their world rectangles. One usually comes with "
+            "their words already; call this for a newer one mid-turn."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -172,6 +196,24 @@ def _look() -> list:
     ]
 
 
+def _board_picture(path: str, what: str) -> list:
+    req = urllib.request.Request(CANVAS_URL + path,
+                                 headers={"X-Canvas-Key": _token(), "X-Canvas-Session": CANVAS_SESSION})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as res:
+            data = json.loads(res.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return [{"type": "text", "text": f"The picture of {what} didn't come ({exc}). Say you couldn't see it."}]
+    if not data.get("image"):
+        return [{"type": "text", "text": "Nothing on the board changed since you last looked."}]
+    tiles = "; ".join(f"#{t['n']} x {round(t['rect'][0])}..{round(t['rect'][2])}, y {round(t['rect'][1])}..{round(t['rect'][3])}"
+                      for t in data.get("tiles") or [])
+    return [
+        {"type": "image", "data": data["image"], "mimeType": data.get("media_type") or "image/png"},
+        {"type": "text", "text": f"This is {what} ({tiles})."},
+    ]
+
+
 def _read_chat(count) -> list:
     try:
         n = max(1, min(30, int(count or 10)))
@@ -237,6 +279,15 @@ def _call(name: str, args: dict) -> tuple[list, bool]:
         return _read_chat(args.get("count")), False
     if name == "look_at_board":
         return _look(), False
+    if name == "look_at_area":
+        try:
+            x0, y0, x1, y1 = (float(args[k]) for k in ("x0", "y0", "x1", "y1"))
+        except (KeyError, TypeError, ValueError):
+            return [{"type": "text", "text": "look_at_area needs x0, y0, x1, y1 as numbers."}], True
+        q = urllib.parse.urlencode({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "px": 1200})
+        return _board_picture(f"/api/board/area?{q}", "that part of the board"), False
+    if name == "look_at_changes":
+        return _board_picture("/api/board/changes?viewer=voice", "what changed since you last looked"), False
     if name == "write_on_board":
         return [{"type": "text", "text": "Written on the board."}], False
     if name == "dismiss":

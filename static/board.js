@@ -161,7 +161,7 @@ function serializeStroke(s) {
 
 // One pass over the points: build them, check them, and measure the box (big boards load many
 // thousands of strokes, so this is the hot loop of opening one).
-function parseStroke(o) {
+export function parseStroke(o) {
   if (!o || typeof o !== 'object' || !Array.isArray(o.pts)) return null;
   const pts = [];
   const flat = o.pts;

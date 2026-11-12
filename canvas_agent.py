@@ -333,8 +333,46 @@ def cmd_wait(args) -> None:
     print(snap or "(none)")
     print("--- timeline ---")
     print((msg.get("timeline") or "").strip())
+    print("--- changes since you last looked (change map) ---")
+    print(board_picture(cfg, sid, "/api/board/changes?viewer=agent", f"{msg['id']}-changes"))
     print("---")
     print(f"reply: python {os.path.basename(sys.argv[0])} say -s {sid} --file reply.md, then wait again")
+
+
+def board_picture(cfg, sid: str, path: str, name: str) -> str:
+    """Fetch a picture the PC draws of the board (the change map, or a rectangle), save it next
+    to the snapshots, and say where it is and what its tiles cover."""
+    try:
+        res = request(cfg, sid, "GET", path, timeout=60)
+    except urllib.error.HTTPError as e:
+        return f"(couldn't draw it: HTTP {e.code} {e.read().decode('utf-8', 'replace')[:200]})"
+    except (urllib.error.URLError, OSError) as e:
+        return f"(couldn't draw it: {e})"
+    if res.get("first_look"):
+        return "(first look: from now on this shows what changed between your looks)"
+    if not res.get("image"):
+        return "(nothing changed since you last looked)"
+    out = os.path.join(HOME, "inbox", sid, f"{name}.png")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(base64.b64decode(res["image"]))
+    tiles = "\n".join(
+        f"  #{t['n']}: world x {round(t['rect'][0])}..{round(t['rect'][2])}, y {round(t['rect'][1])}..{round(t['rect'][3])}"
+        f" at pixels {t['px'][0]},{t['px'][1]} size {t['px'][2]}x{t['px'][3]} (world = rect start + px / {t['scale']})"
+        for t in res.get("tiles") or [])
+    return f"{out}\n{tiles}"
+
+
+def cmd_look(args) -> None:
+    cfg = load_config()
+    if args.area:
+        x0, y0, x1, y1 = args.area
+        q = urllib.parse.urlencode({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "px": args.px})
+        name = f"area-{int(time.time())}"
+        print(board_picture(cfg, args.session, f"/api/board/area?{q}", name))
+    else:
+        name = f"changes-{int(time.time())}"
+        print(board_picture(cfg, args.session, "/api/board/changes?viewer=agent", name))
 
 
 def cmd_say(args) -> None:
@@ -670,6 +708,13 @@ def main() -> None:
     p = with_session(sub.add_parser("wait", help="block until the user's next message, then print it"))
     p.add_argument("--timeout", type=float, default=0, help="give up after this many seconds (default: never)")
     p.set_defaults(fn=cmd_wait)
+
+    p = with_session(sub.add_parser("look", help="a picture of the board drawn on the PC: what changed since "
+                                                  "you last looked (default), or any rectangle (--area)"))
+    p.add_argument("--area", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"),
+                   help="the world rectangle to draw (top left, bottom right)")
+    p.add_argument("--px", type=int, default=1600, help="the picture's longest side in pixels (--area)")
+    p.set_defaults(fn=cmd_look)
 
     p = with_session(sub.add_parser("say", help="reply in the canvas chat (markdown + KaTeX)"))
     p.add_argument("text", nargs="*")

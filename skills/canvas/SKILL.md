@@ -15,7 +15,9 @@ The user has an iPad canvas: an infinite board they draw on with Apple Pencil, a
 
 ## Where to answer: where the user wrote
 
-- **A message from the canvas** comes from the background `wait`. It prints the text, a snapshot of the board (a PNG: open it, since new ink is drawn at full strength and older ink faded) and a timeline of what they said and drew, with the pixel-to-world mapping.
+- **A message from the canvas** comes from the background `wait`. It prints the text, a snapshot of the board (a PNG: open it, since new ink is drawn at full strength and older ink faded), a timeline of what they said and drew, with the pixel-to-world mapping, and the change map.
+  - The change map is a PNG of just the parts of the board that changed since you last looked, anywhere on the board (off screen too), as numbered tiles labelled with their world rectangles. Open it when it's there.
+  - To see any rectangle of the board, on screen or not: `canvas_agent.py look -s <board> --area X0 Y0 X1 Y1` (world units, top left then bottom right). `look` alone gives a newer change map. Both are drawn on the PC, so they work while the iPad sleeps.
   - Answer on the canvas: write markdown to a **new** file, then `canvas_agent.py say -s <board> --file reply.md`. KaTeX works (`$x^2$`).
   - In this chat, mark it so the user can tell the two apart: one line, `📱 From the canvas: "<their words>"`, then a one-line summary of your answer.
   - Then start `wait` again (in the background). Keep exactly one `wait` per board.

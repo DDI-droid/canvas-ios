@@ -283,6 +283,10 @@ then appears in the user's session switcher in the canvas, marked as connected w
    - the path of the board snapshot (a PNG). Open it with your image or Read tool. New ink is
      drawn at full strength, older ink faded.
    - a timeline of what they said and drew, including the px→world mapping.
+   - the change map: a PNG of just the parts of the board that changed since you last looked,
+     anywhere on the board (off screen too), as numbered tiles with their world rectangles.
+   Any rectangle of the board, on screen or not: `python canvas_agent.py look -s {SESSION}
+   --area X0 Y0 X1 Y1` (world units; drawn on the PC). `look` alone: a newer change map.
 2. Do the work.
 3. Reply. Write markdown to a file first, so the shell doesn't mangle `$math$`:
    ```bash
@@ -499,6 +503,21 @@ def page_shots():
     return _pageshots
 
 
+_renderer = None
+
+
+def board_renderer(port: int, token: str):
+    """The PC's own board pictures (boardrender.py), created on first use."""
+    global _renderer
+    if _renderer is None:
+        import boardrender
+        url = f"http://127.0.0.1:{port}/render.html?k={urllib.parse.quote(token, safe='')}"
+        _renderer = boardrender.BoardRenderer(
+            DATA_DIR, lambda: url,
+            lambda: build_version() + file_version("render.js") + file_version("render.html"), log)
+    return _renderer
+
+
 def tab_of(item: dict):
     """The browser tab behind a card: a browser card's, or a page card's that's browsing a link."""
     return item.get("browser") or (item.get("browsing") or {}).get("browser")
@@ -687,6 +706,179 @@ def apply_ink_ops(strokes: list, ops: list) -> list:
     return [s for s in out if s is not None]
 
 
+# ---- what changed on the board, square by square (the change map)
+#
+# The board is cut into squares of CHANGE_CELL world units. Every change (a batch of ink, a
+# drawing or card added, moved, resized, removed, a chart's new data) gets the next number, and
+# each square it touched (where the thing was, and where it is now) records that number. Each
+# viewer (the voice, the main agent) keeps the number it had when it last looked. "What changed
+# since you last looked" is then every square whose number is higher: the change map draws just
+# those, grouped into a few tiles (change_tiles), on the PC (boardrender.py).
+# Kept in data/sessions/<board>/changes.json:
+#   {"cell": 512, "n": 1234, "cells": {"3,-2": 1230, ...},
+#    "seen": {"voice": {"n": 1200, "at": <ms>}, "agent": {"n": 1100, "at": <ms>}}}
+
+CHANGE_CELL = 512
+CHANGE_VIEWERS = ("voice", "agent")
+MAX_CELLS_PER_RECT = 64  # per side: a rect bigger than 64 squares marks its first 64 (never seen)
+
+
+def stroke_rect(s) -> list | None:
+    """A stored stroke's box in world units ({pts: [x, y, p, ...] or [[x, y, p], ...], size})."""
+    if not isinstance(s, dict) or not isinstance(s.get("pts"), list) or not s["pts"]:
+        return None
+    pts = s["pts"]
+    try:
+        if isinstance(pts[0], list):
+            xs = [float(p[0]) for p in pts]
+            ys = [float(p[1]) for p in pts]
+        else:
+            xs = [float(v) for v in pts[0::3]]
+            ys = [float(v) for v in pts[1::3]]
+        r = float(s.get("size") or 3.5) * 0.75 + 1
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not xs or not ys:
+        return None
+    return [min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r]
+
+
+_VIEWBOX_RE = re.compile(r'viewBox\s*=\s*"\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)')
+
+
+def item_rect(it) -> list | None:
+    """A drawing or card's box in world units, worked out like the page does (claude-layer.js)."""
+    if not isinstance(it, dict):
+        return None
+    try:
+        x, y = float(it.get("x") or 0), float(it.get("y") or 0)
+        w = float(it.get("width") or 0) or 400.0
+        h = float(it.get("height") or 0)
+        if h <= 0:
+            if it.get("svg"):
+                m = _VIEWBOX_RE.search(it["svg"][:2000])
+                h = w * (float(m.group(2)) / float(m.group(1))) if m and float(m.group(1)) > 0 else w * 0.75
+            else:
+                h = w * (float(it.get("aspect") or 0) or 0.66) + 40
+    except (TypeError, ValueError):
+        return None
+    return [x, y, x + w, y + h]
+
+
+def _item_sig(it) -> str:
+    return hashlib.sha1(json.dumps(it, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+
+
+class ChangeMap:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        d = read_json_any(path)
+        d = d if isinstance(d, dict) and d.get("cell") == CHANGE_CELL else {}
+        self.n = int(d.get("n") or 0)
+        self.cells: dict = {k: int(v) for k, v in (d.get("cells") or {}).items() if isinstance(v, (int, float))}
+        self.seen: dict = {k: {"n": int(v.get("n") or 0), "at": int(v.get("at") or 0)}
+                           for k, v in (d.get("seen") or {}).items() if isinstance(v, dict)}
+        self._timer = None
+
+    def mark(self, rects) -> None:
+        """One change, touching these world rects."""
+        rects = [r for r in rects if r]
+        if not rects:
+            return
+        with self.lock:
+            self.n += 1
+            for x0, y0, x1, y1 in rects:
+                cx0, cy0 = math.floor(x0 / CHANGE_CELL), math.floor(y0 / CHANGE_CELL)
+                cx1 = min(math.floor(x1 / CHANGE_CELL), cx0 + MAX_CELLS_PER_RECT - 1)
+                cy1 = min(math.floor(y1 / CHANGE_CELL), cy0 + MAX_CELLS_PER_RECT - 1)
+                for cx in range(cx0, cx1 + 1):
+                    for cy in range(cy0, cy1 + 1):
+                        self.cells[f"{cx},{cy}"] = self.n
+            if self._timer is None:  # saved a few seconds later: ink comes in many small batches
+                self._timer = threading.Timer(4.0, self.save)
+                self._timer.daemon = True
+                self._timer.start()
+
+    def since(self, viewer: str) -> tuple:
+        """(changed squares as (cx, cy), the change number now, when the viewer last looked (ms) or
+        None if it never has)."""
+        with self.lock:
+            seen = self.seen.get(viewer)
+            if seen is None:
+                return [], self.n, None
+            out = []
+            for k, v in self.cells.items():
+                if v > seen["n"]:
+                    cx, cy = k.split(",")
+                    out.append((int(cx), int(cy)))
+            return out, self.n, seen["at"]
+
+    def looked(self, viewer: str, n: int) -> None:
+        with self.lock:
+            self.seen[viewer] = {"n": int(n), "at": now_ms()}
+        self.save()
+
+    def save(self) -> None:
+        with self.lock:
+            self._timer = None
+            if self.seen and len(self.cells) > 5000:  # everything every viewer has seen can go
+                low = min(v["n"] for v in self.seen.values())
+                self.cells = {k: v for k, v in self.cells.items() if v > low}
+            data = {"cell": CHANGE_CELL, "n": self.n, "cells": dict(self.cells), "seen": dict(self.seen)}
+        try:
+            write_json_atomic(self.path, data)
+        except OSError as e:
+            log(f"couldn't save {self.path}: {e}")
+
+
+def change_tiles(cells: list, max_tiles: int = 6) -> list:
+    """Changed squares -> a few world rects to draw: squares within two of each other join one
+    tile (nearby changes read better together), then the closest tiles merge until there are at
+    most `max_tiles`."""
+    if not cells:
+        return []
+    cellset = set(cells)
+    parent = {c: c for c in cellset}
+
+    def find(c):
+        while parent[c] != c:
+            parent[c] = parent[parent[c]]
+            c = parent[c]
+        return c
+
+    for (cx, cy) in cellset:
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                o = (cx + dx, cy + dy)
+                if o in cellset:
+                    a, b = find((cx, cy)), find(o)
+                    if a != b:
+                        parent[a] = b
+    groups: dict = {}
+    for c in cellset:
+        r = groups.setdefault(find(c), [c[0], c[1], c[0], c[1]])
+        r[0], r[1], r[2], r[3] = min(r[0], c[0]), min(r[1], c[1]), max(r[2], c[0]), max(r[3], c[1])
+    rects = [[r[0], r[1], r[2] + 1, r[3] + 1] for r in groups.values()]
+
+    def area(r):
+        return (r[2] - r[0]) * (r[3] - r[1])
+
+    while len(rects) > max_tiles:
+        best = None
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                u = [min(rects[i][0], rects[j][0]), min(rects[i][1], rects[j][1]),
+                     max(rects[i][2], rects[j][2]), max(rects[i][3], rects[j][3])]
+                cost = area(u) - area(rects[i]) - area(rects[j])
+                if best is None or cost < best[0]:
+                    best = (cost, i, j, u)
+        _, i, j, u = best
+        rects = [r for k, r in enumerate(rects) if k not in (i, j)] + [u]
+    rects.sort(key=lambda r: (r[1], r[0]))
+    return [[r[0] * CHANGE_CELL, r[1] * CHANGE_CELL, r[2] * CHANGE_CELL, r[3] * CHANGE_CELL] for r in rects]
+
+
 class Store:
     """One session's board and chat, kept in memory and saved under its folder."""
 
@@ -696,8 +888,10 @@ class Store:
         self.strokes_file = os.path.join(folder, "strokes.json")
         self.ink_log_file = os.path.join(folder, "strokes.ops.jsonl")
         self.layer_file = os.path.join(folder, "claude_layer.json")
+        self.changes = ChangeMap(os.path.join(folder, "changes.json"))
         self.conversation = read_json_list(self.conv_file)
         self.layer = read_json_list(self.layer_file)
+        self._layer_seen = {it.get("id"): (item_rect(it), _item_sig(it)) for it in self.layer if isinstance(it, dict)}
         self.status = {"status": "idle", "ts": now_ms()}
         self.ink_rev = 0
         self.ink_id = ""  # this board's identity: a page's saved copy is only good for the same id
@@ -743,6 +937,11 @@ class Store:
 
     def apply_ink(self, ops: list, client) -> int:
         """Apply a batch from a page; returns its revision. Call with the lock held."""
+        # the change map: where each touched stroke was, and where it is now
+        ids = {o["id"] if o["op"] == "del" else o["s"]["id"] for o in ops}
+        rects = [stroke_rect(s) for s in self.strokes if isinstance(s, dict) and s.get("id") in ids]
+        rects += [stroke_rect(o["s"]) for o in ops if o["op"] == "put"]
+        self.changes.mark(rects)
         self.strokes = apply_ink_ops(self.strokes, ops)
         self.ink_rev += 1
         self._log_ink({"rev": self.ink_rev, "client": client, "ops": ops})
@@ -751,6 +950,10 @@ class Store:
 
     def reset_ink(self, strokes: list, client) -> int:
         """Replace the whole board (tools, older pages). Call with the lock held."""
+        before = {s.get("id"): s for s in self.strokes if isinstance(s, dict)}
+        after = {s.get("id"): s for s in strokes if isinstance(s, dict)}
+        self.changes.mark([stroke_rect(s) for k, s in before.items() if after.get(k) != s]
+                          + [stroke_rect(s) for k, s in after.items() if before.get(k) != s])
         self.strokes = strokes
         self.ink_rev += 1
         self.ink_recent.append((self.ink_rev, client, None))
@@ -792,6 +995,22 @@ class Store:
 
     def save_layer(self) -> None:
         write_json_atomic(self.layer_file, self.layer, pretty=True)
+        # the change map: drawings and cards that appeared, went, moved or changed since last save
+        now = {it.get("id"): (item_rect(it), _item_sig(it)) for it in self.layer if isinstance(it, dict)}
+        rects = []
+        for k in set(now) | set(self._layer_seen):
+            a, b = self._layer_seen.get(k), now.get(k)
+            if a is None or b is None or a[1] != b[1]:
+                rects += [a[0] if a else None, b[0] if b else None]
+        self._layer_seen = now
+        self.changes.mark(rects)
+
+    def mark_card_changed(self, card_id: str = "", page: str = "") -> None:
+        """A card's content changed without the card itself changing (a chart's new data)."""
+        with self.lock:
+            for it in self.layer:
+                if isinstance(it, dict) and ((card_id and it.get("id") == card_id) or (page and it.get("page") == page)):
+                    self.changes.mark([item_rect(it)])
 
 
 # --------------------------------------------------------------------------- SSE hub
@@ -1322,6 +1541,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if method not in ("GET", "HEAD"):
                 raise HttpError(405, "method not allowed")
             return self._serve_index()
+        if path == "/render.html":  # the PC's own board pictures (boardrender.py): needs the cookie too
+            with open(os.path.join(STATIC_DIR, "render.html"), "rb") as f:
+                body = f.read()
+            return self._send(200, body, MIME[".html"], {"Set-Cookie": (
+                f"{COOKIE_NAME}={self.token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax")})
         if path.startswith("/api/"):
             return self._route_api(method, path)
         if path.startswith("/app/"):
@@ -1364,6 +1588,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ("POST", "/api/sessions"): self._api_sessions_create,
             ("DELETE", "/api/sessions"): self._api_sessions_archive,
             ("GET", "/api/agent/next"): self._api_agent_next,
+            ("GET", "/api/render/data"): self._api_render_data,
+            ("GET", "/api/board/changes"): self._api_board_changes,
+            ("GET", "/api/board/area"): self._api_board_area,
             ("GET", "/api/ping"): self._api_ping,
             ("POST", "/api/message"): self._api_message,
             ("POST", "/api/reply"): self._api_reply,
@@ -1720,6 +1947,100 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "archived": self.sid})
 
     # ---- the agent side: a Claude Code session attached to this canvas session
+    # ---- the PC's own board pictures (boardrender.py, static/render.js)
+    def _board_rev(self) -> str:
+        st = self.store
+        with st.lock:
+            return f"{st.ink_id}:{st.ink_rev}:{st.changes.n}"
+
+    def _api_render_data(self):
+        """What the render page draws from: the board's strokes and drawings/cards."""
+        st = self.store
+        with st.lock:
+            body = {"rev": f"{st.ink_id}:{st.ink_rev}:{st.changes.n}", "strokes": st.strokes, "layer": st.layer}
+        self._send_json(200, body)
+
+    def _render(self, tiles: list, **opts) -> dict:
+        r = board_renderer(self.server.server_port, self.token)
+        out = r.render({"board": self.session.id, "rev": self._board_rev(), "tiles": tiles, **opts})
+        return {"image": base64.b64encode(out["png"]).decode("ascii"), "media_type": "image/png",
+                "width": out["width"], "height": out["height"], "tiles": out["tiles"]}
+
+    def board_changes(self, viewer: str, mark: bool = True) -> dict:
+        """The change map for `viewer`: one picture of just the parts of the board that changed
+        since it last looked (a few tiles, each naming its world rectangle). Looking counts as
+        looking: the next one starts from here. The very first look only sets that point."""
+        ch = self.store.changes
+        cells, n, since = ch.since(viewer)
+        res: dict = {"changed": False}
+        if since is None:
+            res["first_look"] = True
+        else:
+            tiles = change_tiles(cells)
+            if tiles:
+                t0 = time.perf_counter()
+                res = {"changed": True, "since": since, "squares": len(cells),
+                       **self._render([{"rect": r} for r in tiles], since=since, tileMax=900, width=1800)}
+                res["ms"] = int((time.perf_counter() - t0) * 1000)
+        if mark:
+            ch.looked(viewer, n)
+        res["n"] = n
+        return res
+
+    def _voice_change_map(self, budget: float = 1.5):
+        """The voice's change map for this turn, if it's ready within `budget` s (Chrome warm:
+        ~50 ms). The voice has looked only if it got one: a late one is dropped, unseen."""
+        box: dict = {}
+
+        def work():
+            try:
+                box["res"] = self.board_changes("voice", mark=False)
+            except Exception as e:
+                box["err"] = e
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        t.join(budget)
+        res = box.get("res")
+        if t.is_alive() or res is None:
+            log(f"voice change map skipped: {box.get('err') or 'not ready in time'}")
+            return None
+        if res.get("first_look") or res.get("changed"):
+            self.store.changes.looked("voice", res["n"])
+        return res if res.get("changed") else None
+
+    def _api_board_changes(self):
+        """?viewer=voice|agent: the change map since that viewer last looked (and it has now
+        looked; ?peek=1: it hasn't)."""
+        viewer = self.query.get("viewer", ["agent"])[0]
+        if viewer not in CHANGE_VIEWERS:
+            raise HttpError(400, f"viewer must be one of {', '.join(CHANGE_VIEWERS)}")
+        try:
+            res = self.board_changes(viewer, mark=self.query.get("peek", [""])[0] != "1")
+        except Exception as e:
+            raise HttpError(503, f"couldn't draw the change map: {e}")
+        self._send_json(200, res)
+
+    def _api_board_area(self):
+        """?x0=&y0=&x1=&y1= (world units): a picture of that rectangle of the board, as stored
+        on the PC. ?px=: its longest side in pixels (default 1600, at most 2400)."""
+        try:
+            x0, y0, x1, y1 = (float(self.query.get(k, [""])[0]) for k in ("x0", "y0", "x1", "y1"))
+            px = int(float(self.query.get("px", ["1600"])[0]))
+        except ValueError:
+            raise HttpError(400, "x0, y0, x1, y1 must be numbers (world units)")
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+        if not all(math.isfinite(v) for v in (x0, y0, x1, y1)) or x1 - x0 < 1 or y1 - y0 < 1:
+            raise HttpError(400, "the rectangle is empty")
+        if max(x1 - x0, y1 - y0) > 400_000:
+            raise HttpError(400, "the rectangle is too big (at most 400000 world units a side)")
+        px = max(200, min(2400, px))
+        try:
+            res = self._render([{"rect": [x0, y0, x1, y1]}], tileMax=px, width=px, maxScale=4)
+        except Exception as e:
+            raise HttpError(503, f"couldn't draw the rectangle: {e}")
+        self._send_json(200, res)
+
     def _api_agent_next(self):
         """Long-poll for the user's next message after `after` (a message id; empty = from now).
 
@@ -2493,6 +2814,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             meta["data"], mode = data, "replace"
         meta["updated"] = now_ms()
         save_page(self.session, meta)
+        self.store.mark_card_changed(page=token)
         self.hub.broadcast("card_data", {"page": token, "data": data, "mode": mode})
         self._send_json(200, {"ok": True})
 
@@ -2690,6 +3012,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except Exception as exc:
                     log(f"talker warmup failed: {exc}")
             threading.Thread(target=warm, daemon=True).start()
+            # the PC's board pictures too: a change map then takes ~50 ms in a turn instead of ~2 s
+            renderer = board_renderer(self.server.server_port, self.token)
+            threading.Thread(target=renderer.warm, daemon=True).start()
             return self._send_json(200, {"ok": True})
 
         heard = ""
@@ -2735,14 +3060,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parts.append("(Answer the user only by calling speak: text you write is never heard. Reach the main agent "
                      "only by calling hand_off, add_to_task or ask_main_agent: speaking about it sends nothing. "
                      "Or wait, or dismiss.)")
+        if kind == "utterance" and self.voice.view:
+            v = [round(n) for n in self.voice.view]
+            parts.insert(0, f"[view] their screen shows the board from x {v[0]}..{v[2]}, y {v[1]}..{v[3]} (world units)")
         content = "\n".join(parts)
+        blocks, notes = [], []
         image = body.get("image") if kind == "utterance" else None
         m = re.match(r"^data:(image/(?:png|jpeg));base64,(.+)$", image or "", re.S)
         if m:  # the screen as they see it, sent whenever the board changed since Haiku's last look
-            content = [
-                {"type": "image", "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)}},
-                {"type": "text", "text": "[the picture is the user's screen right now]\n" + content},
-            ]
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)}})
+            notes.append(f"[picture {len(blocks)} is the user's screen right now]")
+        cm = self._voice_change_map() if kind == "utterance" else None
+        if cm:  # what changed anywhere on the board since the voice last looked (the change map)
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": cm["image"]}})
+            where = "; ".join(f"#{t['n']} x {round(t['rect'][0])}..{round(t['rect'][2])}, y {round(t['rect'][1])}..{round(t['rect'][3])}"
+                              for t in cm["tiles"])
+            notes.append(f"[picture {len(blocks)} is the change map: only the parts of the board that changed since you "
+                         f"last looked, anywhere on the board, as tiles ({where}); new ink dark, older ink faint]")
+        if blocks:
+            content = blocks + [{"type": "text", "text": "\n".join(notes) + "\n" + content}]
 
         turn_id = body.get("turn") if isinstance(body.get("turn"), str) else ""
         if not re.match(r"^t-[A-Za-z0-9]{4,24}$", turn_id):
