@@ -37,7 +37,10 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             build 2>&1 | tee build.log | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/Build/Products/Release-iphoneos/Canvas.app
+          # the line above never fails the step by itself (grep finding nothing would): check that
+          # the build succeeded and the app has its program, or a broken IPA gets published
+          grep -q "BUILD SUCCEEDED" build.log
+          test -f build/Build/Products/Release-iphoneos/Canvas.app/Canvas
 
       - name: Package IPA
         run: |

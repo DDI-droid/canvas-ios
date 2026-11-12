@@ -55,6 +55,13 @@ def main() -> None:
         src = os.path.join(tmp, "Canvas.ipa")
         if not os.path.isfile(src):
             sys.exit("the build artifact has no Canvas.ipa")
+        # a failed build can still produce an IPA with an empty app (builds 5 and 6 did, while
+        # CI ignored the failure): never copy or publish one without the app's program in it
+        import zipfile
+        with zipfile.ZipFile(src) as z:
+            names = set(z.namelist())
+        if not {"Payload/Canvas.app/Canvas", "Payload/Canvas.app/Info.plist"} <= names:
+            sys.exit(f"build {run['number']} is broken (its IPA has no app inside): not copied or published")
         os.makedirs(APP_DIR, exist_ok=True)
         shutil.copyfile(src, os.path.join(APP_DIR, "Canvas.ipa.tmp"))
         os.replace(os.path.join(APP_DIR, "Canvas.ipa.tmp"), os.path.join(APP_DIR, "Canvas.ipa"))

@@ -1,3 +1,5 @@
+import Foundation
+
 /// JavaScript injected at document start (main frame only).
 ///
 /// 1. `window.__canvasNative` tells the page it runs inside the app (the page hides its
