@@ -27,9 +27,13 @@ export const LIVE_STYLE =
   '.bar .dot{flex:none;width:7px;height:7px;border-radius:50%;background:#34c759;box-shadow:0 0 0 3px rgba(52,199,89,.18)}' +
   '.bar .back{flex:none;margin:0 -2px 0 -4px;font:600 22px/1 -apple-system,system-ui,sans-serif;color:#0a84ff}' +
   '.bar .grip{flex:none;width:14px;height:10px;opacity:.35;background:radial-gradient(circle,#3a3a3c 1.1px,transparent 1.4px) 0 0/5px 5px}' +
-  '.body{position:relative;flex:1;min-height:0;background:#fff}' +
+  // (white behind a page only once it shows: until then the board's paper colour, see revealOnLoad)
+  '.body{position:relative;flex:1;min-height:0;background:#fff;transition:background-color 0s linear .22s}' +
+  '.body.loading{background:var(--paper,#f8f6f1);transition:none}' +
   '.body.dark{background:#111}' +
   'iframe,video,img.frame{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;pointer-events:none}' +
+  'iframe{transition:opacity .2s ease-out}' +
+  '.body.loading iframe{opacity:0}' +
   'video{object-fit:contain;background:#111}' +
   'img.frame{object-fit:cover;background:#fff}' +
   '.play{position:absolute;left:50%;top:50%;width:62px;height:62px;margin:-31px 0 0 -31px;border-radius:50%;' +
@@ -157,6 +161,20 @@ class VideoCard extends LiveCard {
   }
 }
 
+// A page shows once it has loaded: until then its holder is the board's paper colour (dark in dark
+// mode) and the frame is invisible, so a card never flashes white before its page appears.
+export function revealOnLoad(frame, holder) {
+  holder.classList.add('loading');
+  let done = false;
+  const show = () => {
+    if (done) return;
+    done = true;
+    holder.classList.remove('loading');
+  };
+  frame.addEventListener('load', show, { once: true });
+  setTimeout(show, 10000); // a page that never says it loaded still shows
+}
+
 // ---- a live page in a sandboxed iframe (no access to the canvas or its key)
 export function pageFrame(src, title) {
   const f = document.createElement('iframe');
@@ -216,6 +234,7 @@ class PageCard extends LiveCard {
     const f = pageFrame(this.item.src, this.item.label);
     f.setAttribute('loading', 'lazy');
     this.frame = f;
+    revealOnLoad(f, this.body);
     this.body.append(f);
     this.link = new PageLink(f, {
       onReady: () => this.link.post({ type: 'visibility', visible: this.visible }),

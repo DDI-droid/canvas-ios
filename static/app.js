@@ -7,7 +7,7 @@ import { Live, rankVoices } from './live.js';
 import { Viewer } from './viewer.js';
 import { Cards } from './cards.js';
 import { InkSync } from './inksync.js';
-import { BAR, BrowserStream, PageLink, pageFrame } from './livecards.js';
+import { BAR, BrowserStream, PageLink, pageFrame, revealOnLoad } from './livecards.js';
 import { buildSnapshot, buildTimeline, makeThumb } from './snapshot.js';
 import { api, EventStream, KEY, SESSION, sessionKey, setSession, switchSession, withKey } from './api.js';
 import { COLORS, inkColor } from './palette.js';
@@ -351,6 +351,7 @@ function openMedia(id) {
     viewer.show({ ...base, kind: 'page', aspect, mount: (frame) => {
       const f = pageFrame(rec.item.src, rec.item.label);
       f.className = 'stage-media';
+      revealOnLoad(f, frame);
       frame.append(f);
       const link = new PageLink(f, {
         onReady: () => link.post({ type: 'visibility', visible: true }),

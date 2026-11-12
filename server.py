@@ -1466,6 +1466,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # board switch loads the code with no round trips. Anything else is checked every time.
         cache = ("private, max-age=31536000, immutable"
                  if len(parts) == 1 and self.query.get("v", [""])[0] == build_version() else "no-cache")
+        if parts[0] == "vendor" and cache == "no-cache":
+            # third-party libraries (three.js, Chart.js, KaTeX, ...) that page cards load by plain
+            # path: they change only when one is upgraded, so a day without re-checking is safe
+            cache = "private, max-age=86400"
         st = os.stat(full)
         body = None
         if ext in (".js", ".mjs"):
@@ -2375,10 +2379,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         hm = re.search(r"<head[^>]*>", html, re.I)
         html = html[:hm.end()] + boot + html[hm.end():] if hm else boot + html
         out = html.encode("utf-8")
-        self.send_response(200)
+        # checked every time (its data can change), but an unchanged page isn't sent again
+        etag = '"' + hashlib.sha1(out).hexdigest()[:20] + '"'
+        same = self.headers.get("If-None-Match") == etag
+        self.send_response(304 if same else 200)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
+        if same:
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(out)))
-        self.send_header("Cache-Control", "no-store")
         self._security_headers()
         self.send_header("Content-Security-Policy", LIVE_CSP)
         self.end_headers()
