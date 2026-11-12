@@ -2514,11 +2514,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             heard = body.get("text")
             if not isinstance(heard, str) or not heard.strip():
                 raise HttpError(400, "text is required")
+            # all of it, however long: the user wants to talk at length (a cap that cut the end made a
+            # long dictation look unfinished, so the talker kept waiting and never answered)
             heard = heard.strip()
-            if len(heard) > 6000:
-                # a very long dictation: keep how it began and, above all, the newest words (cutting
-                # the end made it look unfinished, so the talker kept waiting and never answered)
-                heard = heard[:1500].rstrip() + " … " + heard[-4400:].lstrip()
             view = body.get("view")
             if isinstance(view, list) and len(view) == 4 and all(isinstance(n, (int, float)) for n in view):
                 with self.voice.lock:
