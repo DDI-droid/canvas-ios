@@ -1,7 +1,7 @@
 {
   "name": "canvas",
   "description": "Your iPad canvas for Claude Code: a Pencil board, chat and hands-free voice. /canvas:connect gives this session its own board on the iPad.",
-  "version": "1.1.24",
+  "version": "1.1.25",
   "author": {
     "name": "DDI-droid"
   },

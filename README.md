@@ -16,6 +16,25 @@ There are **two ways to use it**, and both use the same page and server:
    SideStore installs it, and you re-sign it every 7 days. The server offers the build at
    `/app/Canvas.ipa` and a SideStore source at `/app/source.json`.
 
+## Get it on another computer
+
+The canvas itself runs on one PC (the host). On any other computer, you download the code and
+the Claude Code plugin, then connect a Claude session to a board. On Windows, in PowerShell:
+
+```powershell
+winget install -e --id Git.Git
+winget install -e --id Python.Python.3.12
+irm https://claude.ai/install.ps1 | iex              # Claude Code; then open a new PowerShell window
+git clone https://github.com/DDI-droid/canvas-ios.git canvas
+cd canvas
+claude plugin marketplace add DDI-droid/canvas-ios
+claude plugin install canvas@ddi-canvas
+claude                                               # sign in, then: /canvas:connect <board name>
+```
+
+`/canvas:connect` asks for the canvas link. Get it with `/canvas:link` on the host. Linux and
+macOS steps, the state of the work and what's next are in `HANDOFF.md`.
+
 ## The Claude Code plugin (one repo, two installs)
 
 This repo is also a Claude Code plugin. On every machine where you run Claude Code (this PC, another
