@@ -26,10 +26,10 @@ computer, a cloud server you log into), install it once:
 /plugin install canvas@ddi-canvas
 ```
 
-The repo is private, so git on that machine must be able to sign in to GitHub without asking. The
-simplest way is `gh auth login`, then `gh auth setup-git`. On the PC that hosts the canvas, git
-already signs in through the repo's own credential helper. To pick up a new version later, run
-`claude plugin marketplace update ddi-canvas`.
+The repo is public, so installing needs no GitHub sign-in. (Pushing does: on the PC that hosts
+the canvas, git signs in through the repo's own credential helper.) To pick up a new version
+later, run `claude plugin marketplace update ddi-canvas`. Setting up a new machine and the state
+of the work: `HANDOFF.md`.
 
 Then, in any session:
 
