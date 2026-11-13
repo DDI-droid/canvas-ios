@@ -814,8 +814,10 @@ class ChangeMap:
                     out.append((int(cx), int(cy)))
             return out, self.n, seen["at"]
 
-    def looked(self, viewer: str, n: int) -> None:
+    def looked(self, viewer: str, n: int, forward_only: bool = False) -> None:
         with self.lock:
+            if forward_only and (self.seen.get(viewer) or {}).get("n", -1) >= int(n):
+                return  # a newer look was already recorded
             self.seen[viewer] = {"n": int(n), "at": now_ms()}
         self.save()
 
@@ -2011,8 +2013,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         - the user's screen (their current view), when the board or the view changed since the voice
           last saw it (and `screen`: an older page sends its own instead);
         - the change map: what changed anywhere on the board since the voice last looked.
-        Returns (screen | None, change map | None, note for the log). Pictures not ready within
-        `budget` s are dropped, unseen: the voice has looked only at what it got."""
+        Returns (screen | None, change map | None, note for the log, seen). Pictures not ready
+        within `budget` s are dropped. Call seen() once the voice has taken the turn: until then
+        nothing counts as looked at (a turn cancelled before it ran was never seen, so its
+        pictures come again with the next one)."""
         st, voice = self.store, self.voice
         ch = st.changes
         cells, n, since = ch.since("voice")
@@ -2030,7 +2034,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not specs:
             if since is None:
                 ch.looked("voice", n)  # the very first look only sets where the next one starts
-            return None, None, ""
+            return None, None, "", None
         box: dict = {}
         t0 = time.perf_counter()
 
@@ -2045,7 +2049,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         res = box.get("res")
         if t.is_alive() or res is None:
             log(f"voice pictures skipped: {box.get('err') or 'not ready in time'}")
-            return None, None, f"pictures skipped ({box.get('err') or 'late'})"
+            return None, None, f"pictures skipped ({box.get('err') or 'late'})", None
         ms = int((time.perf_counter() - t0) * 1000)
 
         def pic(o):
@@ -2053,16 +2057,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "width": o["width"], "height": o["height"], "tiles": o["tiles"], "ms": o["ms"]}
         scr = pic(res.pop(0)) if want_screen else None
         cm = pic(res.pop(0)) if tiles else None
-        if scr:
-            voice.screen_seen = stamp
-        if cm or since is None:
-            ch.looked("voice", n)
+        def seen():
+            if scr:
+                voice.screen_seen = stamp
+            if cm or since is None:
+                ch.looked("voice", n, forward_only=True)
         parts = [f"pictures {ms} ms"]
         for name, o in (("screen", scr), ("map", cm)):
             if o:
                 parts.append(f"{name} {o['width']}x{o['height']} {len(o['image']) * 3 // 4 // 1024} KB "
                              f"(sync {o['ms'].get('sync')}, draw {o['ms'].get('draw')}, encode {o['ms'].get('encode')})")
-        return scr, cm, "; ".join(parts)
+        return scr, cm, "; ".join(parts), seen
 
     def _look_on_pc(self, push) -> None:
         """look_at_board: the user's current view, drawn on the PC (the page reports its view when
@@ -3169,7 +3174,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if m:  # an older page sends the screen itself
             blocks.append({"type": "image", "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)}})
             notes.append(f"[picture {len(blocks)} is the user's screen right now]")
-        scr, cm, pics = self._voice_pictures(screen=not m) if kind == "utterance" else (None, None, "")
+        scr, cm, pics, pics_seen = self._voice_pictures(screen=not m) if kind == "utterance" else (None, None, "", None)
         if isinstance(body.get("settle_ms"), (int, float)):
             pics = f"iPad sent its last ink in {int(body['settle_ms'])} ms; " + (pics or "no pictures needed")
         if scr:  # the screen as they see it, whenever the board or the view changed since its last look
@@ -3245,6 +3250,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if res is None:
                 push({"done": True, "error": err or "talker failed"})
                 return
+            if pics_seen and res["mode"] != "cancelled":
+                pics_seen()  # it took the turn, so it saw this turn's pictures
             if kind == "utterance" and res["mode"] != "cancelled":
                 # it saw these words; unless it answered or dismissed them, they're still pending
                 self.voice.fragment_seen = res["mode"] in ("silent", "look")
