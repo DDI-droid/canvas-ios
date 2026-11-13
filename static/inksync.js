@@ -128,6 +128,19 @@ export class InkSync extends EventTarget {
     return this.pending.length + (this.sending ? this.sending.length : 0);
   }
 
+  // Send what's waiting now and resolve once the server has it (or after `wait` ms, or at once
+  // when it can't be sent: offline, or still loading). The voice uses it so the PC, which draws
+  // the voice's pictures from its own copy, has the stroke you just drew. True: nothing unsent.
+  async settle(wait = 800) {
+    const end = Date.now() + wait;
+    while (this.board.changed.size || this.unsent) {
+      if (this.rev < 0 || this.failures || Date.now() >= end) return false;
+      if (this.sending) await new Promise((r) => setTimeout(r, 25));
+      else await Promise.race([this.flush(), new Promise((r) => setTimeout(r, Math.max(0, end - Date.now())))]);
+    }
+    return true;
+  }
+
   async flush() {
     clearTimeout(this.timer);
     if (this.board.changed.size) this._queue(this.board.takeOps());

@@ -337,13 +337,12 @@ class Mouth extends EventTarget {
 
 // -------------------------------------------------------------------- the conversation
 export class Live extends EventTarget {
-  constructor({ voiceSupported, snapshot, boardRev, viewRect, sendToMain, toast }) {
+  constructor({ voiceSupported, snapshot, settleInk, viewRect, sendToMain, toast }) {
     super();
     this.supported = !!(voiceSupported && SR);
-    this.snapshot = snapshot;     // async () => JPEG data URL of the current view
-    this.boardRev = boardRev || (() => ''); // changes when the ink or the view changes
+    this.snapshot = snapshot;     // async () => JPEG data URL of the current view (only if the PC can't draw it)
+    this.settleInk = settleInk || (async () => true); // send the ink still waiting; resolves when the PC has it
     this.viewRect = viewRect || (() => null); // [x0, y0, x1, y1] in world units: where notes go
-    this.seenRev = null;          // the board as Haiku last saw it
     this.sendToMain = sendToMain; // (task, heard) => void
     this.toast = toast;
     this.ears = new Ears();
@@ -383,10 +382,10 @@ export class Live extends EventTarget {
     }
     this.mouth.unlock();
     this.active = true;
-    this.seenRev = null; // a new conversation: show Haiku the board with the first words
     this.clearDraft(false);
     this.ears.start(lang);
-    api.post('/api/talk', { kind: 'warmup' }, { timeout: 15000 }).catch(() => {});
+    // fresh: a new conversation, so the PC shows Haiku the screen with the first words
+    api.post('/api/talk', { kind: 'warmup', fresh: true }, { timeout: 15000 }).catch(() => {});
     this.lastTurnAt = now();
     this.timer = setInterval(() => this.tick(), 90);
     this.set('listening');
@@ -513,20 +512,14 @@ export class Live extends EventTarget {
     this.askWithScreen({ kind: 'utterance', text, continued, done, interrupted: this.cutoff });
   }
 
-  // Haiku sees what you see: when the board changed since its last look, the screen goes along
-  // with your words (a JPEG of the current view; skipped if it isn't ready within 1.5 s).
+  // Haiku sees what you see, drawn on the PC from its own copy of the board (the screen and the
+  // change map): this iPad only sends the ink still waiting, so the PC has your latest stroke,
+  // and then your words and where you're looking. No picture is made or uploaded here.
   async askWithScreen(body) {
+    const t0 = performance.now();
+    try { await this.settleInk(); } catch { /* the PC draws what it has */ }
+    body.settle_ms = Math.round(performance.now() - t0);
     body.view = this.viewRect();
-    const rev = this.boardRev();
-    if (rev !== this.seenRev) {
-      try {
-        const image = await Promise.race([this.snapshot(), new Promise((r) => setTimeout(() => r(null), 1500))]);
-        if (image) {
-          body.image = image;
-          this.seenRev = rev;
-        }
-      } catch { /* words only */ }
-    }
     if (this.sent && this.sent.text === body.text) this.ask(body); // still the current draft
   }
 
@@ -613,7 +606,8 @@ export class Live extends EventTarget {
     }
   }
 
-  // look_at_board: Haiku waits (server side) for this picture.
+  // look_at_board, only when the PC couldn't draw the screen itself: Haiku waits (server side)
+  // for this picture.
   async uploadBoard() {
     if (this.lookBusy) return;
     this.lookBusy = true;

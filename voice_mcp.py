@@ -14,7 +14,8 @@ The talker's plain text is private: nobody hears or sees it.
 The canvas server (server.py) watches the talker's output stream and acts on `speak`,
 `hand_off`, `add_to_task` and `ask_main_agent` as the tool input streams in, so speech starts
 before this process is even called. Here those only acknowledge. `look_at_board` fetches the
-snapshot the page uploaded (GET /api/talk/board, which waits for it); `read_chat` reads
+picture of the user's view the PC drew (or, if it couldn't, the page uploaded) from
+GET /api/talk/board, which waits for it; `read_chat` reads
 GET /api/conversation.
 """
 from __future__ import annotations

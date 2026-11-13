@@ -4,14 +4,15 @@ The voice and the main agent get pictures of the board drawn here, on the PC, fr
 stores (strokes, drawings, cards), instead of asking the iPad for them: the iPad may be asleep,
 and the user wants it to do as little as possible. A headless Chrome on this PC keeps one tab on
 static/render.html, which draws with the iPad's own stroke code (render.js). A picture takes a
-few hundred ms once Chrome is up; Chrome starts with the first picture (2-3 s) and quits after
-two minutes with nothing to draw. Its own throwaway profile: data/boardrender-profile.
+few tens of ms once Chrome is up (the page keeps a copy of each board and gets only what changed);
+Chrome starts with the first picture (2-3 s) and quits after two minutes with nothing to draw. Its own throwaway profile: data/boardrender-profile.
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -67,10 +68,14 @@ class BoardRenderer:
         self.last_used = 0.0
         self._reaper: threading.Thread | None = None
 
-    # ---- the one call
+    # ---- the calls
     def render(self, spec: dict, timeout: float = 25.0) -> dict:
-        """Draw `spec` (see render.js: board, rev, tiles, since, ...). Returns {png: bytes, width,
-        height, tiles}. Raises on failure."""
+        """Draw `spec` (see render.js: board, tiles, since, ...). Returns {png: bytes (PNG or JPEG),
+        media_type, width, height, tiles, ms}. Raises on failure."""
+        return self.render_many([spec], timeout)[0]
+
+    def render_many(self, specs: list, timeout: float = 25.0) -> list:
+        """Several pictures of one board in one go (one sync of its copy, one call to Chrome)."""
         if ws_connect is None:
             raise RuntimeError("the websockets package is missing")
         with self.lock:
@@ -78,35 +83,44 @@ class BoardRenderer:
             for attempt in (1, 2):
                 try:
                     self._ensure_tab()
-                    expr = f"window.canvasRender({json.dumps(spec)})"
+                    expr = f"window.canvasRenderMany({json.dumps(specs)})"
                     res = self._call("Runtime.evaluate", timeout, expression=expr, awaitPromise=True,
                                      returnByValue=True)
                     r = res.get("result") or {}
                     if r.get("exceptionDetails"):
                         d = r["exceptionDetails"]
                         raise RuntimeError(((d.get("exception") or {}).get("description") or d.get("text") or "error")[:300])
-                    v = (r.get("result") or {}).get("value") or {}
-                    url = v.get("dataUrl") or ""
-                    if not url.startswith("data:image/png;base64,"):
-                        raise RuntimeError("no picture came back")
+                    out = []
+                    for v in (r.get("result") or {}).get("value") or []:
+                        m = re.match(r"^data:(image/(?:png|jpeg));base64,", v.get("dataUrl") or "")
+                        if not m:
+                            raise RuntimeError("no picture came back")
+                        out.append({"png": base64.b64decode(v["dataUrl"][m.end():]), "media_type": m.group(1),
+                                    "width": v.get("width"), "height": v.get("height"),
+                                    "tiles": v.get("tiles") or [], "ms": v.get("ms") or {}})
+                    if len(out) != len(specs):
+                        raise RuntimeError("some pictures didn't come back")
                     self.last_used = time.monotonic()
                     self._start_reaper()
-                    return {"png": base64.b64decode(url.split(",", 1)[1]), "width": v.get("width"),
-                            "height": v.get("height"), "tiles": v.get("tiles") or []}
+                    return out
                 except Exception as e:
                     self.log(f"board picture failed (try {attempt}): {e}")
                     self._stop()
                     if attempt == 2:
                         raise
 
-    def warm(self) -> None:
-        """Start Chrome and load the render page now, so the next picture is quick."""
+    def warm(self, board: str | None = None) -> None:
+        """Start Chrome and load the render page now, and bring its copy of `board` up to date, so
+        the next picture is quick."""
         if ws_connect is None:
             return
         try:
             with self.lock:
                 self.last_used = time.monotonic()
                 self._ensure_tab()
+                if board:
+                    self._call("Runtime.evaluate", 20, expression=f"window.canvasSync({json.dumps(board)})",
+                               awaitPromise=True, returnByValue=True)
             self._start_reaper()
         except Exception as e:
             self.log(f"board pictures: warm-up failed: {e}")

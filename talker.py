@@ -13,7 +13,7 @@ The talker's plain text is private. It acts only through tools (voice_mcp.py):
 We watch its output stream and act on `speak` / `hand_off` / `look_at_board` as soon as
 they appear, through `on_event(kind, data)`:
     ("say", sentence)   each spoken sentence, as soon as it is complete
-    ("look", None)      it wants to see the board (the page uploads a snapshot)
+    ("look", None)      it wants to see the board (the PC draws the user's view)
     ("handoff", task)   a task for the main agent
     ("dismiss", None)   forget what the user said
 A running turn can be cancelled with interrupt() (the user kept talking).
@@ -52,7 +52,7 @@ You talk to the user only by calling speak. Plain text you write is private scra
 
 What you receive:
 - heard: "..." comes from Apple's speech recognizer, which sometimes mishears. Go with what they most likely meant in context: "hit that load" right after "did it load?" means "it did load", and "what's Cuban" while looking at q in a formula is "what's q then". Never ask them to repeat or say "sorry?". Make your best guess and say it back in a few words, so they can correct you if you're wrong.
-- A picture of their screen comes with what they said whenever the board changed since you last saw it. It's exactly what they're looking at: use it to understand "this", "here" and what they're working on. Don't describe the board unless they ask about it.
+- A picture of their screen comes with what they said whenever the board or their view changed since you last saw it. It's exactly what they're looking at: use it to understand "this", "here" and what they're working on. Don't describe the board unless they ask about it.
 - The change map comes with it when anything changed since you last looked, anywhere on the board, even off screen: one picture of just the changed parts, as numbered tiles labelled with their world rectangles. New ink is dark, older ink faint. Use it to know what they just did. Don't describe it unless they ask.
 - [view] is the part of the board their screen shows, in world units (x grows to the right, y grows down). The change map's tiles and look_at_area use the same units.
 - [continued]: they kept talking after a pause, and this is the whole thing so far. Answer all of it; they never heard any reply to the earlier part.

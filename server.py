@@ -1254,6 +1254,7 @@ class VoiceState:
         self.cancelled: collections.deque = collections.deque(maxlen=64)
         self.fragment_seen = False  # the talker saw words it didn't answer yet (for [continued])
         self.view = None            # the user's view [x0, y0, x1, y1] (world), sent with each turn
+        self.screen_seen = None     # (board revision, view) of the last screen picture it was shown
         self.notes_in_view = 0      # voice notes placed in this view (they stack)
 
     # cancelling: the user kept talking, so a turn about the first part is stale
@@ -1954,16 +1955,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return f"{st.ink_id}:{st.ink_rev}:{st.changes.n}"
 
     def _api_render_data(self):
-        """What the render page draws from: the board's strokes and drawings/cards."""
+        """What the render page draws from, as changes to its copy: ?since=R&id=BOARD gives the ink
+        batches after R (or the whole board, as /api/ink does); ?layer=SIG gives the drawings and
+        cards only when they're no longer SIG."""
+        try:
+            since = int(self.query.get("since", ["-1"])[0])
+        except ValueError:
+            since = -1
+        board_id = self.query.get("id", [""])[0]
+        have = self.query.get("layer", [""])[0]
         st = self.store
         with st.lock:
-            body = {"rev": f"{st.ink_id}:{st.ink_rev}:{st.changes.n}", "strokes": st.strokes, "layer": st.layer}
-        self._send_json(200, body)
+            layer = json.dumps(st.layer, ensure_ascii=False, separators=(",", ":"))
+            sig = hashlib.sha1(layer.encode("utf-8")).hexdigest()[:16]
+            ink = json.dumps(st.ink_since(since, board_id), ensure_ascii=False, separators=(",", ":"))
+        body = '{"ink":' + ink + ',"layer_sig":"' + sig + '"' + ("" if have == sig else ',"layer":' + layer) + "}"
+        self._send(200, body.encode("utf-8"), MIME[".json"])
 
     def _render(self, tiles: list, **opts) -> dict:
         r = board_renderer(self.server.server_port, self.token)
-        out = r.render({"board": self.session.id, "rev": self._board_rev(), "tiles": tiles, **opts})
-        return {"image": base64.b64encode(out["png"]).decode("ascii"), "media_type": "image/png",
+        out = r.render({"board": self.session.id, "tiles": tiles, **opts})
+        return {"image": base64.b64encode(out["png"]).decode("ascii"), "media_type": out["media_type"],
                 "width": out["width"], "height": out["height"], "tiles": out["tiles"]}
 
     def board_changes(self, viewer: str, mark: bool = True) -> dict:
@@ -1987,14 +1999,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
         res["n"] = n
         return res
 
-    def _voice_change_map(self, budget: float = 1.5):
-        """The voice's change map for this turn, if it's ready within `budget` s (Chrome warm:
-        ~50 ms). The voice has looked only if it got one: a late one is dropped, unseen."""
+    def _screen_spec(self, view: list, since) -> dict:
+        """The user's screen as a picture: their view, 1024 px wide (as the iPad's own was)."""
+        ww, wh = max(1.0, view[2] - view[0]), max(1.0, view[3] - view[1])
+        scale = min(1024 / ww, 1400 / wh)
+        return {"board": self.session.id, "tiles": [{"rect": [float(n) for n in view], "scale": scale}],
+                "bare": True, "since": since, "format": "jpeg", "quality": 0.82, "itemAlpha": 0.55}
+
+    def _voice_pictures(self, screen: bool, budget: float = 1.5) -> tuple:
+        """This turn's pictures, drawn together on the PC from what it stores (the iPad does nothing):
+        - the user's screen (their current view), when the board or the view changed since the voice
+          last saw it (and `screen`: an older page sends its own instead);
+        - the change map: what changed anywhere on the board since the voice last looked.
+        Returns (screen | None, change map | None, note for the log). Pictures not ready within
+        `budget` s are dropped, unseen: the voice has looked only at what it got."""
+        st, voice = self.store, self.voice
+        ch = st.changes
+        cells, n, since = ch.since("voice")
+        with voice.lock:
+            view = list(voice.view) if voice.view else None
+        stamp = (self._board_rev(), tuple(round(v) for v in view)) if view else None
+        want_screen = bool(screen and view and stamp != voice.screen_seen)
+        tiles = change_tiles(cells) if since is not None else []
+        specs = []
+        if want_screen:
+            specs.append(self._screen_spec(view, since))
+        if tiles:
+            specs.append({"board": self.session.id, "tiles": [{"rect": r} for r in tiles], "since": since,
+                          "tileMax": 900, "width": 1800, "format": "jpeg", "quality": 0.85})
+        if not specs:
+            if since is None:
+                ch.looked("voice", n)  # the very first look only sets where the next one starts
+            return None, None, ""
         box: dict = {}
+        t0 = time.perf_counter()
 
         def work():
             try:
-                box["res"] = self.board_changes("voice", mark=False)
+                box["res"] = board_renderer(self.server.server_port, self.token).render_many(specs)
             except Exception as e:
                 box["err"] = e
         t = threading.Thread(target=work, daemon=True)
@@ -2002,11 +2044,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
         t.join(budget)
         res = box.get("res")
         if t.is_alive() or res is None:
-            log(f"voice change map skipped: {box.get('err') or 'not ready in time'}")
-            return None
-        if res.get("first_look") or res.get("changed"):
-            self.store.changes.looked("voice", res["n"])
-        return res if res.get("changed") else None
+            log(f"voice pictures skipped: {box.get('err') or 'not ready in time'}")
+            return None, None, f"pictures skipped ({box.get('err') or 'late'})"
+        ms = int((time.perf_counter() - t0) * 1000)
+
+        def pic(o):
+            return {"image": base64.b64encode(o["png"]).decode("ascii"), "media_type": o["media_type"],
+                    "width": o["width"], "height": o["height"], "tiles": o["tiles"], "ms": o["ms"]}
+        scr = pic(res.pop(0)) if want_screen else None
+        cm = pic(res.pop(0)) if tiles else None
+        if scr:
+            voice.screen_seen = stamp
+        if cm or since is None:
+            ch.looked("voice", n)
+        parts = [f"pictures {ms} ms"]
+        for name, o in (("screen", scr), ("map", cm)):
+            if o:
+                parts.append(f"{name} {o['width']}x{o['height']} {len(o['image']) * 3 // 4 // 1024} KB "
+                             f"(sync {o['ms'].get('sync')}, draw {o['ms'].get('draw')}, encode {o['ms'].get('encode')})")
+        return scr, cm, "; ".join(parts)
+
+    def _look_on_pc(self, push) -> None:
+        """look_at_board: the user's current view, drawn on the PC (the page reports its view when
+        it settles). If the PC can't draw it, the page is asked for its own picture instead."""
+        with self.voice.lock:
+            view = list(self.voice.view) if self.voice.view else None
+        try:
+            if not view:
+                raise RuntimeError("no view reported yet")
+            out = board_renderer(self.server.server_port, self.token).render(self._screen_spec(view, None))
+            self.voice.screen_seen = (self._board_rev(), tuple(round(v) for v in view))
+            self.voice.look_arrived(out["media_type"], base64.b64encode(out["png"]).decode("ascii"))
+        except Exception as e:
+            log(f"look_at_board on the PC failed ({e}): asking the page")
+            push({"look": True})
 
     def _api_board_changes(self):
         """?viewer=voice|agent: the change map since that viewer last looked (and it has now
@@ -2715,7 +2786,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """The tab's newest frame (JPEG) once it's newer than ?after=N; waits up to 20 s.
         ?v=<viewer>&w=<px>&q=<quality>: the viewer's picture size and quality (it adapts them
         to its link and its card's size), and each picture goes to one of its requests only.
-        ?meta=1: just {url, title}, at once."""
+        ?meta=1: just {url, title}, at once.
+        ?peek=1: the newest frame at once, if the tab is open and has one (the PC's board pictures:
+        drawing a picture never opens a tab or waits for one)."""
+        if self.query.get("peek"):
+            open_tab = browser_manager().get(bid)
+            jpeg = open_tab.frame if open_tab else b""
+            if not jpeg:
+                return self._send_json(200, {"pending": True})
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.send_header("Cache-Control", "no-store")
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(jpeg)
+            return
         tab = self._browser_tab(bid)
         if self.query.get("meta"):
             return self._send_json(200, {"url": tab.url or "", "title": tab.title or ""})
@@ -3006,15 +3092,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self._read_json()
         kind = body.get("kind") or "utterance"
         if kind == "warmup":
+            if body.get("fresh"):  # a new conversation: its first words come with the screen
+                self.voice.screen_seen = None
             def warm():
                 try:
                     talker.turn("[keep-alive: voice mode is on and nothing was said. Don't speak or use any tool.]")
                 except Exception as exc:
                     log(f"talker warmup failed: {exc}")
             threading.Thread(target=warm, daemon=True).start()
-            # the PC's board pictures too: a change map then takes ~50 ms in a turn instead of ~2 s
+            # the PC's board pictures too (the screen, the change map): Chrome up and this board's
+            # copy loaded, so a turn's pictures take tens of ms instead of seconds
             renderer = board_renderer(self.server.server_port, self.token)
-            threading.Thread(target=renderer.warm, daemon=True).start()
+
+            def warm_pictures():
+                renderer.warm(self.session.id)
+                with self.voice.lock:
+                    view = list(self.voice.view) if self.voice.view else None
+                if view:  # drawings and card pictures in view are made now, not in the first turn
+                    try:
+                        renderer.render(self._screen_spec(view, None))
+                    except Exception:
+                        pass
+            threading.Thread(target=warm_pictures, daemon=True).start()
             return self._send_json(200, {"ok": True})
 
         heard = ""
@@ -3067,12 +3166,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         blocks, notes = [], []
         image = body.get("image") if kind == "utterance" else None
         m = re.match(r"^data:(image/(?:png|jpeg));base64,(.+)$", image or "", re.S)
-        if m:  # the screen as they see it, sent whenever the board changed since Haiku's last look
+        if m:  # an older page sends the screen itself
             blocks.append({"type": "image", "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)}})
             notes.append(f"[picture {len(blocks)} is the user's screen right now]")
-        cm = self._voice_change_map() if kind == "utterance" else None
+        scr, cm, pics = self._voice_pictures(screen=not m) if kind == "utterance" else (None, None, "")
+        if isinstance(body.get("settle_ms"), (int, float)):
+            pics = f"iPad sent its last ink in {int(body['settle_ms'])} ms; " + (pics or "no pictures needed")
+        if scr:  # the screen as they see it, whenever the board or the view changed since its last look
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": scr["media_type"], "data": scr["image"]}})
+            notes.append(f"[picture {len(blocks)} is the user's screen right now]")
         if cm:  # what changed anywhere on the board since the voice last looked (the change map)
-            blocks.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": cm["image"]}})
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": cm["media_type"], "data": cm["image"]}})
             where = "; ".join(f"#{t['n']} x {round(t['rect'][0])}..{round(t['rect'][2])}, y {round(t['rect'][1])}..{round(t['rect'][3])}"
                               for t in cm["tiles"])
             notes.append(f"[picture {len(blocks)} is the change map: only the parts of the board that changed since you "
@@ -3100,7 +3204,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 push({"say": data})
             elif k == "look":
                 self.voice.look_requested()
-                push({"look": True})
+                threading.Thread(target=self._look_on_pc, args=(push,), daemon=True).start()
             elif k == "handoff":
                 self.voice.delegate(data)
                 push({"handoff": data})
@@ -3146,6 +3250,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.voice.fragment_seen = res["mode"] in ("silent", "look")
             push({"done": True, **{k: v for k, v in res.items() if k != "notes"}})
             res["finish"] = "quiet" if body.get("quiet") else ("tap" if body.get("done") else "")
+            if pics:
+                res["pics"] = pics
             log(f"talk {turn_id} {kind} -> {res['mode']} first={res['first_ms']}ms total={res['ms']}ms")
             self._log_voice(kind, heard, res, test=not body.get("log", True))
 
@@ -3223,7 +3329,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _log_voice(self, kind: str, heard: str, res: dict, test: bool = False) -> None:
         """Voice turns go to data/voice.log, not the chat: the chat panel is the main agent's."""
         rec = {"ts": datetime.now().isoformat(timespec="seconds"), "kind": kind, "heard": heard, "test": test,
-               **{k: res.get(k) for k in ("mode", "via", "finish", "muted", "task", "text", "looked", "notes", "first_ms", "ms")}}
+               **{k: res.get(k) for k in ("mode", "via", "finish", "muted", "task", "text", "looked", "notes", "first_ms", "ms", "pics")}}
         with open(os.path.join(DATA_DIR, "voice.log"), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
