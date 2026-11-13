@@ -5,14 +5,30 @@ For a Claude Code session picking up the canvas work on another machine. Read th
 
 ## 1. Set up a new machine
 
-```bash
-python3 --version                                    # the board tool needs Python 3, nothing else
-curl -fsSL https://claude.ai/install.sh | bash       # Claude Code (Windows: irm https://claude.ai/install.ps1 | iex)
+**Windows** (PowerShell). Claude Code on Windows needs Git for Windows. The board tool needs
+Python 3 and nothing else.
+
+```powershell
+winget install -e --id Git.Git
+winget install -e --id Python.Python.3.12
+irm https://claude.ai/install.ps1 | iex              # Claude Code
+# open a NEW PowerShell window, so git, python and claude are on the PATH
 git clone https://github.com/DDI-droid/canvas-ios.git canvas
 cd canvas
 claude plugin marketplace add DDI-droid/canvas-ios   # the canvas plugin (this repo, public)
 claude plugin install canvas@ddi-canvas
-claude                                               # first run signs in: open the link it prints, paste the code back
+claude                                               # first run signs you in, in the browser
+```
+
+**Linux or macOS:**
+
+```bash
+python3 --version
+curl -fsSL https://claude.ai/install.sh | bash
+git clone https://github.com/DDI-droid/canvas-ios.git canvas && cd canvas
+claude plugin marketplace add DDI-droid/canvas-ios
+claude plugin install canvas@ddi-canvas
+claude                                               # without a browser: open the link it prints elsewhere, paste the code back
 ```
 
 Inside Claude: `/canvas:connect <name>`. It asks for the canvas link. The user gets it with
